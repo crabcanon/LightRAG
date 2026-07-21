@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 from pathlib import Path
+from urllib.parse import unquote
 
 import numpy as np
 import pytest
@@ -2982,6 +2983,27 @@ def test_parser_source_resolver_prefers_exact_canonical_file(tmp_path, monkeypat
 
 
 @pytest.mark.offline
+def test_parser_source_resolver_uses_instance_input_dir_for_workspace(
+    tmp_path, monkeypatch
+):
+    global_input_dir = tmp_path / "global-input"
+    global_input_dir.mkdir()
+    monkeypatch.setenv("INPUT_DIR", str(global_input_dir))
+
+    instance_input_dir = tmp_path / "instance-input"
+    workspace = f"test-release-closure-{(tmp_path / 'work').name}"
+    workspace_input_dir = instance_input_dir / workspace
+    workspace_input_dir.mkdir(parents=True)
+    source = workspace_input_dir / "isolated.txt"
+    source.write_text("isolated source", encoding="utf-8")
+    rag = _new_rag(tmp_path / "work", input_dir=str(instance_input_dir))
+
+    resolved = rag._resolve_source_file_for_parser("isolated.txt")
+
+    assert Path(resolved) == source
+
+
+@pytest.mark.offline
 def test_parse_mineru_to_lightrag_document(tmp_path, monkeypatch):
     """End-to-end: parse_mineru routes through MinerURawClient + sidecar
     writer and produces spec-compliant *.parsed/ + *.mineru_raw/ artifacts.
@@ -3099,7 +3121,10 @@ def test_parse_mineru_to_lightrag_document(tmp_path, monkeypatch):
         assert full_doc["content"].startswith("{{LRdoc}}")
         assert full_doc["sidecar_location"].startswith("file://")
         assert full_doc["sidecar_location"].endswith("/")
-        assert str(blocks_path.parent.resolve()) in full_doc["sidecar_location"]
+        sidecar_path = unquote(
+            full_doc["sidecar_location"][len("file://") :].rstrip("/")
+        )
+        assert Path(sidecar_path).resolve() == blocks_path.parent.resolve()
 
         await rag.finalize_storages()
 

@@ -2695,12 +2695,16 @@ async def background_delete_documents(
 
 
 def create_document_routes(
-    rag: LightRAG, doc_manager: DocumentManager, api_key: Optional[str] = None
+    rag: LightRAG,
+    doc_manager: DocumentManager,
+    api_key: Optional[str] = None,
+    context_dependency=None,
 ):
     # Fresh router per call — see the note above the temp_prefix constant.
     router = APIRouter(
         prefix="/documents",
         tags=["documents"],
+        dependencies=[Depends(context_dependency)] if context_dependency else None,
     )
 
     # Create combined auth dependency for document routes

@@ -3476,7 +3476,12 @@ class _PipelineMixin:
         p = Path(file_path)
         name = p.name
         source_name = Path(str(source_file or "").strip()).name
-        input_path = input_dir_path()
+        configured_instance_input = getattr(self, "input_dir", None)
+        input_path = (
+            Path(configured_instance_input)
+            if configured_instance_input
+            else input_dir_path()
+        )
         # API ``DocumentManager`` scopes its input dir to
         # ``<base_input_dir>/<workspace>/`` (see DocumentManager.__init__);
         # check that location first so files uploaded into a workspace

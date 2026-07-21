@@ -109,12 +109,15 @@ class RelationCreateRequest(BaseModel):
     )
 
 
-def create_graph_routes(rag, api_key: Optional[str] = None):
+def create_graph_routes(rag, api_key: Optional[str] = None, context_dependency=None):
     # Fresh router per call. A module-level instance would accumulate
     # duplicate routes when the factory is invoked more than once in the
     # same process (e.g. across tests), which triggers FastAPI's
     # "Duplicate Operation ID" warnings.
-    router = APIRouter(tags=["graph"])
+    router = APIRouter(
+        tags=["graph"],
+        dependencies=[Depends(context_dependency)] if context_dependency else None,
+    )
 
     combined_auth = get_combined_auth_dependency(api_key)
 
