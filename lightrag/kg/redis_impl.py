@@ -7,6 +7,7 @@ import pipmaster as pm
 import configparser
 from contextlib import asynccontextmanager
 import threading
+from urllib.parse import urlsplit
 
 if not pm.is_installed("redis"):
     pm.install("redis")
@@ -61,6 +62,19 @@ redis_retry = retry(
 )
 
 
+def _safe_redis_url(redis_url: str) -> str:
+    """Return a log-safe Redis endpoint without credentials or query values."""
+    try:
+        parsed = urlsplit(redis_url)
+        hostname = parsed.hostname or "unknown"
+        if ":" in hostname:
+            hostname = f"[{hostname}]"
+        port = f":{parsed.port}" if parsed.port is not None else ""
+        return f"{parsed.scheme or 'redis'}://{hostname}{port}{parsed.path}"
+    except (TypeError, ValueError):
+        return "redis://<configured>"
+
+
 class RedisConnectionManager:
     """Shared Redis connection pool manager to avoid creating multiple pools for the same Redis URI"""
 
@@ -86,12 +100,14 @@ class RedisConnectionManager:
                     socket_connect_timeout=SOCKET_CONNECT_TIMEOUT,
                 )
                 cls._pool_refs[redis_url] = 0
-                logger.info(f"Created shared Redis connection pool for {redis_url}")
+                logger.info(
+                    f"Created shared Redis connection pool for {_safe_redis_url(redis_url)}"
+                )
 
             # Increment reference count
             cls._pool_refs[redis_url] += 1
             logger.debug(
-                f"Redis pool {redis_url} reference count: {cls._pool_refs[redis_url]}"
+                f"Redis pool {_safe_redis_url(redis_url)} reference count: {cls._pool_refs[redis_url]}"
             )
 
         return cls._pools[redis_url]
@@ -114,7 +130,7 @@ class RedisConnectionManager:
             if redis_url in cls._pool_refs:
                 cls._pool_refs[redis_url] -= 1
                 logger.debug(
-                    f"Redis pool {redis_url} reference count: {cls._pool_refs[redis_url]}"
+                    f"Redis pool {_safe_redis_url(redis_url)} reference count: {cls._pool_refs[redis_url]}"
                 )
 
                 # If no more references, remove from registry and return for disconnect
@@ -137,10 +153,12 @@ class RedisConnectionManager:
             try:
                 await pool.aclose()
                 logger.info(
-                    f"Closed Redis connection pool for {redis_url} (no more references)"
+                    f"Closed Redis connection pool for {_safe_redis_url(redis_url)} (no more references)"
                 )
             except Exception as e:
-                logger.error(f"Error closing Redis pool for {redis_url}: {e}")
+                logger.error(
+                    f"Error closing Redis pool for {_safe_redis_url(redis_url)}: {e}"
+                )
 
     @classmethod
     async def close_all_pools(cls):
@@ -162,10 +180,12 @@ class RedisConnectionManager:
         try:
             await pool.aclose()
             logger.info(
-                f"Closed Redis connection pool for {redis_url} (no more references)"
+                f"Closed Redis connection pool for {_safe_redis_url(redis_url)} (no more references)"
             )
         except Exception as e:
-            logger.error(f"Error closing Redis pool for {redis_url}: {e}")
+            logger.error(
+                f"Error closing Redis pool for {_safe_redis_url(redis_url)}: {e}"
+            )
 
     @classmethod
     def schedule_pool_close(cls, pool: ConnectionPool, redis_url: str) -> None:
@@ -195,9 +215,14 @@ class RedisConnectionManager:
 class RedisKVStorage(BaseKVStorage):
     def __post_init__(self):
         validate_workspace(self.workspace)
+        profile = (
+            getattr(self, "global_config", {})
+            .get("storage_profile", {})
+            .get("redis", {})
+        )
         # Check for REDIS_WORKSPACE environment variable first (higher priority)
         # This allows administrators to force a specific workspace for all Redis storage instances
-        redis_workspace = os.environ.get("REDIS_WORKSPACE")
+        redis_workspace = None if profile else os.environ.get("REDIS_WORKSPACE")
         if redis_workspace and redis_workspace.strip():
             # Use environment variable value, overriding the passed workspace parameter
             effective_workspace = redis_workspace.strip()
@@ -225,7 +250,7 @@ class RedisKVStorage(BaseKVStorage):
             self.workspace = ""
             logger.debug(f"Final namespace (no workspace): '{self.final_namespace}'")
 
-        self._redis_url = os.environ.get(
+        self._redis_url = profile.get("uri") or os.environ.get(
             "REDIS_URI", config.get("redis", "uri", fallback="redis://localhost:6379")
         )
         self._pool = None
@@ -623,9 +648,14 @@ class RedisDocStatusStorage(DocStatusStorage):
 
     def __post_init__(self):
         validate_workspace(self.workspace)
+        profile = (
+            getattr(self, "global_config", {})
+            .get("storage_profile", {})
+            .get("redis", {})
+        )
         # Check for REDIS_WORKSPACE environment variable first (higher priority)
         # This allows administrators to force a specific workspace for all Redis storage instances
-        redis_workspace = os.environ.get("REDIS_WORKSPACE")
+        redis_workspace = None if profile else os.environ.get("REDIS_WORKSPACE")
         if redis_workspace and redis_workspace.strip():
             # Use environment variable value, overriding the passed workspace parameter
             effective_workspace = redis_workspace.strip()
@@ -655,7 +685,7 @@ class RedisDocStatusStorage(DocStatusStorage):
                 f"[{self.workspace}] Final namespace (no workspace): '{self.namespace}'"
             )
 
-        self._redis_url = os.environ.get(
+        self._redis_url = profile.get("uri") or os.environ.get(
             "REDIS_URI", config.get("redis", "uri", fallback="redis://localhost:6379")
         )
         self._pool = None

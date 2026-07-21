@@ -15,7 +15,7 @@ import ssl as ssl_module
 import time
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Union, final
+from typing import Any, AsyncIterator, Mapping, Union, final
 import numpy as np
 import configparser
 
@@ -37,6 +37,10 @@ from ..utils import (
 from ..types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
 from ..constants import GRAPH_FIELD_SEP, DEFAULT_QUERY_PRIORITY
 from ..kg.shared_storage import get_data_init_lock, get_namespace_lock
+from ..kg.storage_profiles import (
+    get_storage_profile_section,
+    resolve_workspace_override,
+)
 
 import pipmaster as pm
 
@@ -402,7 +406,9 @@ def _merge_edge_payloads(docs: list[dict[str, Any]]) -> dict[str, Any]:
 _shard_doc_supported: bool | None = None
 
 
-def _pit_sort_with_field(field: str) -> list[dict]:
+def _pit_sort_with_field(
+    field: str, shard_doc_supported: bool | None = None
+) -> list[dict]:
     """Return PIT sort clause with a unique field as primary sort.
 
     Used purely as a pagination tiebreaker — order is fixed to asc since the
@@ -411,18 +417,20 @@ def _pit_sort_with_field(field: str) -> list[dict]:
     >= 3.3.0: _shard_doc only (most efficient, already unique within PIT).
     < 3.3.0:  field + _doc (field is unique, _doc for efficiency).
     """
-    if _shard_doc_supported:
+    if _shard_doc_supported if shard_doc_supported is None else shard_doc_supported:
         return [{"_shard_doc": "asc"}]
     return [{field: {"order": "asc"}}, {"_doc": "asc"}]
 
 
-def _pit_sort_with_composite_key(*fields: str) -> list[dict]:
+def _pit_sort_with_composite_key(
+    *fields: str, shard_doc_supported: bool | None = None
+) -> list[dict]:
     """Return PIT sort clause with multiple fields forming a composite unique key.
 
     >= 3.3.0: _shard_doc (most efficient, ignores the fields).
     < 3.3.0:  field1 + field2 + ... + _doc (composite is unique, _doc for efficiency).
     """
-    if _shard_doc_supported:
+    if _shard_doc_supported if shard_doc_supported is None else shard_doc_supported:
         return [{"_shard_doc": "asc"}]
     return [{f: {"order": "asc"}} for f in fields] + [{"_doc": "asc"}]
 
@@ -450,32 +458,59 @@ async def _detect_shard_doc_support(client: AsyncOpenSearch) -> bool:
 
 
 class ClientManager:
-    """Singleton manager for OpenSearch client connections."""
+    """Resource-keyed manager for OpenSearch client connections."""
 
-    _instances = {"client": None, "ref_count": 0}
+    _instances: dict[tuple[Any, ...], dict[str, Any]] = {}
     _lock = asyncio.Lock()
 
     @classmethod
-    async def get_client(cls) -> AsyncOpenSearch:
+    async def get_client(
+        cls, global_config: Mapping[str, Any] | None = None
+    ) -> AsyncOpenSearch:
         """Get or create a shared AsyncOpenSearch client with reference counting."""
         global _shard_doc_supported
+        profile = get_storage_profile_section(global_config or {}, "opensearch")
+        hosts_value = profile.get("hosts") or _get_opensearch_env(
+            "OPENSEARCH_HOSTS", "localhost:9200"
+        )
+        if isinstance(hosts_value, str):
+            hosts = [h.strip() for h in hosts_value.split(",") if h.strip()]
+        else:
+            hosts = [str(host).strip() for host in hosts_value if str(host).strip()]
+        username = str(
+            profile.get("username") or _get_opensearch_env("OPENSEARCH_USER", "admin")
+        )
+        password = str(
+            profile.get("password")
+            or _get_opensearch_env("OPENSEARCH_PASSWORD", "admin")
+        )
+        use_ssl_value = profile.get(
+            "use_ssl", _get_opensearch_env("OPENSEARCH_USE_SSL", "true")
+        )
+        verify_certs_value = profile.get(
+            "verify_certs", _get_opensearch_env("OPENSEARCH_VERIFY_CERTS", "false")
+        )
+        use_ssl = str(use_ssl_value).lower() in ("true", "1", "yes")
+        verify_certs = str(verify_certs_value).lower() in ("true", "1", "yes")
+        timeout = int(
+            profile.get("timeout") or _get_opensearch_env("OPENSEARCH_TIMEOUT", "30")
+        )
+        max_retries = int(
+            profile.get("max_retries")
+            or _get_opensearch_env("OPENSEARCH_MAX_RETRIES", "3")
+        )
+        resource_key = (
+            tuple(hosts),
+            username,
+            password,
+            use_ssl,
+            verify_certs,
+            timeout,
+            max_retries,
+        )
         async with cls._lock:
-            if cls._instances["client"] is None:
-                hosts_str = _get_opensearch_env("OPENSEARCH_HOSTS", "localhost:9200")
-                hosts = [h.strip() for h in hosts_str.split(",") if h.strip()]
-                username = _get_opensearch_env("OPENSEARCH_USER", "admin")
-                password = _get_opensearch_env("OPENSEARCH_PASSWORD", "admin")
-                use_ssl = _get_opensearch_env("OPENSEARCH_USE_SSL", "true").lower() in (
-                    "true",
-                    "1",
-                    "yes",
-                )
-                verify_certs = _get_opensearch_env(
-                    "OPENSEARCH_VERIFY_CERTS", "false"
-                ).lower() in ("true", "1", "yes")
-                timeout = int(_get_opensearch_env("OPENSEARCH_TIMEOUT", "30"))
-                max_retries = int(_get_opensearch_env("OPENSEARCH_MAX_RETRIES", "3"))
-
+            instance = cls._instances.get(resource_key)
+            if instance is None:
                 ssl_context = None
                 if use_ssl and not verify_certs:
                     ssl_context = ssl_module.create_default_context()
@@ -493,35 +528,64 @@ class ClientManager:
                     max_retries=max_retries,
                     retry_on_timeout=True,
                 )
-                cls._instances["client"] = client
-                cls._instances["ref_count"] = 0
-                _shard_doc_supported = await _detect_shard_doc_support(client)
+                shard_doc_supported = await _detect_shard_doc_support(client)
+                instance = {
+                    "client": client,
+                    "ref_count": 0,
+                    "shard_doc_supported": shard_doc_supported,
+                }
+                cls._instances[resource_key] = instance
+                # Retained as a compatibility fallback for direct helper calls;
+                # storage instances use the client-scoped capability below.
+                _shard_doc_supported = shard_doc_supported
                 logger.info(f"OpenSearch client connected to {hosts}")
 
-            cls._instances["ref_count"] += 1
-            return cls._instances["client"]
+            instance["ref_count"] += 1
+            return instance["client"]
 
     @classmethod
     async def release_client(cls, client: AsyncOpenSearch):
         """Release a client reference. Closes the connection when ref count reaches 0."""
         global _shard_doc_supported
         async with cls._lock:
-            if client is not None and client is cls._instances["client"]:
-                cls._instances["ref_count"] -= 1
-                if cls._instances["ref_count"] <= 0:
+            if client is None:
+                return
+            for resource_key, instance in list(cls._instances.items()):
+                if client is not instance["client"]:
+                    continue
+                instance["ref_count"] -= 1
+                if instance["ref_count"] <= 0:
                     try:
-                        await cls._instances["client"].close()
+                        await instance["client"].close()
                     except Exception:
                         pass
-                    cls._instances["client"] = None
-                    cls._instances["ref_count"] = 0
-                    _shard_doc_supported = None
+                    del cls._instances[resource_key]
+                    remaining = next(iter(cls._instances.values()), None)
+                    _shard_doc_supported = (
+                        bool(remaining["shard_doc_supported"])
+                        if remaining is not None
+                        else None
+                    )
                     logger.info("OpenSearch client connection closed")
+                return
+
+    @classmethod
+    def supports_shard_doc(cls, client: AsyncOpenSearch | None) -> bool:
+        """Return the capability detected for this exact physical cluster."""
+
+        for instance in cls._instances.values():
+            if client is instance["client"]:
+                return bool(instance["shard_doc_supported"])
+        return bool(_shard_doc_supported)
 
 
-def _resolve_workspace(workspace: str, namespace: str):
+def _resolve_workspace(
+    workspace: str, namespace: str, global_config: Mapping[str, Any] | None = None
+):
     """Resolve effective workspace from env or parameter."""
-    opensearch_workspace = os.environ.get("OPENSEARCH_WORKSPACE")
+    opensearch_workspace = resolve_workspace_override(
+        global_config or {}, "opensearch", "OPENSEARCH_WORKSPACE"
+    )
     if opensearch_workspace and opensearch_workspace.strip():
         effective = opensearch_workspace.strip()
         logger.info(
@@ -531,15 +595,23 @@ def _resolve_workspace(workspace: str, namespace: str):
     return workspace
 
 
-def _build_index_name(workspace: str, namespace: str) -> tuple[str, str, str]:
+def _build_index_name(
+    workspace: str,
+    namespace: str,
+    global_config: Mapping[str, Any] | None = None,
+) -> tuple[str, str, str]:
     """Build index name and return (effective_workspace, final_namespace, index_name)."""
-    effective = _resolve_workspace(workspace, namespace)
+    effective = _resolve_workspace(workspace, namespace, global_config)
     if effective:
         final_ns = f"{effective}_{namespace}"
     else:
         final_ns = namespace
         effective = ""
-    index_name = _sanitize_index_name(final_ns)
+    profile = get_storage_profile_section(global_config or {}, "opensearch")
+    index_prefix = str(profile.get("index_prefix", "")).strip()
+    index_name = _sanitize_index_name(
+        f"{index_prefix}_{final_ns}" if index_prefix else final_ns
+    )
     return effective, final_ns, index_name
 
 
@@ -581,7 +653,7 @@ async def _verify_mirrored_id_mapping(client: AsyncOpenSearch, index_name: str) 
     releases will be missing this mapping; sorting by a missing field on a
     multi-shard index can drop or duplicate documents during PIT pagination.
     """
-    if _shard_doc_supported:
+    if ClientManager.supports_shard_doc(client):
         return
     try:
         mapping = await client.indices.get_mapping(index=index_name)
@@ -618,7 +690,7 @@ class OpenSearchKVStorage(BaseKVStorage):
     def __post_init__(self):
         validate_workspace(self.workspace)
         self.workspace, self.final_namespace, self._index_name = _build_index_name(
-            self.workspace, self.namespace
+            self.workspace, self.namespace, self.global_config
         )
         # Pending writes are flushed via _flush_pending_kv_ops() during
         # index_done_callback() / finalize(). Buffering many small upsert()
@@ -642,7 +714,7 @@ class OpenSearchKVStorage(BaseKVStorage):
         """Initialize client connection and create index if needed."""
         async with get_data_init_lock():
             if self.client is None:
-                self.client = await ClientManager.get_client()
+                self.client = await ClientManager.get_client(self.global_config)
             await self._create_index_if_not_exists()
             self._index_ready = True
             logger.debug(
@@ -659,7 +731,7 @@ class OpenSearchKVStorage(BaseKVStorage):
             return
         async with get_data_init_lock():
             if self.client is None:
-                self.client = await ClientManager.get_client()
+                self.client = await ClientManager.get_client(self.global_config)
             if not self._index_ready:
                 await self._create_index_if_not_exists()
                 self._index_ready = True
@@ -765,7 +837,10 @@ class OpenSearchKVStorage(BaseKVStorage):
                         "query": {"match_all": {}},
                         "size": batch_size,
                         "pit": {"id": pit_id, "keep_alive": "1m"},
-                        "sort": _pit_sort_with_field("__mirrored_id"),
+                        "sort": _pit_sort_with_field(
+                            "__mirrored_id",
+                            ClientManager.supports_shard_doc(self.client),
+                        ),
                     }
                     if search_after:
                         body["search_after"] = search_after
@@ -1214,7 +1289,7 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
     def __post_init__(self):
         validate_workspace(self.workspace)
         self.workspace, self.final_namespace, self._index_name = _build_index_name(
-            self.workspace, self.namespace
+            self.workspace, self.namespace, self.global_config
         )
         (
             self._max_upsert_payload_bytes,
@@ -1242,7 +1317,7 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
         """Initialize client connection and create doc status index."""
         async with get_data_init_lock():
             if self.client is None:
-                self.client = await ClientManager.get_client()
+                self.client = await ClientManager.get_client(self.global_config)
             await self._create_index_if_not_exists()
             self._index_ready = True
             logger.debug(
@@ -1255,7 +1330,7 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
             return
         async with get_data_init_lock():
             if self.client is None:
-                self.client = await ClientManager.get_client()
+                self.client = await ClientManager.get_client(self.global_config)
             if not self._index_ready:
                 await self._create_index_if_not_exists()
                 self._index_ready = True
@@ -1487,7 +1562,10 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
                         "query": query,
                         "size": batch_size,
                         "pit": {"id": pit_id, "keep_alive": "1m"},
-                        "sort": _pit_sort_with_field("__mirrored_id"),
+                        "sort": _pit_sort_with_field(
+                            "__mirrored_id",
+                            ClientManager.supports_shard_doc(self.client),
+                        ),
                     }
                     if search_after:
                         body["search_after"] = search_after
@@ -1586,7 +1664,7 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
                 return [], total_count
 
             sort_clause = [{sort_field: {"order": sort_order}}] + _pit_sort_with_field(
-                "__mirrored_id"
+                "__mirrored_id", ClientManager.supports_shard_doc(self.client)
             )
 
             pit = await self.client.create_pit(
@@ -1867,7 +1945,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
     def __post_init__(self):
         validate_workspace(self.workspace)
         self.workspace, self.final_namespace, base_name = _build_index_name(
-            self.workspace, self.namespace
+            self.workspace, self.namespace, self.global_config
         )
         self._nodes_index = f"{base_name}-nodes"
         self._edges_index = f"{base_name}-edges"
@@ -1881,7 +1959,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         """Initialize client, create indices, and detect PPL graphlookup support."""
         async with get_data_init_lock():
             if self.client is None:
-                self.client = await ClientManager.get_client()
+                self.client = await ClientManager.get_client(self.global_config)
             await self._create_indices_if_not_exist()
             await self._migrate_edges_to_canonical_id_if_needed()
             self._indices_ready = True
@@ -1900,7 +1978,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             return
         async with get_data_init_lock():
             if self.client is None:
-                self.client = await ClientManager.get_client()
+                self.client = await ClientManager.get_client(self.global_config)
             if not self._indices_ready:
                 await self._create_indices_if_not_exist()
                 self._indices_ready = True
@@ -2525,7 +2603,11 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                         "size": 10000,
                         "pit": {"id": pit_id, "keep_alive": "1m"},
                         "sort": _pit_sort_with_composite_key(
-                            "source_node_id", "target_node_id"
+                            "source_node_id",
+                            "target_node_id",
+                            shard_doc_supported=ClientManager.supports_shard_doc(
+                                self.client
+                            ),
                         ),
                     }
                     if search_after:
@@ -2659,7 +2741,11 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                         "size": 10000,
                         "pit": {"id": pit_id, "keep_alive": "1m"},
                         "sort": _pit_sort_with_composite_key(
-                            "source_node_id", "target_node_id"
+                            "source_node_id",
+                            "target_node_id",
+                            shard_doc_supported=ClientManager.supports_shard_doc(
+                                self.client
+                            ),
                         ),
                     }
                     if search_after:
@@ -3010,7 +3096,9 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                         "_source": False,
                         "size": 10000,
                         "pit": {"id": pit_id, "keep_alive": "1m"},
-                        "sort": _pit_sort_with_field("entity_id"),
+                        "sort": _pit_sort_with_field(
+                            "entity_id", ClientManager.supports_shard_doc(self.client)
+                        ),
                     }
                     if search_after:
                         body["search_after"] = search_after
@@ -3065,7 +3153,9 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                     "_source": False,
                     "size": 10000,
                     "pit": {"id": pit_id, "keep_alive": "1m"},
-                    "sort": _pit_sort_with_field("entity_id"),
+                    "sort": _pit_sort_with_field(
+                        "entity_id", ClientManager.supports_shard_doc(self.client)
+                    ),
                 }
                 if search_after:
                     body["search_after"] = search_after
@@ -3136,7 +3226,11 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                     "size": 10000,
                     "pit": {"id": pit_id, "keep_alive": "1m"},
                     "sort": _pit_sort_with_composite_key(
-                        "source_node_id", "target_node_id"
+                        "source_node_id",
+                        "target_node_id",
+                        shard_doc_supported=ClientManager.supports_shard_doc(
+                            self.client
+                        ),
                     ),
                 }
                 if search_after:
@@ -3540,7 +3634,9 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                         "query": {"match_all": {}},
                         "size": 10000,
                         "pit": {"id": pit_id, "keep_alive": "1m"},
-                        "sort": _pit_sort_with_field("entity_id"),
+                        "sort": _pit_sort_with_field(
+                            "entity_id", ClientManager.supports_shard_doc(self.client)
+                        ),
                     }
                     if search_after:
                         body["search_after"] = search_after
@@ -3585,7 +3681,11 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                         "size": 10000,
                         "pit": {"id": pit_id, "keep_alive": "1m"},
                         "sort": _pit_sort_with_composite_key(
-                            "source_node_id", "target_node_id"
+                            "source_node_id",
+                            "target_node_id",
+                            shard_doc_supported=ClientManager.supports_shard_doc(
+                                self.client
+                            ),
                         ),
                     }
                     if search_after:
@@ -3761,7 +3861,7 @@ class OpenSearchVectorDBStorage(BaseVectorStorage):
         validate_workspace(self.workspace)
         self._validate_embedding_func()
         self.workspace, self.final_namespace, self._index_name = _build_index_name(
-            self.workspace, self.namespace
+            self.workspace, self.namespace, self.global_config
         )
         kwargs = self.global_config.get("vector_db_storage_cls_kwargs", {})
         cosine_threshold = kwargs.get("cosine_better_than_threshold")
@@ -3792,7 +3892,7 @@ class OpenSearchVectorDBStorage(BaseVectorStorage):
         """Initialize client and create k-NN vector index."""
         async with get_data_init_lock():
             if self.client is None:
-                self.client = await ClientManager.get_client()
+                self.client = await ClientManager.get_client(self.global_config)
             await self._create_knn_index_if_not_exists()
             self._index_ready = True
             logger.debug(
@@ -3809,7 +3909,7 @@ class OpenSearchVectorDBStorage(BaseVectorStorage):
             return
         async with get_data_init_lock():
             if self.client is None:
-                self.client = await ClientManager.get_client()
+                self.client = await ClientManager.get_client(self.global_config)
             if not self._index_ready:
                 await self._create_knn_index_if_not_exists()
                 self._index_ready = True

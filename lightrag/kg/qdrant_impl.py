@@ -3,6 +3,7 @@ import configparser
 import hashlib
 import json
 import os
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Any, List, final
@@ -14,6 +15,10 @@ from ..base import BaseVectorStorage
 from ..constants import DEFAULT_QUERY_PRIORITY
 from ..exceptions import DataMigrationError
 from ..kg.shared_storage import get_data_init_lock, get_namespace_lock
+from ..kg.storage_profiles import (
+    get_storage_profile_section,
+    resolve_workspace_override,
+)
 from ..utils import _cooperative_yield, compute_mdhash_id, logger, validate_workspace
 
 if not pm.is_installed("qdrant-client"):
@@ -479,7 +484,10 @@ class QdrantVectorDBStorage(BaseVectorStorage):
         self._validate_embedding_func()
         # Check for QDRANT_WORKSPACE environment variable first (higher priority)
         # This allows administrators to force a specific workspace for all Qdrant storage instances
-        qdrant_workspace = os.environ.get("QDRANT_WORKSPACE")
+        profile = get_storage_profile_section(self.global_config, "qdrant")
+        qdrant_workspace = resolve_workspace_override(
+            self.global_config, "qdrant", "QDRANT_WORKSPACE"
+        )
         if qdrant_workspace and qdrant_workspace.strip():
             # Use environment variable value, overriding the passed workspace parameter
             effective_workspace = qdrant_workspace.strip()
@@ -511,6 +519,14 @@ class QdrantVectorDBStorage(BaseVectorStorage):
             logger.warning(
                 f"Qdrant collection: {self.final_namespace} missing suffix. Pls add model_name to embedding_func for proper workspace data isolation."
             )
+        collection_prefix = str(profile.get("collection_prefix", "")).strip()
+        if collection_prefix:
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", collection_prefix):
+                raise ValueError(
+                    "Qdrant physical collection_prefix must match "
+                    "[A-Za-z0-9][A-Za-z0-9_-]{0,63}"
+                )
+            self.final_namespace = f"{collection_prefix}_{self.final_namespace}"
 
         kwargs = self.global_config.get("vector_db_storage_cls_kwargs", {})
         cosine_threshold = kwargs.get("cosine_better_than_threshold")
@@ -563,6 +579,20 @@ class QdrantVectorDBStorage(BaseVectorStorage):
         self._pending_vector_docs: dict[str, _PendingVectorDoc] = {}
         self._pending_vector_deletes: set[str] = set()
         self._flush_lock = None
+
+    def _get_qdrant_connection_kwargs(self) -> dict[str, Any]:
+        """Resolve the immutable Qdrant connection config for this instance."""
+
+        profile = get_storage_profile_section(self.global_config, "qdrant")
+        return {
+            "url": profile.get("url")
+            or os.environ.get("QDRANT_URL", config.get("qdrant", "uri", fallback=None)),
+            "api_key": profile.get("api_key")
+            or os.environ.get(
+                "QDRANT_API_KEY",
+                config.get("qdrant", "apikey", fallback=None),
+            ),
+        }
 
     @staticmethod
     def _to_json_serializable(value: Any) -> Any:
@@ -660,15 +690,7 @@ class QdrantVectorDBStorage(BaseVectorStorage):
             try:
                 # Create QdrantClient if not already created
                 if self._client is None:
-                    self._client = QdrantClient(
-                        url=os.environ.get(
-                            "QDRANT_URL", config.get("qdrant", "uri", fallback=None)
-                        ),
-                        api_key=os.environ.get(
-                            "QDRANT_API_KEY",
-                            config.get("qdrant", "apikey", fallback=None),
-                        ),
-                    )
+                    self._client = QdrantClient(**self._get_qdrant_connection_kwargs())
                     logger.debug(
                         f"[{self.workspace}] QdrantClient created successfully"
                     )

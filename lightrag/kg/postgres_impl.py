@@ -2312,14 +2312,18 @@ class ClientManager:
         "ref_count": 0,
         "vector_signature": None,
     }
+    _profile_instances: dict[str, dict[str, Any]] = {}
     _lock = asyncio.Lock()
 
     @staticmethod
-    def get_config(vector_storage: str | None = None) -> dict[str, Any]:
+    def get_config(
+        vector_storage: str | None = None,
+        storage_profile: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         config = configparser.ConfigParser()
         config.read("config.ini", "utf-8")
 
-        return {
+        resolved = {
             "host": os.environ.get(
                 "POSTGRES_HOST",
                 config.get("postgres", "host", fallback="localhost"),
@@ -2461,6 +2465,16 @@ class ClientManager:
                 ),
             ),
         }
+        if storage_profile:
+            postgres = storage_profile.get("postgres", {})
+            supported = set(resolved) - {"enable_vector", "workspace"}
+            resolved.update(
+                {key: value for key, value in postgres.items() if key in supported}
+            )
+            # A per-instance profile must never inherit a process-wide workspace
+            # override, because the catalog's immutable workspace is the data key.
+            resolved["workspace"] = None
+        return resolved
 
     @classmethod
     def _build_vector_signature(
@@ -2501,15 +2515,45 @@ class ClientManager:
         )
 
     @classmethod
-    async def get_client(cls, vector_storage: str | None = None) -> PostgreSQLDB:
+    async def get_client(
+        cls,
+        vector_storage: str | None = None,
+        storage_profile: dict[str, Any] | None = None,
+    ) -> PostgreSQLDB:
         """Return the shared PostgreSQL client for all PG storages in this process.
 
         The first caller fixes the vector-related pool configuration. Later calls
         must provide a compatible vector storage setup or a RuntimeError is raised.
         """
         async with cls._lock:
-            config = ClientManager.get_config(vector_storage=vector_storage)
+            config = ClientManager.get_config(
+                vector_storage=vector_storage, storage_profile=storage_profile
+            )
             requested_signature = cls._build_vector_signature(config, vector_storage)
+            if storage_profile:
+                profile_id = str(storage_profile.get("id", "")).strip()
+                if not profile_id:
+                    raise RuntimeError(
+                        "A physical storage profile must include a non-empty id"
+                    )
+                instance = cls._profile_instances.setdefault(
+                    profile_id,
+                    {"db": None, "ref_count": 0, "vector_signature": None},
+                )
+                if instance["db"] is None:
+                    db = PostgreSQLDB(config)
+                    await db.initdb()
+                    await db.check_tables()
+                    instance["db"] = db
+                    instance["vector_signature"] = requested_signature
+                elif instance["vector_signature"] != requested_signature:
+                    raise RuntimeError(
+                        f"Storage profile {profile_id!r} already uses incompatible "
+                        "PostgreSQL vector settings"
+                    )
+                instance["ref_count"] += 1
+                return instance["db"]
+
             if cls._instances["db"] is None:
                 db = PostgreSQLDB(config)
                 await db.initdb()
@@ -2535,7 +2579,26 @@ class ClientManager:
                         cls._instances["db"] = None
                         cls._instances["vector_signature"] = None
                 else:
-                    if db.pool is not None:
+                    profile_id = next(
+                        (
+                            key
+                            for key, value in cls._profile_instances.items()
+                            if value["db"] is db
+                        ),
+                        None,
+                    )
+                    if profile_id is not None:
+                        instance = cls._profile_instances[profile_id]
+                        instance["ref_count"] -= 1
+                        if instance["ref_count"] == 0:
+                            if db.pool is not None:
+                                await db.pool.close()
+                            del cls._profile_instances[profile_id]
+                            logger.info(
+                                "Closed PostgreSQL database connection pool for "
+                                f"storage profile {profile_id!r}"
+                            )
+                    elif db.pool is not None:
                         await db.pool.close()
 
 
@@ -2557,7 +2620,8 @@ class PGKVStorage(BaseKVStorage):
         async with get_data_init_lock():
             if self.db is None:
                 self.db = await ClientManager.get_client(
-                    vector_storage=self.global_config.get("vector_storage")
+                    vector_storage=self.global_config.get("vector_storage"),
+                    storage_profile=self.global_config.get("storage_profile"),
                 )
 
             # Implement workspace priority: PostgreSQLDB.workspace > self.workspace > "default"
@@ -3760,7 +3824,8 @@ class PGVectorStorage(BaseVectorStorage):
         async with get_data_init_lock():
             if self.db is None:
                 self.db = await ClientManager.get_client(
-                    vector_storage=self.global_config.get("vector_storage")
+                    vector_storage=self.global_config.get("vector_storage"),
+                    storage_profile=self.global_config.get("storage_profile"),
                 )
 
             # Implement workspace priority: PostgreSQLDB.workspace > self.workspace > "default"
@@ -4850,7 +4915,8 @@ class PGDocStatusStorage(DocStatusStorage):
         async with get_data_init_lock():
             if self.db is None:
                 self.db = await ClientManager.get_client(
-                    vector_storage=self.global_config.get("vector_storage")
+                    vector_storage=self.global_config.get("vector_storage"),
+                    storage_profile=self.global_config.get("storage_profile"),
                 )
 
             # Implement workspace priority: PostgreSQLDB.workspace > self.workspace > "default"
@@ -6002,7 +6068,8 @@ class PGGraphStorage(BaseGraphStorage):
         async with get_data_init_lock():
             if self.db is None:
                 self.db = await ClientManager.get_client(
-                    vector_storage=self.global_config.get("vector_storage")
+                    vector_storage=self.global_config.get("vector_storage"),
+                    storage_profile=self.global_config.get("storage_profile"),
                 )
 
             # Implement workspace priority: PostgreSQLDB.workspace > self.workspace > "default"

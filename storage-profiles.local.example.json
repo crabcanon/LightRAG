@@ -1,0 +1,55 @@
+{
+  "profiles": {
+    "dedicated-project-a": {
+      "dedicated": true,
+      "working_dir": "/app/data/physical/project-a/rag_storage",
+      "input_dir": "/app/data/physical/project-a/inputs",
+      "postgres": {
+        "host": "project-a-postgres",
+        "port": 5432,
+        "user": "rag",
+        "password": "CHANGE_ME",
+        "database": "rag"
+      },
+      "neo4j": {
+        "uri": "neo4j://project-a-neo4j:7687",
+        "username": "neo4j",
+        "password": "CHANGE_ME",
+        "database": "neo4j"
+      },
+      "redis": {
+        "uri": "redis://project-a-redis:6379/0"
+      },
+      "mongo": {
+        "uri": "mongodb://project-a-mongo:27017",
+        "database": "rag_project_a"
+      },
+      "milvus": {
+        "uri": "http://project-a-milvus:19530",
+        "db_name": "rag_project_a",
+        "token": "CHANGE_ME"
+      },
+      "qdrant": {
+        "url": "http://project-a-qdrant:6333",
+        "api_key": "CHANGE_ME",
+        "collection_prefix": "project_a"
+      },
+      "memgraph": {
+        "uri": "bolt://project-a-memgraph:7687",
+        "username": "",
+        "password": "",
+        "database": "memgraph"
+      },
+      "opensearch": {
+        "hosts": [
+          "project-a-opensearch:9200"
+        ],
+        "username": "admin",
+        "password": "CHANGE_ME",
+        "use_ssl": true,
+        "verify_certs": false,
+        "index_prefix": "project_a"
+      }
+    }
+  }
+}

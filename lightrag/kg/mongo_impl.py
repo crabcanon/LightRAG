@@ -7,7 +7,7 @@ import numpy as np
 import configparser
 import asyncio
 
-from typing import Any, Union, final
+from typing import Any, Mapping, Union, final
 
 from ..base import (
     BaseGraphStorage,
@@ -28,6 +28,10 @@ from ..types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
 from ..constants import GRAPH_FIELD_SEP, DEFAULT_QUERY_PRIORITY
 from .._version import __version__
 from ..kg.shared_storage import get_data_init_lock, get_namespace_lock
+from ..kg.storage_profiles import (
+    get_storage_profile_section,
+    resolve_workspace_override,
+)
 
 import pipmaster as pm
 
@@ -277,48 +281,61 @@ async def _run_batched_bulk_write(
 
 
 class ClientManager:
-    _instances: dict = {"client": None, "db": None, "ref_count": 0}
+    _instances: dict[tuple[str, str], dict[str, Any]] = {}
     _lock = asyncio.Lock()
 
     @classmethod
-    async def get_client(cls) -> AsyncMongoClient:
+    async def get_client(
+        cls, profile: Mapping[str, Any] | None = None
+    ) -> AsyncDatabase:
+        profile = profile or {}
+        uri = str(
+            profile.get("uri")
+            or os.environ.get(
+                "MONGO_URI",
+                config.get(
+                    "mongodb",
+                    "uri",
+                    fallback="mongodb://root:root@localhost:27017/",
+                ),
+            )
+        )
+        database_name = str(
+            profile.get("database")
+            or os.environ.get(
+                "MONGO_DATABASE",
+                config.get("mongodb", "database", fallback="LightRAG"),
+            )
+        )
+        resource_key = (uri, database_name)
         async with cls._lock:
-            if cls._instances["db"] is None:
-                uri = os.environ.get(
-                    "MONGO_URI",
-                    config.get(
-                        "mongodb",
-                        "uri",
-                        fallback="mongodb://root:root@localhost:27017/",
-                    ),
-                )
-                database_name = os.environ.get(
-                    "MONGO_DATABASE",
-                    config.get("mongodb", "database", fallback="LightRAG"),
-                )
+            instance = cls._instances.get(resource_key)
+            if instance is None:
                 client = AsyncMongoClient(
                     uri,
                     driver=DriverInfo(name="LightRAG", version=__version__),
                 )
                 db = client.get_database(database_name)
-                cls._instances["client"] = client
-                cls._instances["db"] = db
-                cls._instances["ref_count"] = 0
-            cls._instances["ref_count"] += 1
-            return cls._instances["db"]
+                instance = {"client": client, "db": db, "ref_count": 0}
+                cls._instances[resource_key] = instance
+            instance["ref_count"] += 1
+            return instance["db"]
 
     @classmethod
     async def release_client(cls, db: AsyncDatabase):
         async with cls._lock:
-            if db is not None:
-                if db is cls._instances["db"]:
-                    cls._instances["ref_count"] -= 1
-                    if cls._instances["ref_count"] == 0:
-                        client = cls._instances.get("client")
-                        if client is not None:
-                            await client.close()
-                        cls._instances["client"] = None
-                        cls._instances["db"] = None
+            if db is None:
+                return
+            for resource_key, instance in list(cls._instances.items()):
+                if db is not instance["db"]:
+                    continue
+                instance["ref_count"] -= 1
+                if instance["ref_count"] <= 0:
+                    client = instance.get("client")
+                    if client is not None:
+                        await client.close()
+                    del cls._instances[resource_key]
+                return
 
 
 @final
@@ -340,7 +357,9 @@ class MongoKVStorage(BaseKVStorage):
         validate_workspace(self.workspace)
         # Check for MONGODB_WORKSPACE environment variable first (higher priority)
         # This allows administrators to force a specific workspace for all MongoDB storage instances
-        mongodb_workspace = os.environ.get("MONGODB_WORKSPACE")
+        mongodb_workspace = resolve_workspace_override(
+            self.global_config, "mongo", "MONGODB_WORKSPACE"
+        )
         if mongodb_workspace and mongodb_workspace.strip():
             # Use environment variable value, overriding the passed workspace parameter
             effective_workspace = mongodb_workspace.strip()
@@ -380,7 +399,9 @@ class MongoKVStorage(BaseKVStorage):
     async def initialize(self):
         async with get_data_init_lock():
             if self.db is None:
-                self.db = await ClientManager.get_client()
+                self.db = await ClientManager.get_client(
+                    get_storage_profile_section(self.global_config, "mongo")
+                )
 
             self._data = await get_or_create_collection(self.db, self._collection_name)
             logger.debug(
@@ -589,7 +610,9 @@ class MongoDocStatusStorage(DocStatusStorage):
         validate_workspace(self.workspace)
         # Check for MONGODB_WORKSPACE environment variable first (higher priority)
         # This allows administrators to force a specific workspace for all MongoDB storage instances
-        mongodb_workspace = os.environ.get("MONGODB_WORKSPACE")
+        mongodb_workspace = resolve_workspace_override(
+            self.global_config, "mongo", "MONGODB_WORKSPACE"
+        )
         if mongodb_workspace and mongodb_workspace.strip():
             # Use environment variable value, overriding the passed workspace parameter
             effective_workspace = mongodb_workspace.strip()
@@ -623,7 +646,9 @@ class MongoDocStatusStorage(DocStatusStorage):
     async def initialize(self):
         async with get_data_init_lock():
             if self.db is None:
-                self.db = await ClientManager.get_client()
+                self.db = await ClientManager.get_client(
+                    get_storage_profile_section(self.global_config, "mongo")
+                )
 
             self._data = await get_or_create_collection(self.db, self._collection_name)
 
@@ -1103,7 +1128,9 @@ class MongoGraphStorage(BaseGraphStorage):
         validate_workspace(self.workspace)
         # Check for MONGODB_WORKSPACE environment variable first (higher priority)
         # This allows administrators to force a specific workspace for all MongoDB storage instances
-        mongodb_workspace = os.environ.get("MONGODB_WORKSPACE")
+        mongodb_workspace = resolve_workspace_override(
+            self.global_config, "mongo", "MONGODB_WORKSPACE"
+        )
         if mongodb_workspace and mongodb_workspace.strip():
             # Use environment variable value, overriding the passed workspace parameter
             effective_workspace = mongodb_workspace.strip()
@@ -1143,7 +1170,9 @@ class MongoGraphStorage(BaseGraphStorage):
     async def initialize(self):
         async with get_data_init_lock():
             if self.db is None:
-                self.db = await ClientManager.get_client()
+                self.db = await ClientManager.get_client(
+                    get_storage_profile_section(self.global_config, "mongo")
+                )
 
             self.collection = await get_or_create_collection(
                 self.db, self._collection_name
@@ -2883,7 +2912,9 @@ class MongoVectorDBStorage(BaseVectorStorage):
 
         # Check for MONGODB_WORKSPACE environment variable first (higher priority)
         # This allows administrators to force a specific workspace for all MongoDB storage instances
-        mongodb_workspace = os.environ.get("MONGODB_WORKSPACE")
+        mongodb_workspace = resolve_workspace_override(
+            self.global_config, "mongo", "MONGODB_WORKSPACE"
+        )
         if mongodb_workspace and mongodb_workspace.strip():
             # Use environment variable value, overriding the passed workspace parameter
             effective_workspace = mongodb_workspace.strip()
@@ -2952,7 +2983,9 @@ class MongoVectorDBStorage(BaseVectorStorage):
     async def initialize(self):
         async with get_data_init_lock():
             if self.db is None:
-                self.db = await ClientManager.get_client()
+                self.db = await ClientManager.get_client(
+                    get_storage_profile_section(self.global_config, "mongo")
+                )
 
             self._data = await get_or_create_collection(self.db, self._collection_name)
 

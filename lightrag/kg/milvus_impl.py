@@ -18,6 +18,10 @@ from ..constants import (
     GRAPH_FIELD_SEP,
 )
 from ..kg.shared_storage import get_data_init_lock, get_namespace_lock
+from ..kg.storage_profiles import (
+    get_storage_profile_section,
+    resolve_workspace_override,
+)
 import pipmaster as pm
 
 if not pm.is_installed("pymilvus"):
@@ -438,8 +442,10 @@ class MilvusIndexConfig:
 class MilvusVectorDBStorage(BaseVectorStorage):
     def _get_milvus_connection_kwargs(self, include_db_name: bool = True) -> dict:
         """Build Milvus connection kwargs from env/config."""
+        profile = get_storage_profile_section(self.global_config, "milvus")
         connection_kwargs = {
-            "uri": os.environ.get(
+            "uri": profile.get("uri")
+            or os.environ.get(
                 "MILVUS_URI",
                 config.get(
                     "milvus",
@@ -449,19 +455,22 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     ),
                 ),
             ),
-            "user": os.environ.get(
+            "user": profile.get("user")
+            or os.environ.get(
                 "MILVUS_USER", config.get("milvus", "user", fallback=None)
             ),
-            "password": os.environ.get(
+            "password": profile.get("password")
+            or os.environ.get(
                 "MILVUS_PASSWORD",
                 config.get("milvus", "password", fallback=None),
             ),
-            "token": os.environ.get(
+            "token": profile.get("token")
+            or os.environ.get(
                 "MILVUS_TOKEN", config.get("milvus", "token", fallback=None)
             ),
         }
 
-        db_name = os.environ.get(
+        db_name = profile.get("db_name") or os.environ.get(
             "MILVUS_DB_NAME",
             config.get("milvus", "db_name", fallback=None),
         )
@@ -2089,7 +2098,9 @@ class MilvusVectorDBStorage(BaseVectorStorage):
 
         # Check for MILVUS_WORKSPACE environment variable first (higher priority)
         # This allows administrators to force a specific workspace for all Milvus storage instances
-        milvus_workspace = os.environ.get("MILVUS_WORKSPACE")
+        milvus_workspace = resolve_workspace_override(
+            self.global_config, "milvus", "MILVUS_WORKSPACE"
+        )
         if milvus_workspace and milvus_workspace.strip():
             # Use environment variable value, overriding the passed workspace parameter
             effective_workspace = milvus_workspace.strip()
