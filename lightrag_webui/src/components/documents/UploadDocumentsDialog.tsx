@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect } from 'react'
 import { FileRejection } from 'react-dropzone'
 import Button from '@/components/ui/Button'
 import {
@@ -12,7 +12,27 @@ import {
 import FileUploader from '@/components/ui/FileUploader'
 import { toast } from 'sonner'
 import { errorMessage } from '@/lib/utils'
-import { uploadDocument } from '@/api/lightrag'
+import {
+  createKnowledgeBase,
+  KnowledgeBase,
+  listKnowledgeBases,
+  StorageProfileSummary,
+  uploadDocument
+} from '@/api/lightrag'
+import Input from '@/components/ui/Input'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue
+} from '@/components/ui/Select'
+import { useSettingsStore } from '@/stores/settings'
+import { useGraphStore } from '@/stores/graph'
+import {
+  buildKnowledgeBaseUploadOptions,
+  NEW_KNOWLEDGE_BASE_UPLOAD_TARGET
+} from './uploadKnowledgeBaseOptions'
 
 import { UploadIcon } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
@@ -36,6 +56,46 @@ export default function UploadDocumentsDialog({
   const [isUploading, setIsUploading] = useState(false)
   const [progresses, setProgresses] = useState<Record<string, number>>({})
   const [fileErrors, setFileErrors] = useState<Record<string, string>>({})
+  const [uploadTarget, setUploadTarget] = useState(NEW_KNOWLEDGE_BASE_UPLOAD_TARGET)
+  const [newKnowledgeBaseName, setNewKnowledgeBaseName] = useState('')
+  const [newIsolationLevel, setNewIsolationLevel] = useState<'logical' | 'physical'>('logical')
+  const [newStorageProfileId, setNewStorageProfileId] = useState('')
+  const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[]>([])
+  const [storageProfiles, setStorageProfiles] = useState<StorageProfileSummary[]>([])
+  const [loadingTargets, setLoadingTargets] = useState(false)
+  const selectedKnowledgeBaseId = useSettingsStore.use.selectedKnowledgeBaseId()
+  const setSelectedKnowledgeBaseId = useSettingsStore.use.setSelectedKnowledgeBaseId()
+  const uploadOptions = buildKnowledgeBaseUploadOptions(knowledgeBases)
+
+  useEffect(() => {
+    if (!open) return
+
+    let active = true
+    void listKnowledgeBases()
+      .then((response) => {
+        if (!active) return
+        setKnowledgeBases(response.knowledge_bases)
+        setStorageProfiles(
+          response.storage_profiles.filter((profile) => profile.available && profile.dedicated)
+        )
+      })
+      .catch((error) => {
+        if (!active) return
+        toast.error(
+          t('knowledgeBases.loadError', {
+            defaultValue: 'Failed to load knowledge bases: {{error}}',
+            error: errorMessage(error)
+          })
+        )
+      })
+      .finally(() => {
+        if (active) setLoadingTargets(false)
+      })
+
+    return () => {
+      active = false
+    }
+  }, [open, t])
 
   const handleRejectedFiles = useCallback(
     (rejectedFiles: FileRejection[]) => {
@@ -83,6 +143,32 @@ export default function UploadDocumentsDialog({
       const toastId = toast.loading(t('documentPanel.uploadDocuments.batch.uploading'))
 
       try {
+        let targetKnowledgeBaseId = uploadTarget
+        let createdKnowledgeBase: KnowledgeBase | null = null
+        const selectedKnowledgeBaseAtStart = selectedKnowledgeBaseId
+
+        if (uploadTarget === NEW_KNOWLEDGE_BASE_UPLOAD_TARGET) {
+          const name = newKnowledgeBaseName.trim()
+          if (!name) {
+            throw new Error(
+              t('knowledgeBases.nameRequired', 'Enter a name for the new knowledge base')
+            )
+          }
+          if (newIsolationLevel === 'physical' && !newStorageProfileId) {
+            throw new Error(
+              t('knowledgeBases.profileRequired', 'Select an available storage profile')
+            )
+          }
+          createdKnowledgeBase = await createKnowledgeBase({
+            name,
+            isolation_level: newIsolationLevel,
+            storage_profile_id:
+              newIsolationLevel === 'physical' ? newStorageProfileId : null
+          })
+          targetKnowledgeBaseId = createdKnowledgeBase.id
+          window.dispatchEvent(new CustomEvent('lightrag:knowledge-bases-changed'))
+        }
+
         // Track errors locally to ensure we have the final state
         const uploadErrors: Record<string, string> = {}
         let batchProbeTriggered = false
@@ -105,13 +191,17 @@ export default function UploadDocumentsDialog({
               [file.name]: 0
             }))
 
-            const result = await uploadDocument(file, (percentCompleted: number) => {
-              console.debug(t('documentPanel.uploadDocuments.single.uploading', { name: file.name, percent: percentCompleted }))
-              setProgresses((pre) => ({
-                ...pre,
-                [file.name]: percentCompleted
-              }))
-            })
+            const result = await uploadDocument(
+              file,
+              (percentCompleted: number) => {
+                console.debug(t('documentPanel.uploadDocuments.single.uploading', { name: file.name, percent: percentCompleted }))
+                setProgresses((pre) => ({
+                  ...pre,
+                  [file.name]: percentCompleted
+                }))
+              },
+              targetKnowledgeBaseId
+            )
 
             if (result.status !== 'success') {
               uploadErrors[file.name] = result.message
@@ -124,7 +214,9 @@ export default function UploadDocumentsDialog({
               hasSuccessfulUpload = true
               if (!batchProbeTriggered) {
                 batchProbeTriggered = true
-                onUploadBatchAccepted?.()
+                if (targetKnowledgeBaseId === selectedKnowledgeBaseAtStart) {
+                  onUploadBatchAccepted?.()
+                }
               }
             }
           } catch (err) {
@@ -186,12 +278,22 @@ export default function UploadDocumentsDialog({
 
         // Only update if at least one file was uploaded successfully
         if (hasSuccessfulUpload) {
-          // Refresh document list
-          if (onDocumentsUploaded) {
+          if (targetKnowledgeBaseId !== selectedKnowledgeBaseAtStart) {
+            setSelectedKnowledgeBaseId(targetKnowledgeBaseId)
+            useGraphStore.getState().reset()
+            window.location.reload()
+          } else if (onDocumentsUploaded) {
             onDocumentsUploaded().catch(err => {
               console.error('Error refreshing documents:', err)
             })
           }
+        } else if (createdKnowledgeBase) {
+          toast.warning(
+            t(
+              'knowledgeBases.createdWithoutUpload',
+              'The knowledge base was created, but no file was accepted. You can select it and retry.'
+            )
+          )
         }
       } catch (err) {
         console.error('Unexpected error during upload:', err)
@@ -200,7 +302,20 @@ export default function UploadDocumentsDialog({
         setIsUploading(false)
       }
     },
-    [setIsUploading, setProgresses, setFileErrors, t, onDocumentsUploaded, onUploadBatchAccepted]
+    [
+      setIsUploading,
+      setProgresses,
+      setFileErrors,
+      t,
+      onDocumentsUploaded,
+      onUploadBatchAccepted,
+      uploadTarget,
+      newKnowledgeBaseName,
+      newIsolationLevel,
+      newStorageProfileId,
+      selectedKnowledgeBaseId,
+      setSelectedKnowledgeBaseId
+    ]
   )
 
   return (
@@ -210,9 +325,16 @@ export default function UploadDocumentsDialog({
         if (isUploading) {
           return
         }
+        if (open) {
+          setLoadingTargets(true)
+        }
         if (!open) {
           setProgresses({})
           setFileErrors({})
+          setUploadTarget(NEW_KNOWLEDGE_BASE_UPLOAD_TARGET)
+          setNewKnowledgeBaseName('')
+          setNewIsolationLevel('logical')
+          setNewStorageProfileId('')
         }
         setOpen(open)
       }}
@@ -229,6 +351,89 @@ export default function UploadDocumentsDialog({
             {t('documentPanel.uploadDocuments.description')}
           </DialogDescription>
         </DialogHeader>
+        <div className="grid gap-2">
+          <label className="text-sm font-medium" htmlFor="upload-knowledge-base-target">
+            {t('knowledgeBases.uploadTarget', 'Upload destination')}
+          </label>
+          <Select value={uploadTarget} onValueChange={setUploadTarget} disabled={isUploading || loadingTargets}>
+            <SelectTrigger id="upload-knowledge-base-target">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={NEW_KNOWLEDGE_BASE_UPLOAD_TARGET}>
+                {t('knowledgeBases.createIsolated', 'Create an isolated knowledge base')}
+              </SelectItem>
+              {uploadOptions.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          {uploadTarget === NEW_KNOWLEDGE_BASE_UPLOAD_TARGET && (
+            <div className="grid gap-2">
+              <Input
+                value={newKnowledgeBaseName}
+                onChange={(event) => setNewKnowledgeBaseName(event.target.value)}
+                placeholder={t('knowledgeBases.namePlaceholder', 'Knowledge base name')}
+                maxLength={128}
+                disabled={isUploading}
+                autoFocus
+              />
+              <Select
+                value={newIsolationLevel}
+                onValueChange={(value) => {
+                  setNewIsolationLevel(value as 'logical' | 'physical')
+                  if (value === 'logical') setNewStorageProfileId('')
+                }}
+                disabled={isUploading}
+              >
+                <SelectTrigger aria-label={t('knowledgeBases.isolationLevel', 'Isolation level')}>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="logical">
+                    {t('knowledgeBases.logicalIsolation', 'Logical isolation')}
+                  </SelectItem>
+                  <SelectItem value="physical">
+                    {t('knowledgeBases.physicalIsolation', 'Physical isolation')}
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+              {newIsolationLevel === 'physical' && (
+                <Select
+                  value={newStorageProfileId}
+                  onValueChange={setNewStorageProfileId}
+                  disabled={isUploading || storageProfiles.length === 0}
+                >
+                  <SelectTrigger aria-label={t('knowledgeBases.storageProfile', 'Storage profile')}>
+                    <SelectValue
+                      placeholder={t('knowledgeBases.selectStorageProfile', 'Select a storage profile')}
+                    />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {storageProfiles.map((profile) => (
+                      <SelectItem key={profile.id} value={profile.id}>
+                        {profile.id}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
+            </div>
+          )}
+          <p className="text-muted-foreground text-xs">
+            {uploadTarget === NEW_KNOWLEDGE_BASE_UPLOAD_TARGET
+              ? t(
+                'knowledgeBases.isolatedHint',
+                'A new RAG, graph, cache, document directory, and pipeline namespace will be created.'
+              )
+              : t(
+                'knowledgeBases.incrementalHint',
+                'The files will incrementally update the selected RAG, graph, and cache.'
+              )}
+          </p>
+        </div>
         <FileUploader
           maxFileCount={Infinity}
           maxSize={200 * 1024 * 1024}

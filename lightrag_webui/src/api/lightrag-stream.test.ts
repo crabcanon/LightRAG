@@ -24,7 +24,16 @@ Object.defineProperty(globalThis, 'sessionStorage', {
 // Mock zustand stores — both return a vanilla store-like object with getState()
 let storeApiKey: string | null = null
 let storeIsGuestMode = false
-const fakeSettingsStore = { getState: () => ({ apiKey: storeApiKey }) }
+let storeSelectedKnowledgeBaseId = 'default'
+const fakeSettingsStore = {
+  getState: () => ({
+    apiKey: storeApiKey,
+    selectedKnowledgeBaseId: storeSelectedKnowledgeBaseId,
+    setSelectedKnowledgeBaseId: (knowledgeBaseId: string) => {
+      storeSelectedKnowledgeBaseId = knowledgeBaseId
+    },
+  }),
+}
 const fakeAuthStore = {
   getState: () => ({
     isGuestMode: storeIsGuestMode,
@@ -156,6 +165,7 @@ afterEach(() => {
   storageData.clear()
   storeApiKey = null
   storeIsGuestMode = false
+  storeSelectedKnowledgeBaseId = 'default'
 })
 
 describe('queryTextStream — normal path', () => {
@@ -454,6 +464,24 @@ describe('queryTextStream — auth headers', () => {
 
     const sentHeaders = capturedHeaders as Record<string, string>
     expect(sentHeaders['Authorization']).toBeUndefined()
+  })
+
+  test('includes the selected knowledge-base header', async () => {
+    storeSelectedKnowledgeBaseId = 'kb_streaming'
+    let capturedHeaders: HeadersInit | undefined
+    installFetchMock((_url: string, init?: RequestInit) => {
+      capturedHeaders = init?.headers
+      return makeNdjsonResponse(['{"response": "ok"}'])
+    })
+
+    await apiModule.queryTextStream(
+      makeQueryRequest(),
+      () => {},
+      () => {}
+    )
+
+    const sentHeaders = capturedHeaders as Record<string, string>
+    expect(sentHeaders['LIGHTRAG-KNOWLEDGE-BASE']).toBe('kb_streaming')
   })
 
   test('calls /query/stream endpoint', async () => {
