@@ -42,6 +42,7 @@ logger = logging.getLogger("lightrag")
 # an in-flight write from another live process cannot plausibly still be
 # running (multi-million-node graphml writes finish in minutes, not hours).
 TMP_REAP_AGE_SECONDS = 3600
+REPLACE_RETRY_DELAYS_SECONDS = (0.005, 0.01, 0.02, 0.04, 0.08)
 
 
 def tmp_path_for(file_name: str) -> str:
@@ -130,7 +131,17 @@ def atomic_write(
     try:
         write_fn(tmp)
         _preserve_mode(tmp, file_name, workspace)
-        os.replace(tmp, file_name)
+        for attempt in range(len(REPLACE_RETRY_DELAYS_SECONDS) + 1):
+            try:
+                os.replace(tmp, file_name)
+                break
+            except PermissionError:
+                if attempt == len(REPLACE_RETRY_DELAYS_SECONDS):
+                    raise
+                # Windows may briefly report a sharing violation when two
+                # writers replace the same destination at once. Retrying the
+                # same atomic rename preserves the old-or-new file contract.
+                time.sleep(REPLACE_RETRY_DELAYS_SECONDS[attempt])
     except BaseException:
         try:
             if os.path.exists(tmp):
