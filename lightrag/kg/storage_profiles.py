@@ -36,39 +36,19 @@ STORAGE_ISOLATION_CAPABILITIES: dict[str, StorageIsolationCapability] = {
     "FaissVectorDBStorage": StorageIsolationCapability(None, None),
     # External services use an instance-scoped profile section.
     "RedisKVStorage": StorageIsolationCapability("redis", "REDIS_WORKSPACE"),
-    "RedisDocStatusStorage": StorageIsolationCapability(
-        "redis", "REDIS_WORKSPACE"
-    ),
+    "RedisDocStatusStorage": StorageIsolationCapability("redis", "REDIS_WORKSPACE"),
     "PGKVStorage": StorageIsolationCapability("postgres", "POSTGRES_WORKSPACE"),
-    "PGVectorStorage": StorageIsolationCapability(
-        "postgres", "POSTGRES_WORKSPACE"
-    ),
-    "PGGraphStorage": StorageIsolationCapability(
-        "postgres", "POSTGRES_WORKSPACE"
-    ),
-    "PGDocStatusStorage": StorageIsolationCapability(
-        "postgres", "POSTGRES_WORKSPACE"
-    ),
+    "PGVectorStorage": StorageIsolationCapability("postgres", "POSTGRES_WORKSPACE"),
+    "PGGraphStorage": StorageIsolationCapability("postgres", "POSTGRES_WORKSPACE"),
+    "PGDocStatusStorage": StorageIsolationCapability("postgres", "POSTGRES_WORKSPACE"),
     "Neo4JStorage": StorageIsolationCapability("neo4j", "NEO4J_WORKSPACE"),
     "MongoKVStorage": StorageIsolationCapability("mongo", "MONGODB_WORKSPACE"),
-    "MongoDocStatusStorage": StorageIsolationCapability(
-        "mongo", "MONGODB_WORKSPACE"
-    ),
-    "MongoGraphStorage": StorageIsolationCapability(
-        "mongo", "MONGODB_WORKSPACE"
-    ),
-    "MongoVectorDBStorage": StorageIsolationCapability(
-        "mongo", "MONGODB_WORKSPACE"
-    ),
-    "MilvusVectorDBStorage": StorageIsolationCapability(
-        "milvus", "MILVUS_WORKSPACE"
-    ),
-    "QdrantVectorDBStorage": StorageIsolationCapability(
-        "qdrant", "QDRANT_WORKSPACE"
-    ),
-    "MemgraphStorage": StorageIsolationCapability(
-        "memgraph", "MEMGRAPH_WORKSPACE"
-    ),
+    "MongoDocStatusStorage": StorageIsolationCapability("mongo", "MONGODB_WORKSPACE"),
+    "MongoGraphStorage": StorageIsolationCapability("mongo", "MONGODB_WORKSPACE"),
+    "MongoVectorDBStorage": StorageIsolationCapability("mongo", "MONGODB_WORKSPACE"),
+    "MilvusVectorDBStorage": StorageIsolationCapability("milvus", "MILVUS_WORKSPACE"),
+    "QdrantVectorDBStorage": StorageIsolationCapability("qdrant", "QDRANT_WORKSPACE"),
+    "MemgraphStorage": StorageIsolationCapability("memgraph", "MEMGRAPH_WORKSPACE"),
     "OpenSearchKVStorage": StorageIsolationCapability(
         "opensearch", "OPENSEARCH_WORKSPACE"
     ),
@@ -133,7 +113,9 @@ def resolve_workspace_override(
     return value or None
 
 
-def required_profile_sections(storage_implementations: Sequence[str]) -> tuple[str, ...]:
+def required_profile_sections(
+    storage_implementations: Sequence[str],
+) -> tuple[str, ...]:
     """Return deterministic profile sections required by active backends."""
 
     sections = {"working_dir", "input_dir"}
@@ -271,7 +253,9 @@ def profile_resource_fingerprints(
                     value = _resource_url(section, value)
                 if isinstance(value, list):
                     value = sorted(
-                        _resource_host(item) if field == "hosts" else str(item).strip().lower()
+                        _resource_host(item)
+                        if field == "hosts"
+                        else str(item).strip().lower()
                         for item in value
                     )
                 elif field in {"host", "port"}:
@@ -335,9 +319,7 @@ def build_default_resource_profile(
             }
         elif section == "redis":
             profile[section] = {
-                "uri": setting(
-                    "REDIS_URI", "redis", "uri", "redis://localhost:6379"
-                )
+                "uri": setting("REDIS_URI", "redis", "uri", "redis://localhost:6379")
             }
         elif section == "mongo":
             profile[section] = {
@@ -362,9 +344,7 @@ def build_default_resource_profile(
                 "db_name": setting("MILVUS_DB_NAME", "milvus", "db_name"),
             }
         elif section == "qdrant":
-            profile[section] = {
-                "url": setting("QDRANT_URL", "qdrant", "uri")
-            }
+            profile[section] = {"url": setting("QDRANT_URL", "qdrant", "uri")}
         elif section == "memgraph":
             profile[section] = {
                 "uri": setting(
@@ -375,9 +355,7 @@ def build_default_resource_profile(
                 ),
             }
         elif section == "opensearch":
-            hosts = setting(
-                "OPENSEARCH_HOSTS", "opensearch", "hosts", "localhost:9200"
-            )
+            hosts = setting("OPENSEARCH_HOSTS", "opensearch", "hosts", "localhost:9200")
             profile[section] = {
                 "hosts": (
                     [item.strip() for item in str(hosts).split(",") if item.strip()]

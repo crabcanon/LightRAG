@@ -194,9 +194,10 @@ def test_resource_fingerprint_ignores_credentials_but_detects_resource_changes(
 
     first = profile_resource_fingerprints(base, required)
     assert profile_resource_fingerprints(changed_credentials, required) == first
-    assert profile_resource_fingerprints(changed_database, required)["mongo"] != first[
-        "mongo"
-    ]
+    assert (
+        profile_resource_fingerprints(changed_database, required)["mongo"]
+        != first["mongo"]
+    )
 
 
 def test_malformed_uri_has_a_stable_resource_fingerprint(tmp_path: Path) -> None:

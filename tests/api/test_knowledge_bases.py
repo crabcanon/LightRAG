@@ -19,6 +19,7 @@ from lightrag.api.knowledge_bases import (
     KnowledgeBaseManager,
     StorageProfileError,
 )
+
 _original_argv = sys.argv[:]
 sys.argv = [sys.argv[0]]
 _graph_routes = importlib.import_module("lightrag.api.routers.graph_routes")
@@ -453,9 +454,7 @@ def test_forced_storage_workspace_rejects_dynamic_library(
     monkeypatch, tmp_path: Path, implementation: str, workspace_variable: str
 ):
     monkeypatch.setenv(workspace_variable, "forced")
-    manager = _manager(
-        tmp_path, active_storage_implementations=(implementation,) * 4
-    )
+    manager = _manager(tmp_path, active_storage_implementations=(implementation,) * 4)
 
     with pytest.raises(StorageProfileError, match=workspace_variable):
         manager.create(
@@ -510,9 +509,7 @@ def test_different_profile_ids_cannot_reuse_the_same_physical_resources(
         profiles={"first": first, "second": second},
         active_storage_implementations=("MongoKVStorage",) * 4,
     )
-    manager.create(
-        name="First", isolation_level="physical", storage_profile_id="first"
-    )
+    manager.create(name="First", isolation_level="physical", storage_profile_id="first")
 
     with pytest.raises(StorageProfileError, match="mongo"):
         manager.create(

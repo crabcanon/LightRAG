@@ -376,7 +376,9 @@ class KnowledgeBaseManager:
         ],
         storage_profiles: Mapping[str, Mapping[str, Any]] | None = None,
         default_storage_profile: Mapping[str, Any] | None = None,
-        active_storage_implementations: Sequence[str] = _DEFAULT_STORAGE_IMPLEMENTATIONS,
+        active_storage_implementations: Sequence[
+            str
+        ] = _DEFAULT_STORAGE_IMPLEMENTATIONS,
         max_loaded_instances: int = 32,
     ) -> None:
         if max_loaded_instances < 1:
