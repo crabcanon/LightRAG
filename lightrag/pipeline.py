@@ -16,16 +16,15 @@ import base64
 import inspect
 import json
 
-import json_repair
 import mimetypes
 import os
-import re
 import threading
 import time
 import traceback
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -76,12 +75,14 @@ from lightrag.utils import (
     get_env_value,
     get_llm_cache_identity,
     handle_cache,
+    is_truncated_response,
     logger,
     repair_vlm_json_escape_damage_nested,
     sanitize_text_for_encoding,
     save_to_cache,
     serialize_llm_cache_identity,
     strip_control_characters,
+    tolerant_load_json_dict,
 )
 from lightrag.utils_pipeline import (
     # Re-exported through the pipeline namespace (not used by this module
@@ -123,6 +124,48 @@ _INFLIGHT_DOC_STATUSES = (
     DocStatus.PARSING,
     DocStatus.ANALYZING,
 )
+
+
+@lru_cache(maxsize=64)
+def _warn_content_budget_structurally_starved(
+    *,
+    max_extract: int,
+    leading_cap: int,
+    trailing_cap: int,
+    frame_reserve: int,
+    content_min: int,
+) -> None:
+    """Log once when the configured caps alone starve multimodal content.
+
+    ``lru_cache`` keyed on the config tuple makes this emit a single WARNING
+    per unique configuration per process — an operator heads-up so gross
+    misconfiguration surfaces proactively instead of as a burst of per-item
+    :class:`MultimodalAnalysisError` failures from ``_analyze_text_modality``.
+
+    Conservative by design: ``frame_reserve`` counts only the fixed safety
+    buffer, not the (item-specific, typically much larger) template frame, so
+    ``static_room`` *overestimates* the room left for content.  It therefore
+    warns only in egregious cases where the SURROUNDING caps by themselves
+    already leave less than ``content_min``; the per-item budget floor in
+    ``_analyze_text_modality`` is the true enforcement.
+    """
+    static_room = max_extract - leading_cap - trailing_cap - frame_reserve
+    if static_room >= content_min:
+        return
+    logger.warning(
+        "[analyze_multimodal] MAX_EXTRACT_INPUT_TOKENS=%d leaves only ~%d "
+        "tokens for multimodal content after SURROUNDING caps (leading=%d, "
+        "trailing=%d) and a %d-token reserve — below the content floor of %d "
+        "(MM_EXTRACT_CONTENT_MIN_TOKENS). Items with non-trivial surrounding/"
+        "captions will fail analysis. Raise MAX_EXTRACT_INPUT_TOKENS or lower "
+        "SURROUNDING_LEADING_MAX_TOKENS / SURROUNDING_TRAILING_MAX_TOKENS.",
+        max_extract,
+        static_room,
+        leading_cap,
+        trailing_cap,
+        frame_reserve,
+        content_min,
+    )
 
 
 def _call_source_file_resolver(
@@ -3761,52 +3804,18 @@ class _PipelineMixin:
             _VLM_RASTER_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
             def _json_extract(text: str) -> dict[str, Any]:
-                """Tolerant JSON object recovery.
+                """Tolerant JSON object recovery via :func:`tolerant_load_json_dict`.
 
-                Mirrors :func:`lightrag.operate._process_json_extraction_result`
-                so weaker models that emit ```json ... ``` fenced output,
-                trailing commas, or unquoted keys are still salvageable.
-                The order of attempts is:
-
-                1. Strip a leading ```json fence if present.
-                2. Hand the cleaned string to ``json_repair.loads`` (handles
-                   minor structural slips like trailing commas).
-                3. Fall back to a greedy ``{...}`` regex slice for outputs
-                   that wrap the JSON object in prose, then re-run
-                   ``json_repair.loads`` on the slice.
-
-                String values in the recovered object are passed through
-                ``repair_vlm_json_escape_damage``: models writing LaTeX
-                inside JSON strings routinely under-escape backslashes
-                (``"\\frac"`` is valid JSON meaning form feed + ``rac``),
-                and this is the single choke point both fresh responses
-                and cache hits flow through.
+                String values are passed through ``repair_vlm_json_escape_damage``,
+                the single choke point both fresh responses and cache hits flow
+                through: models writing LaTeX inside JSON strings routinely
+                under-escape backslashes (``"\\frac"`` is valid JSON meaning form
+                feed + ``rac``).
                 """
-                if not text:
+                obj = tolerant_load_json_dict(text)
+                if not obj:
                     return {}
-                candidate = text.strip()
-                fence_match = re.match(
-                    r"^```(?:json)?\s*\n(.*?)\n```$",
-                    candidate,
-                    re.DOTALL | re.IGNORECASE,
-                )
-                if fence_match:
-                    candidate = fence_match.group(1).strip()
-                try:
-                    obj = json_repair.loads(candidate)
-                    if isinstance(obj, dict):
-                        return repair_vlm_json_escape_damage_nested(obj)
-                except Exception:
-                    pass
-                m = re.search(r"\{[\s\S]*\}", candidate)
-                if m:
-                    try:
-                        obj = json_repair.loads(m.group(0))
-                        if isinstance(obj, dict):
-                            return repair_vlm_json_escape_damage_nested(obj)
-                    except Exception:
-                        pass
-                return {}
+                return repair_vlm_json_escape_damage_nested(obj)
 
             class _MMJSONConformanceError(Exception):
                 """Raised only when an LLM/VLM response violates MM JSON schema."""
@@ -3864,7 +3873,10 @@ class _PipelineMixin:
                 """
 
                 def _attempt(raw: Any, fresh: bool) -> tuple[dict[str, str], str, bool]:
-                    text = str(raw)
+                    # Keep str input as-is: str(raw) would rebuild a plain str
+                    # and drop the TruncatedResponse marker the cache guards
+                    # below need to observe.
+                    text = raw if isinstance(raw, str) else str(raw)
                     return validate_result(_json_extract(text)), text, fresh
 
                 use_cached_response = cached is not None
@@ -4056,26 +4068,37 @@ class _PipelineMixin:
                 )
                 cache_id_to_attach: str | None = None
                 if fresh and analysis_cache_enabled:
-                    audit_blob = image_audit_metadata(normalized_images)
-                    original_prompt = prompt + (
-                        f"\n<vlm_images>"
-                        f"{json.dumps(audit_blob, ensure_ascii=False)}"
-                        "</vlm_images>"
-                        if audit_blob
-                        else ""
-                    )
-                    await save_to_cache(
-                        self.llm_response_cache,
-                        CacheData(
-                            args_hash=args_hash,
-                            content=str(result_text),
-                            prompt=original_prompt,
-                            mode="default",
-                            cache_type="analysis",
-                            chunk_id=None,
-                        ),
-                    )
-                    cache_id_to_attach = cache_id
+                    if is_truncated_response(result_text):
+                        # A token-limit-truncated VLM response that still
+                        # parsed must not be persisted: the cache would replay
+                        # the partial analysis on every later run, even once a
+                        # larger token budget would have completed it.
+                        logger.warning(
+                            f"[analyze_multimodal] drawings/{item_id}: skipping "
+                            "analysis cache write for token-limit-truncated "
+                            "VLM response"
+                        )
+                    else:
+                        audit_blob = image_audit_metadata(normalized_images)
+                        original_prompt = prompt + (
+                            f"\n<vlm_images>"
+                            f"{json.dumps(audit_blob, ensure_ascii=False)}"
+                            "</vlm_images>"
+                            if audit_blob
+                            else ""
+                        )
+                        await save_to_cache(
+                            self.llm_response_cache,
+                            CacheData(
+                                args_hash=args_hash,
+                                content=str(result_text),
+                                prompt=original_prompt,
+                                mode="default",
+                                cache_type="analysis",
+                                chunk_id=None,
+                            ),
+                        )
+                        cache_id_to_attach = cache_id
                 elif not fresh:
                     # Cache hit: the entry exists, so attaching its id is
                     # safe (and necessary for document-delete cleanup).
@@ -4157,8 +4180,14 @@ class _PipelineMixin:
                 # it for their model's context window.
                 tokenizer = getattr(self, "tokenizer", None)
                 if tokenizer is not None:
-                    from lightrag.constants import DEFAULT_MAX_EXTRACT_INPUT_TOKENS
-                    from lightrag.multimodal_context import trim_content_to_budget
+                    from lightrag.constants import (
+                        DEFAULT_MAX_EXTRACT_INPUT_TOKENS,
+                        DEFAULT_MM_EXTRACT_CONTENT_MIN_TOKENS,
+                    )
+                    from lightrag.multimodal_context import (
+                        _resolve_surrounding_budget,
+                        trim_content_to_budget,
+                    )
 
                     SAFETY_BUFFER = 256
                     max_extract_tokens = get_env_value(
@@ -4166,6 +4195,30 @@ class _PipelineMixin:
                         DEFAULT_MAX_EXTRACT_INPUT_TOKENS,
                         int,
                     )
+                    content_min_tokens = get_env_value(
+                        "MM_EXTRACT_CONTENT_MIN_TOKENS",
+                        DEFAULT_MM_EXTRACT_CONTENT_MIN_TOKENS,
+                        int,
+                    )
+                    # One-time operator heads-up when the configured caps alone
+                    # (before the per-item template frame) already starve
+                    # content below its floor.  The per-item guard below is the
+                    # real enforcement; this only surfaces gross misconfig once
+                    # instead of as a burst of per-item failures.  Skip it when
+                    # the cap is disabled (max_extract_tokens <= 0): enforcement
+                    # is bypassed too, so no item can fail and the warning would
+                    # be false.
+                    if max_extract_tokens > 0:
+                        leading_cap, trailing_cap = _resolve_surrounding_budget(
+                            None, None
+                        )
+                        _warn_content_budget_structurally_starved(
+                            max_extract=max_extract_tokens,
+                            leading_cap=leading_cap,
+                            trailing_cap=trailing_cap,
+                            frame_reserve=SAFETY_BUFFER,
+                            content_min=content_min_tokens,
+                        )
                     total_tokens = len(tokenizer.encode(prompt))
                     if max_extract_tokens > 0 and total_tokens > max_extract_tokens:
                         frame_tokens = len(tokenizer.encode(_render("")))
@@ -4187,6 +4240,30 @@ class _PipelineMixin:
                                 f"({frame_tokens} tokens) exceeds "
                                 f"MAX_EXTRACT_INPUT_TOKENS "
                                 f"({max_extract_tokens}); raise the cap"
+                            )
+                        if content_budget < content_min_tokens:
+                            # Budget is positive but too thin to ground a useful
+                            # analysis: trimming here would hand the LLM a
+                            # near-empty stub (a few chars of a table body /
+                            # equation), wasting the call and polluting the
+                            # graph with a hallucinated description.  Fail the
+                            # item loudly instead — it is reprocessable
+                            # idempotently once the budget is widened.  Input
+                            # mirror of the output-side floor
+                            # DEFAULT_MM_CHUNK_DESCRIPTION_MIN_TOKENS.
+                            raise MultimodalAnalysisError(
+                                f"{kind}/{item_id}: content budget "
+                                f"({content_budget} tokens) is below the "
+                                f"minimum ({content_min_tokens}); the prompt "
+                                f"frame ({frame_tokens} tokens: template + "
+                                f"surrounding + captions + footnotes) consumed "
+                                f"most of MAX_EXTRACT_INPUT_TOKENS "
+                                f"({max_extract_tokens}), leaving too little "
+                                f"room for content. Raise "
+                                f"MAX_EXTRACT_INPUT_TOKENS or lower "
+                                f"SURROUNDING_LEADING_MAX_TOKENS / "
+                                f"SURROUNDING_TRAILING_MAX_TOKENS / "
+                                f"MM_EXTRACT_CONTENT_MIN_TOKENS"
                             )
                         trimmed, was_trimmed = trim_content_to_budget(
                             content_text,
@@ -4267,18 +4344,25 @@ class _PipelineMixin:
                     result_obj["equation"] = analysis_fields["equation"]
                 cache_id_to_attach: str | None = None
                 if fresh and analysis_cache_enabled:
-                    await save_to_cache(
-                        self.llm_response_cache,
-                        CacheData(
-                            args_hash=args_hash,
-                            content=str(result_text),
-                            prompt=prompt,
-                            mode="default",
-                            cache_type="analysis",
-                            chunk_id=None,
-                        ),
-                    )
-                    cache_id_to_attach = cache_id
+                    if is_truncated_response(result_text):
+                        logger.warning(
+                            f"[analyze_multimodal] {kind}/{item_id}: skipping "
+                            "analysis cache write for token-limit-truncated "
+                            "EXTRACT response"
+                        )
+                    else:
+                        await save_to_cache(
+                            self.llm_response_cache,
+                            CacheData(
+                                args_hash=args_hash,
+                                content=str(result_text),
+                                prompt=prompt,
+                                mode="default",
+                                cache_type="analysis",
+                                chunk_id=None,
+                            ),
+                        )
+                        cache_id_to_attach = cache_id
                 elif not fresh:
                     # Cache hit path (handle_cache already gated by flag):
                     # safe to surface the existing cache_id for cleanup.

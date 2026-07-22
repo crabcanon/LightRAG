@@ -22,6 +22,8 @@ from lightrag.utils import (
     sanitize_and_normalize_extracted_text,
     sanitize_text_for_encoding,
     repair_vlm_json_escape_damage_nested,
+    strip_markdown_code_fence,
+    tolerant_load_json_dict,
     pack_user_ass_to_openai_messages,
     split_string_by_multi_markers,
     truncate_list_by_token_size,
@@ -29,6 +31,7 @@ from lightrag.utils import (
     handle_cache,
     save_to_cache,
     CacheData,
+    is_truncated_response,
     use_llm_func_with_cache,
     get_env_value,
     get_llm_cache_identity,
@@ -85,7 +88,7 @@ from lightrag.constants import (
     DEFAULT_ENTITY_NAME_MAX_LENGTH,
     DEFAULT_ENTITY_NAME_MAX_BYTES,
 )
-from lightrag.kg.shared_storage import get_storage_keyed_lock
+from lightrag.kg.shared_storage import PipelineStatusLogger, get_storage_keyed_lock
 import time
 from dotenv import load_dotenv
 
@@ -787,7 +790,7 @@ def _looks_like_json_extraction_result(result: str) -> bool:
         return True
 
     if stripped.startswith("```"):
-        return _strip_markdown_code_fence(stripped).strip().startswith(("{", "["))
+        return strip_markdown_code_fence(stripped).strip().startswith(("{", "["))
 
     return False
 
@@ -801,7 +804,8 @@ async def _process_json_extraction_result(
     """Process a JSON-formatted extraction result from LLM.
 
     This function parses the LLM response as JSON and extracts entities and relationships.
-    It uses json_repair to handle slightly malformed JSON from weaker models.
+    It uses :func:`tolerant_load_json_dict` to recover JSON from fenced,
+    prose-wrapped, or slightly malformed responses from weaker models.
 
     Args:
         result: The JSON extraction result from LLM
@@ -815,17 +819,16 @@ async def _process_json_extraction_result(
     maybe_nodes = defaultdict(list)
     maybe_edges = defaultdict(list)
 
-    try:
-        # Parse the JSON response using json_repair for robustness
-        parsed = json_repair.loads(_strip_markdown_code_fence(result).strip())
-    except Exception as e:
-        logger.warning(f"{chunk_key}: Failed to parse JSON extraction result: {e}")
-        return dict(maybe_nodes), dict(maybe_edges)
-
-    if not isinstance(parsed, dict):
-        logger.warning(
-            f"{chunk_key}: JSON extraction result is not a dict, got {type(parsed).__name__}"
-        )
+    # tolerant_load_json_dict strips fences, tolerates leading/trailing prose
+    # (including trailing braces), and repairs the malformed-object slips
+    # json_repair fixes. It never raises and returns {} for unparseable input or
+    # a top-level array (callers require exactly one object). Note: because the
+    # helper absorbs the underlying parse exception, only this single "empty or
+    # unrecoverable" warning is logged — the low-level decode error is no longer
+    # surfaced.
+    parsed = tolerant_load_json_dict(result)
+    if not parsed:
+        logger.warning(f"{chunk_key}: JSON extraction result is empty or unrecoverable")
         return dict(maybe_nodes), dict(maybe_edges)
 
     # Models quoting LaTeX in descriptions routinely under-escape backslashes
@@ -1034,6 +1037,11 @@ async def rebuild_knowledge_from_chunks(
     if not entities_to_rebuild and not relationships_to_rebuild:
         return report
 
+    # Operation-scoped status logger for per-item FAILURE messages: errors must
+    # stay visible in the pipeline history (the WebUI reads it), while per-item
+    # success/completion detail goes to the backend log only (volume control).
+    status_logger = PipelineStatusLogger(pipeline_status)
+
     # Get all referenced chunk IDs
     all_referenced_chunk_ids = set()
     for chunk_ids in entities_to_rebuild.values():
@@ -1154,10 +1162,7 @@ async def rebuild_knowledge_from_chunks(
                 f"Failed to parse cached extraction result for chunk {chunk_id}: {e}"
             )
             logger.warning(status_message)
-            if pipeline_status is not None and pipeline_status_lock is not None:
-                async with pipeline_status_lock:
-                    pipeline_status["latest_message"] = status_message
-                    pipeline_status["history_messages"].append(status_message)
+            status_logger.log(status_message)
             continue
 
     # Get max async tasks limit from global_config for semaphore control
@@ -1198,11 +1203,8 @@ async def rebuild_knowledge_from_chunks(
                 except Exception as e:
                     failed_entities_count += 1
                     status_message = f"Failed to rebuild `{entity_name}`: {e}"
-                    logger.info(status_message)  # Per requirement, change to info
-                    if pipeline_status is not None and pipeline_status_lock is not None:
-                        async with pipeline_status_lock:
-                            pipeline_status["latest_message"] = status_message
-                            pipeline_status["history_messages"].append(status_message)
+                    logger.info(status_message)
+                    status_logger.log(status_message)
                     if rebuild_policy == "rollback":
                         # A real storage/rebuild failure is retryable and must
                         # retain the custom-chunk journal.
@@ -1233,8 +1235,6 @@ async def rebuild_knowledge_from_chunks(
                         global_config=global_config,
                         relation_chunks_storage=relation_chunks_storage,
                         entity_chunks_storage=entity_chunks_storage,
-                        pipeline_status=pipeline_status,
-                        pipeline_status_lock=pipeline_status_lock,
                         chunk_data_by_id=chunk_data_by_id,
                         structural_fallback=structural_fallback,
                     )
@@ -1244,11 +1244,8 @@ async def rebuild_knowledge_from_chunks(
                 except Exception as e:
                     failed_relationships_count += 1
                     status_message = f"Failed to rebuild `{src}`~`{tgt}`: {e}"
-                    logger.info(status_message)  # Per requirement, change to info
-                    if pipeline_status is not None and pipeline_status_lock is not None:
-                        async with pipeline_status_lock:
-                            pipeline_status["latest_message"] = status_message
-                            pipeline_status["history_messages"].append(status_message)
+                    logger.info(status_message)
+                    status_logger.log(status_message)
                     if rebuild_policy == "rollback":
                         # A real storage/rebuild failure is retryable and must
                         # retain the custom-chunk journal.
@@ -1628,8 +1625,6 @@ async def _rebuild_single_entity(
     llm_response_cache: BaseKVStorage,
     global_config: dict[str, str],
     entity_chunks_storage: BaseKVStorage | None = None,
-    pipeline_status: dict | None = None,
-    pipeline_status_lock=None,
     chunk_data_by_id: dict[str, dict[str, Any]] | None = None,
     structural_fallback: bool = False,
 ) -> bool:
@@ -1873,16 +1868,13 @@ async def _rebuild_single_entity(
         truncation_info,
     )
 
-    # Log rebuild completion with truncation info
+    # Log rebuild completion with truncation info. Per-item detail goes to the
+    # backend log only; pipeline history keeps the rebuild summary (volume
+    # control).
     status_message = f"Rebuild `{entity_name}` from {len(chunk_ids)} chunks"
     if truncation_info:
         status_message += f" ({truncation_info})"
     logger.info(status_message)
-    # Update pipeline status
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            pipeline_status["latest_message"] = status_message
-            pipeline_status["history_messages"].append(status_message)
     return False
 
 
@@ -1898,8 +1890,6 @@ async def _rebuild_single_relationship(
     global_config: dict[str, str],
     relation_chunks_storage: BaseKVStorage | None = None,
     entity_chunks_storage: BaseKVStorage | None = None,
-    pipeline_status: dict | None = None,
-    pipeline_status_lock=None,
     chunk_data_by_id: dict[str, dict[str, Any]] | None = None,
     structural_fallback: bool = False,
 ) -> bool:
@@ -2172,7 +2162,9 @@ async def _rebuild_single_relationship(
         logger.error(error_msg)
         raise  # Re-raise exception
 
-    # Log rebuild completion with truncation info
+    # Log rebuild completion with truncation info. Per-item detail goes to the
+    # backend log only; pipeline history keeps the rebuild summary (volume
+    # control).
     status_message = f"Rebuild `{src}`~`{tgt}` from {len(chunk_ids)} chunks"
     if truncation_info:
         status_message += f" ({truncation_info})"
@@ -2184,12 +2176,6 @@ async def _rebuild_single_relationship(
         status_message += truncation_info
 
     logger.info(status_message)
-
-    # Update pipeline status
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            pipeline_status["latest_message"] = status_message
-            pipeline_status["history_messages"].append(status_message)
     return degraded
 
 
@@ -2248,8 +2234,13 @@ async def _merge_nodes_then_upsert(
     pipeline_status_lock=None,
     llm_response_cache: BaseKVStorage | None = None,
     entity_chunks_storage: BaseKVStorage | None = None,
+    status_logger: PipelineStatusLogger | None = None,
 ):
     """Get existing nodes from knowledge graph use name,if exists, merge data, else create, then upsert."""
+    if status_logger is None:
+        # Fallback for direct callers that pass pipeline_status only; a
+        # throwaway logger reproduces the one-shot helper's behavior.
+        status_logger = PipelineStatusLogger(pipeline_status)
     timing_start = time.perf_counter()
     try:
         already_entity_types = []
@@ -2515,10 +2506,7 @@ async def _merge_nodes_then_upsert(
         # Add message to pipeline satus when merge happens
         if already_fragment > 0 or llm_was_used:
             logger.info(status_message)
-            if pipeline_status is not None and pipeline_status_lock is not None:
-                async with pipeline_status_lock:
-                    pipeline_status["latest_message"] = status_message
-                    pipeline_status["history_messages"].append(status_message)
+            status_logger.log(status_message)
         else:
             logger.debug(status_message)
 
@@ -2583,7 +2571,12 @@ async def _merge_edges_then_upsert(
     added_entities: list = None,  # New parameter to track entities added during edge processing
     relation_chunks_storage: BaseKVStorage | None = None,
     entity_chunks_storage: BaseKVStorage | None = None,
+    status_logger: PipelineStatusLogger | None = None,
 ):
+    if status_logger is None:
+        # Fallback for direct callers that pass pipeline_status only; a
+        # throwaway logger reproduces the one-shot helper's behavior.
+        status_logger = PipelineStatusLogger(pipeline_status)
     timing_start = time.perf_counter()
     timing_relation = f"`{src_id}`~`{tgt_id}`"
     try:
@@ -2902,10 +2895,7 @@ async def _merge_edges_then_upsert(
         # Add message to pipeline satus when merge happens
         if already_fragment > 0 or llm_was_used:
             logger.info(status_message)
-            if pipeline_status is not None and pipeline_status_lock is not None:
-                async with pipeline_status_lock:
-                    pipeline_status["latest_message"] = status_message
-                    pipeline_status["history_messages"].append(status_message)
+            status_logger.log(status_message)
         else:
             logger.debug(status_message)
 
@@ -3100,10 +3090,7 @@ async def _merge_edges_then_upsert(
                         f"Chunks appended from relation: `{need_insert_id}`"
                     )
                     logger.info(status_message)
-                    if pipeline_status is not None and pipeline_status_lock is not None:
-                        async with pipeline_status_lock:
-                            pipeline_status["latest_message"] = status_message
-                            pipeline_status["history_messages"].append(status_message)
+                    status_logger.log(status_message)
 
         edge_created_at = int(time.time())
         edge_upsert_started = time.perf_counter()
@@ -3286,6 +3273,11 @@ async def merge_nodes_and_edges(
             if pipeline_status.get("cancellation_requested", False):
                 raise PipelineCancelledException("User cancelled during merge phase")
 
+    # Operation-scoped status logger shared by all entity/relation merge tasks
+    # of this document: the first history write fetches the shared list once;
+    # every merge log is then a single extend on the cached handle.
+    status_logger = PipelineStatusLogger(pipeline_status)
+
     # Collect all nodes and edges from all chunks
     all_nodes = defaultdict(list)
     all_edges = defaultdict(list)
@@ -3398,6 +3390,7 @@ async def merge_nodes_and_edges(
                         pipeline_status_lock,
                         llm_response_cache,
                         entity_chunks_storage,
+                        status_logger=status_logger,
                     )
 
                     return entity_data
@@ -3487,6 +3480,7 @@ async def merge_nodes_and_edges(
                         added_entities,  # Pass list to collect added entities
                         relation_chunks_storage,
                         entity_chunks_storage,  # Add entity_chunks_storage parameter
+                        status_logger=status_logger,
                     )
 
                     if edge_data is None:
@@ -3577,6 +3571,11 @@ async def extract_entities(
                 raise PipelineCancelledException(
                     "User cancelled during entity extraction"
                 )
+
+    # Operation-scoped status logger shared by all chunk tasks: the first
+    # history write fetches the shared list once; every per-chunk log is then
+    # a single extend on the cached handle.
+    status_logger = PipelineStatusLogger(pipeline_status)
 
     use_llm_func: callable = global_config["role_llm_funcs"]["extract"]
     entity_extract_max_gleaning = global_config["entity_extract_max_gleaning"]
@@ -3948,10 +3947,7 @@ async def extract_entities(
         relations_count = len(maybe_edges)
         log_message = f"Chunk {processed_chunks} of {total_chunks} extracted {entities_count} Ent + {relations_count} Rel {chunk_key}"
         logger.info(log_message)
-        if pipeline_status is not None:
-            async with pipeline_status_lock:
-                pipeline_status["latest_message"] = log_message
-                pipeline_status["history_messages"].append(log_message)
+        status_logger.log(log_message)
 
         # Return the extracted nodes and edges for centralized processing
         return maybe_nodes, maybe_edges
@@ -4196,7 +4192,11 @@ async def kg_query(
             stream=query_param.stream,
         )
 
-        if hashing_kv and hashing_kv.global_config.get("enable_llm_cache"):
+        if (
+            hashing_kv
+            and hashing_kv.global_config.get("enable_llm_cache")
+            and not is_truncated_response(response)
+        ):
             queryparam_dict = {
                 "mode": query_param.mode,
                 "response_type": query_param.response_type,
@@ -4325,24 +4325,6 @@ def _normalize_keyword_list(raw_values: Any, field_name: str) -> list[str]:
     return normalized
 
 
-_CODE_FENCE_PATTERN = re.compile(
-    r"^\s*```(?:json|JSON)?\s*\n?(.*?)\n?\s*```\s*$", re.DOTALL
-)
-
-
-def _strip_markdown_code_fence(text: str) -> str:
-    """Strip a surrounding markdown code fence (```json ... ``` or ``` ... ```).
-
-    Why: LLM training priors strongly associate "JSON output" with fenced code
-    blocks, so providers routinely wrap responses despite explicit instructions
-    to the contrary. Stripping here avoids relying on ``json_repair`` and the
-    noisy warning it emits.
-    """
-
-    match = _CODE_FENCE_PATTERN.match(text)
-    return match.group(1) if match else text
-
-
 def _parse_keywords_payload(result: Any) -> tuple[bool, list[str], list[str]]:
     """Parse keyword extraction responses from heterogeneous provider outputs."""
 
@@ -4357,7 +4339,7 @@ def _parse_keywords_payload(result: Any) -> tuple[bool, list[str], list[str]]:
         payload = result
     elif isinstance(result, str):
         cleaned_result = remove_think_tags(result)
-        unfenced_result = _strip_markdown_code_fence(cleaned_result)
+        unfenced_result = strip_markdown_code_fence(cleaned_result)
         if unfenced_result is not cleaned_result:
             logger.debug(
                 "Stripped markdown code fence from keyword extraction response"
@@ -4473,7 +4455,10 @@ async def extract_keywords_only(
     _, hl_keywords, ll_keywords = _parse_keywords_payload(result)
 
     # 6. Cache only the processed keywords with cache type
-    if hl_keywords or ll_keywords:
+    #    Skip caching when the LLM response was truncated by the token limit:
+    #    the parsed keyword set may be incomplete, and caching it would replay
+    #    the partial result on every later run.
+    if (hl_keywords or ll_keywords) and not is_truncated_response(result):
         cache_data = {
             "high_level_keywords": hl_keywords,
             "low_level_keywords": ll_keywords,
@@ -6216,7 +6201,11 @@ async def naive_query(
             stream=query_param.stream,
         )
 
-        if hashing_kv and hashing_kv.global_config.get("enable_llm_cache"):
+        if (
+            hashing_kv
+            and hashing_kv.global_config.get("enable_llm_cache")
+            and not is_truncated_response(response)
+        ):
             queryparam_dict = {
                 "mode": query_param.mode,
                 "response_type": query_param.response_type,

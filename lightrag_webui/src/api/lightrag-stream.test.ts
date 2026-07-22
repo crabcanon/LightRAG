@@ -51,11 +51,6 @@ mock.module('@/lib/utils', () => ({
   errorMessage: (error: any) =>
     error instanceof Error ? error.message : `${error}`,
 }))
-mock.module('@/lib/constants', () => ({
-  backendBaseUrl: 'http://localhost:9621',
-  popularLabelsDefaultLimit: 300,
-  searchLabelsDefaultLimit: 50,
-}))
 
 // Mock axios — the module calls axios.create() at top level and
 // axios.get() in silentRefreshGuestToken
@@ -497,7 +492,7 @@ describe('queryTextStream — auth headers', () => {
       () => {}
     )
 
-    expect(capturedUrl).toBe('http://localhost:9621/query/stream')
+    expect(capturedUrl).toBe('/query/stream')
   })
 })
 

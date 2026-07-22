@@ -67,6 +67,8 @@ from lightrag.constants import (
     DEFAULT_SUMMARY_LANGUAGE,
     DEFAULT_LLM_TIMEOUT,
     DEFAULT_EMBEDDING_TIMEOUT,
+    DEFAULT_EMBEDDING_BATCH_NUM,
+    DEFAULT_EMBEDDING_FUNC_MAX_ASYNC,
     DEFAULT_RERANK_TIMEOUT,
     DEFAULT_SOURCE_IDS_LIMIT_METHOD,
     DEFAULT_MAX_FILE_PATHS,
@@ -350,11 +352,6 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     )
     """Maximum total tokens in context (including system prompt, entities, relations and chunks)."""
 
-    cosine_threshold: int = field(
-        default=get_env_value("COSINE_THRESHOLD", DEFAULT_COSINE_THRESHOLD, int)
-    )
-    """Cosine threshold of vector DB retrieval for entities, relations and chunks."""
-
     related_chunk_number: int = field(
         default=get_env_value("RELATED_CHUNK_NUMBER", DEFAULT_RELATED_CHUNK_NUMBER, int)
     )
@@ -510,11 +507,15 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     embedding_token_limit: int | None = field(default=None, init=False)
     """Token limit for embedding model. Set automatically from embedding_func.max_token_size in __post_init__."""
 
-    embedding_batch_num: int = field(default=int(os.getenv("EMBEDDING_BATCH_NUM", 10)))
+    embedding_batch_num: int = field(
+        default=get_env_value("EMBEDDING_BATCH_NUM", DEFAULT_EMBEDDING_BATCH_NUM, int)
+    )
     """Batch size for embedding computations."""
 
     embedding_func_max_async: int = field(
-        default=int(os.getenv("EMBEDDING_FUNC_MAX_ASYNC", 8))
+        default=get_env_value(
+            "EMBEDDING_FUNC_MAX_ASYNC", DEFAULT_EMBEDDING_FUNC_MAX_ASYNC, int
+        )
     )
     """Maximum number of concurrent embedding function calls."""
 
@@ -532,7 +533,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     """
 
     default_embedding_timeout: int = field(
-        default=int(os.getenv("EMBEDDING_TIMEOUT", DEFAULT_EMBEDDING_TIMEOUT))
+        default=get_env_value("EMBEDDING_TIMEOUT", DEFAULT_EMBEDDING_TIMEOUT, int)
     )
 
     # LLM Configuration
@@ -556,25 +557,27 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     """Name of the LLM model used for generating responses."""
 
     summary_max_tokens: int = field(
-        default=int(os.getenv("SUMMARY_MAX_TOKENS", DEFAULT_SUMMARY_MAX_TOKENS))
+        default=get_env_value("SUMMARY_MAX_TOKENS", DEFAULT_SUMMARY_MAX_TOKENS, int)
     )
     """Maximum tokens allowed for entity/relation description."""
 
     summary_context_size: int = field(
-        default=int(os.getenv("SUMMARY_CONTEXT_SIZE", DEFAULT_SUMMARY_CONTEXT_SIZE))
+        default=get_env_value("SUMMARY_CONTEXT_SIZE", DEFAULT_SUMMARY_CONTEXT_SIZE, int)
     )
     """Maximum number of tokens allowed per LLM response."""
 
     summary_length_recommended: int = field(
-        default=int(
-            os.getenv("SUMMARY_LENGTH_RECOMMENDED", DEFAULT_SUMMARY_LENGTH_RECOMMENDED)
+        default=get_env_value(
+            "SUMMARY_LENGTH_RECOMMENDED", DEFAULT_SUMMARY_LENGTH_RECOMMENDED, int
         )
     )
     """Recommended length of LLM summary output."""
 
     llm_model_max_async: int = field(
-        default=int(
-            os.getenv("MAX_ASYNC_LLM", os.getenv("MAX_ASYNC", DEFAULT_MAX_ASYNC))
+        default=get_env_value(
+            "MAX_ASYNC_LLM",
+            get_env_value("MAX_ASYNC", DEFAULT_MAX_ASYNC, int),
+            int,
         )
     )
     """Maximum number of concurrent LLM calls."""
@@ -583,7 +586,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     """Additional keyword arguments passed to the LLM model function."""
 
     default_llm_timeout: int = field(
-        default=int(os.getenv("LLM_TIMEOUT", DEFAULT_LLM_TIMEOUT))
+        default=get_env_value("LLM_TIMEOUT", DEFAULT_LLM_TIMEOUT, int)
     )
 
     entity_extraction_use_json: bool = field(
@@ -602,11 +605,14 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     """Function for reranking retrieved documents. All rerank configurations (model name, API keys, top_k, etc.) should be included in this function. Optional."""
 
     rerank_model_max_async: int = field(
-        default=int(
-            os.getenv(
-                "MAX_ASYNC_RERANK",
-                os.getenv("MAX_ASYNC_LLM", os.getenv("MAX_ASYNC", DEFAULT_MAX_ASYNC)),
-            )
+        default=get_env_value(
+            "MAX_ASYNC_RERANK",
+            get_env_value(
+                "MAX_ASYNC_LLM",
+                get_env_value("MAX_ASYNC", DEFAULT_MAX_ASYNC, int),
+                int,
+            ),
+            int,
         )
     )
     """Maximum number of concurrent rerank calls.
@@ -614,7 +620,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     (MAX_ASYNC is still accepted as a deprecated alias)."""
 
     default_rerank_timeout: int = field(
-        default=int(os.getenv("RERANK_TIMEOUT", DEFAULT_RERANK_TIMEOUT))
+        default=get_env_value("RERANK_TIMEOUT", DEFAULT_RERANK_TIMEOUT, int)
     )
     """Rerank request timeout in seconds.
     Independent from LLM_TIMEOUT since reranker calls are much shorter
@@ -659,44 +665,36 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     # ---
 
     max_parallel_insert: int = field(
-        default=int(os.getenv("MAX_PARALLEL_INSERT", DEFAULT_MAX_PARALLEL_INSERT))
+        default=get_env_value("MAX_PARALLEL_INSERT", DEFAULT_MAX_PARALLEL_INSERT, int)
     )
     """Maximum number of parallel insert operations."""
 
     max_parallel_parse_native: int = field(
-        default=int(
-            os.getenv(
-                "MAX_PARALLEL_PARSE_NATIVE", str(DEFAULT_MAX_PARALLEL_PARSE_NATIVE)
-            )
+        default=get_env_value(
+            "MAX_PARALLEL_PARSE_NATIVE", DEFAULT_MAX_PARALLEL_PARSE_NATIVE, int
         )
     )
     max_parallel_parse_mineru: int = field(
-        default=int(
-            os.getenv(
-                "MAX_PARALLEL_PARSE_MINERU", str(DEFAULT_MAX_PARALLEL_PARSE_MINERU)
-            )
+        default=get_env_value(
+            "MAX_PARALLEL_PARSE_MINERU", DEFAULT_MAX_PARALLEL_PARSE_MINERU, int
         )
     )
     max_parallel_parse_docling: int = field(
-        default=int(
-            os.getenv(
-                "MAX_PARALLEL_PARSE_DOCLING", str(DEFAULT_MAX_PARALLEL_PARSE_DOCLING)
-            )
+        default=get_env_value(
+            "MAX_PARALLEL_PARSE_DOCLING", DEFAULT_MAX_PARALLEL_PARSE_DOCLING, int
         )
     )
     max_parallel_analyze: int = field(
-        default=int(
-            os.getenv("MAX_PARALLEL_ANALYZE", str(DEFAULT_MAX_PARALLEL_ANALYZE))
-        )
+        default=get_env_value("MAX_PARALLEL_ANALYZE", DEFAULT_MAX_PARALLEL_ANALYZE, int)
     )
     queue_size_parse: int = field(
-        default=int(os.getenv("QUEUE_SIZE_PARSE", str(DEFAULT_QUEUE_SIZE_PARSE)))
+        default=get_env_value("QUEUE_SIZE_PARSE", DEFAULT_QUEUE_SIZE_PARSE, int)
     )
     queue_size_analyze: int = field(
-        default=int(os.getenv("QUEUE_SIZE_ANALYZE", str(DEFAULT_QUEUE_SIZE_ANALYZE)))
+        default=get_env_value("QUEUE_SIZE_ANALYZE", DEFAULT_QUEUE_SIZE_ANALYZE, int)
     )
     queue_size_insert: int = field(
-        default=int(os.getenv("QUEUE_SIZE_INSERT", str(DEFAULT_QUEUE_SIZE_INSERT)))
+        default=get_env_value("QUEUE_SIZE_INSERT", DEFAULT_QUEUE_SIZE_INSERT, int)
     )
 
     max_graph_nodes: int = field(
@@ -770,7 +768,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     """If True, lightrag will automatically calls initialize_storages and finalize_storages at the appropriate times."""
 
     cosine_better_than_threshold: float = field(
-        default=float(os.getenv("COSINE_THRESHOLD", 0.2))
+        default=get_env_value("COSINE_THRESHOLD", DEFAULT_COSINE_THRESHOLD, float)
     )
 
     ollama_server_infos: Optional[OllamaServerInfos] = field(default=None)
@@ -3515,7 +3513,10 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                     enable_cot=True,
                     stream=param.stream,
                 )
-                if type(response) is str:
+                # isinstance, not exact type: a truncated non-streaming
+                # response arrives as TruncatedResponse (a str subclass) and
+                # must not be misclassified as a streaming iterator.
+                if isinstance(response, str):
                     return {
                         "status": "success",
                         "message": "Bypass mode LLM non streaming response",
