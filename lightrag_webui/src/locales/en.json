@@ -19,6 +19,26 @@
       "switchToDark": "Switch to dark theme"
     }
   },
+  "knowledgeBases": {
+    "selector": "Knowledge base",
+    "loading": "Loading knowledge bases…",
+    "refresh": "Refresh knowledge bases",
+    "loadError": "Failed to load knowledge bases: {{error}}",
+    "uploadTarget": "Upload destination",
+    "addToCurrent": "Add to current knowledge base",
+    "createIsolated": "Create an isolated knowledge base",
+    "namePlaceholder": "Knowledge base name",
+    "nameRequired": "Enter a name for the new knowledge base",
+    "isolationLevel": "Isolation level",
+    "logicalIsolation": "Logical isolation",
+    "physicalIsolation": "Physical isolation",
+    "storageProfile": "Storage profile",
+    "selectStorageProfile": "Select a storage profile",
+    "profileRequired": "Select an available storage profile",
+    "createdWithoutUpload": "The knowledge base was created, but no file was accepted. You can select it and retry.",
+    "incrementalHint": "The files will incrementally update the selected RAG, graph, and cache.",
+    "isolatedHint": "A new RAG, graph, cache, document directory, and pipeline namespace will be created."
+  },
   "login": {
     "description": "Please enter your account and password to log in to the system",
     "username": "Username",

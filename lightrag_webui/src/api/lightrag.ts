@@ -6,6 +6,31 @@ import { useSettingsStore } from '@/stores/settings'
 import { useAuthStore } from '@/stores/state'
 import { navigationService } from '@/services/navigation'
 
+export const KNOWLEDGE_BASE_HEADER = 'LIGHTRAG-KNOWLEDGE-BASE'
+export const DEFAULT_KNOWLEDGE_BASE_ID = 'default'
+
+export type KnowledgeBase = {
+  id: string
+  name: string
+  effective_workspace: string
+  isolation_level: 'logical' | 'physical'
+  storage_profile_id: string | null
+  created_at: string
+  updated_at: string
+}
+
+export type StorageProfileSummary = {
+  id: string
+  available: boolean
+  dedicated: boolean
+}
+
+export type KnowledgeBaseListResponse = {
+  default_id: string
+  knowledge_bases: KnowledgeBase[]
+  storage_profiles: StorageProfileSummary[]
+}
+
 // Types
 export type LightragNodeType = {
   id: string
@@ -55,6 +80,7 @@ export type LightragRoleLLMConfig = {
 
 export type LightragStatus = {
   status: 'healthy'
+  knowledge_base_id?: string
   working_directory: string
   input_directory: string
   configuration: {
@@ -69,6 +95,8 @@ export type LightragStatus = {
     graph_storage: string
     vector_storage: string
     workspace?: string
+    selected_workspace?: string
+    knowledge_base?: KnowledgeBase
     storage_workspaces?: {
       kv_storage?: string | null
       doc_status_storage?: string | null
@@ -439,6 +467,12 @@ axiosInstance.interceptors.request.use((config) => {
   if (apiKey) {
     config.headers['X-API-Key'] = apiKey
   }
+  const knowledgeBaseHeaders = buildKnowledgeBaseHeaders()
+  Object.entries(knowledgeBaseHeaders).forEach(([name, value]) => {
+    if (!config.headers.get(name)) {
+      config.headers[name] = value
+    }
+  })
   return config
 })
 
@@ -709,6 +743,17 @@ async function _readNdjsonStream(
 /**
  * Build auth headers for the streaming fetch request.
  */
+export function buildKnowledgeBaseHeaders(
+  explicitKnowledgeBaseId?: string
+): Record<string, string> {
+  const knowledgeBaseId =
+    explicitKnowledgeBaseId ?? useSettingsStore.getState().selectedKnowledgeBaseId
+  if (!knowledgeBaseId || knowledgeBaseId === DEFAULT_KNOWLEDGE_BASE_ID) {
+    return {}
+  }
+  return { [KNOWLEDGE_BASE_HEADER]: knowledgeBaseId }
+}
+
 function _buildStreamHeaders(): HeadersInit {
   const apiKey = useSettingsStore.getState().apiKey;
   const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
@@ -722,6 +767,7 @@ function _buildStreamHeaders(): HeadersInit {
   if (apiKey) {
     headers['X-API-Key'] = apiKey;
   }
+  Object.assign(headers, buildKnowledgeBaseHeaders())
   return headers;
 }
 
@@ -895,6 +941,34 @@ export const queryTextStream = async (
   }
 };
 
+export const listKnowledgeBases = async (): Promise<KnowledgeBaseListResponse> => {
+  const response = await axiosInstance.get('/knowledge-bases')
+  return response.data
+}
+
+export const createKnowledgeBase = async (request: {
+  name: string
+  isolation_level?: 'logical' | 'physical'
+  storage_profile_id?: string | null
+}): Promise<KnowledgeBase> => {
+  const response = await axiosInstance.post('/knowledge-bases', request)
+  return response.data
+}
+
+export const renameKnowledgeBase = async (
+  knowledgeBaseId: string,
+  name: string
+): Promise<KnowledgeBase> => {
+  const response = await axiosInstance.patch(`/knowledge-bases/${knowledgeBaseId}`, { name })
+  return response.data
+}
+
+export const deleteKnowledgeBase = async (knowledgeBaseId: string): Promise<void> => {
+  await axiosInstance.delete(`/knowledge-bases/${knowledgeBaseId}`, {
+    params: { confirm: true }
+  })
+}
+
 export const insertText = async (text: string): Promise<DocActionResponse> => {
   const response = await axiosInstance.post('/documents/text', { text })
   return response.data
@@ -907,14 +981,16 @@ export const insertTexts = async (texts: string[]): Promise<DocActionResponse> =
 
 export const uploadDocument = async (
   file: File,
-  onUploadProgress?: (percentCompleted: number) => void
+  onUploadProgress?: (percentCompleted: number) => void,
+  knowledgeBaseId?: string
 ): Promise<DocActionResponse> => {
   const formData = new FormData()
   formData.append('file', file)
 
   const response = await axiosInstance.post('/documents/upload', formData, {
     headers: {
-      'Content-Type': 'multipart/form-data'
+      'Content-Type': 'multipart/form-data',
+      ...buildKnowledgeBaseHeaders(knowledgeBaseId)
     },
     // prettier-ignore
     onUploadProgress:

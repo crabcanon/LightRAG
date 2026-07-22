@@ -19,6 +19,26 @@
       "switchToDark": "切换到深色主题"
     }
   },
+  "knowledgeBases": {
+    "selector": "知识库",
+    "loading": "正在加载知识库…",
+    "refresh": "刷新知识库列表",
+    "loadError": "加载知识库失败：{{error}}",
+    "uploadTarget": "上传目标",
+    "addToCurrent": "增量加入当前知识库",
+    "createIsolated": "新建独立知识库",
+    "namePlaceholder": "知识库名称",
+    "nameRequired": "请输入新知识库名称",
+    "isolationLevel": "隔离级别",
+    "logicalIsolation": "逻辑隔离",
+    "physicalIsolation": "物理隔离",
+    "storageProfile": "存储配置档案",
+    "selectStorageProfile": "请选择存储配置档案",
+    "profileRequired": "请选择一个可用的存储配置档案",
+    "createdWithoutUpload": "知识库已创建，但没有文件被接受。您可以选择该知识库后重试。",
+    "incrementalHint": "文件将增量更新当前选中知识库的 RAG、图谱与缓存。",
+    "isolatedHint": "系统将新建独立的 RAG、图谱、缓存、文档目录和流水线命名空间。"
+  },
   "login": {
     "description": "请输入您的账号和密码登录系统",
     "username": "用户名",

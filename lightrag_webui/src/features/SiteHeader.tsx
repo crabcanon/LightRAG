@@ -10,6 +10,7 @@ import { navigationService } from '@/services/navigation'
 import { ZapIcon, LogOutIcon } from 'lucide-react'
 import GithubIcon from '@/components/icons/GithubIcon'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/Tooltip'
+import KnowledgeBaseSelector from '@/components/knowledge-bases/KnowledgeBaseSelector'
 
 interface NavigationTabProps {
   value: string
@@ -99,6 +100,7 @@ export default function SiteHeader() {
             </TooltipProvider>
           </div>
         )}
+        <KnowledgeBaseSelector />
       </div>
 
       <div className="flex h-10 flex-1 items-center justify-center">

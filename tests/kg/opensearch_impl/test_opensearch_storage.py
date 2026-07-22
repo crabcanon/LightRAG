@@ -361,7 +361,7 @@ class TestBulkBatchLimits:
 
 
 class TestClientManager:
-    """Tests for ClientManager singleton pattern and reference counting."""
+    """Tests for resource-keyed client pooling and reference counting."""
 
     @staticmethod
     def _stub_client(version: str = "3.3.0") -> AsyncMock:
@@ -376,28 +376,81 @@ class TestClientManager:
 
     @pytest.mark.asyncio
     async def test_singleton_and_refcount(self):
-        ClientManager._instances = {"client": None, "ref_count": 0}
+        ClientManager._instances = {}
         with patch("lightrag.kg.opensearch_impl.AsyncOpenSearch") as mock_cls:
             mock_cls.return_value = self._stub_client()
             c1 = await ClientManager.get_client()
             c2 = await ClientManager.get_client()
             assert c1 is c2
-            assert ClientManager._instances["ref_count"] == 2
+            instance = next(iter(ClientManager._instances.values()))
+            assert instance["ref_count"] == 2
             await ClientManager.release_client(c1)
-            assert ClientManager._instances["ref_count"] == 1
+            assert instance["ref_count"] == 1
             await ClientManager.release_client(c2)
-            assert ClientManager._instances["ref_count"] == 0
-            assert ClientManager._instances["client"] is None
+            assert ClientManager._instances == {}
 
     @pytest.mark.asyncio
     async def test_close_called_on_last_release(self):
-        ClientManager._instances = {"client": None, "ref_count": 0}
+        ClientManager._instances = {}
         with patch("lightrag.kg.opensearch_impl.AsyncOpenSearch") as mock_cls:
             inner = self._stub_client()
             mock_cls.return_value = inner
             c = await ClientManager.get_client()
             await ClientManager.release_client(c)
             inner.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_different_physical_profiles_get_different_clients(self):
+        ClientManager._instances = {}
+        with patch("lightrag.kg.opensearch_impl.AsyncOpenSearch") as mock_cls:
+            first = self._stub_client()
+            second = self._stub_client()
+            mock_cls.side_effect = [first, second]
+
+            first_result = await ClientManager.get_client(
+                {
+                    "storage_profile": {
+                        "opensearch": {
+                            "hosts": ["search-a:9200"],
+                            "username": "a",
+                            "password": "one",
+                        }
+                    }
+                }
+            )
+            second_result = await ClientManager.get_client(
+                {
+                    "storage_profile": {
+                        "opensearch": {
+                            "hosts": ["search-b:9200"],
+                            "username": "b",
+                            "password": "two",
+                        }
+                    }
+                }
+            )
+
+        assert first_result is first
+        assert second_result is second
+        assert len(ClientManager._instances) == 2
+
+    @pytest.mark.asyncio
+    async def test_cluster_capability_is_scoped_to_the_physical_client(self):
+        ClientManager._instances = {}
+        with patch("lightrag.kg.opensearch_impl.AsyncOpenSearch") as mock_cls:
+            modern = self._stub_client("3.3.0")
+            legacy = self._stub_client("2.19.0")
+            mock_cls.side_effect = [modern, legacy]
+
+            modern_result = await ClientManager.get_client(
+                {"storage_profile": {"opensearch": {"hosts": ["modern-search:9200"]}}}
+            )
+            legacy_result = await ClientManager.get_client(
+                {"storage_profile": {"opensearch": {"hosts": ["legacy-search:9200"]}}}
+            )
+
+        assert ClientManager.supports_shard_doc(modern_result) is True
+        assert ClientManager.supports_shard_doc(legacy_result) is False
 
 
 # ---------------------------------------------------------------------------

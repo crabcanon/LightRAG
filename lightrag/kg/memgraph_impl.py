@@ -9,6 +9,10 @@ from ..utils import logger, validate_workspace
 from ..base import BaseGraphStorage
 from ..types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
 from ..kg.shared_storage import get_data_init_lock
+from ..kg.storage_profiles import (
+    get_storage_profile_section,
+    resolve_workspace_override,
+)
 import pipmaster as pm
 
 if not pm.is_installed("neo4j"):
@@ -35,7 +39,9 @@ config.read("config.ini", "utf-8")
 class MemgraphStorage(BaseGraphStorage):
     def __init__(self, namespace, global_config, embedding_func, workspace=None):
         # Priority: 1) MEMGRAPH_WORKSPACE env 2) user arg 3) default 'base'
-        memgraph_workspace = os.environ.get("MEMGRAPH_WORKSPACE")
+        memgraph_workspace = resolve_workspace_override(
+            global_config, "memgraph", "MEMGRAPH_WORKSPACE"
+        )
         original_workspace = workspace  # Save original value for logging
         if memgraph_workspace and memgraph_workspace.strip():
             workspace = memgraph_workspace
@@ -73,22 +79,48 @@ class MemgraphStorage(BaseGraphStorage):
             return "base"
         return workspace.replace("`", "``")
 
+    def _get_connection_config(self) -> dict[str, str]:
+        """Resolve the immutable connection config for this instance."""
+
+        profile = get_storage_profile_section(self.global_config, "memgraph")
+        return {
+            "uri": str(
+                profile.get("uri")
+                or os.environ.get(
+                    "MEMGRAPH_URI",
+                    config.get("memgraph", "uri", fallback="bolt://localhost:7687"),
+                )
+            ),
+            "username": str(
+                profile.get("username")
+                or os.environ.get(
+                    "MEMGRAPH_USERNAME",
+                    config.get("memgraph", "username", fallback=""),
+                )
+            ),
+            "password": str(
+                profile.get("password")
+                or os.environ.get(
+                    "MEMGRAPH_PASSWORD",
+                    config.get("memgraph", "password", fallback=""),
+                )
+            ),
+            "database": str(
+                profile.get("database")
+                or os.environ.get(
+                    "MEMGRAPH_DATABASE",
+                    config.get("memgraph", "database", fallback="memgraph"),
+                )
+            ),
+        }
+
     async def initialize(self):
         async with get_data_init_lock():
-            URI = os.environ.get(
-                "MEMGRAPH_URI",
-                config.get("memgraph", "uri", fallback="bolt://localhost:7687"),
-            )
-            USERNAME = os.environ.get(
-                "MEMGRAPH_USERNAME", config.get("memgraph", "username", fallback="")
-            )
-            PASSWORD = os.environ.get(
-                "MEMGRAPH_PASSWORD", config.get("memgraph", "password", fallback="")
-            )
-            DATABASE = os.environ.get(
-                "MEMGRAPH_DATABASE",
-                config.get("memgraph", "database", fallback="memgraph"),
-            )
+            connection = self._get_connection_config()
+            URI = connection["uri"]
+            USERNAME = connection["username"]
+            PASSWORD = connection["password"]
+            DATABASE = connection["database"]
 
             self._driver = AsyncGraphDatabase.driver(
                 URI,

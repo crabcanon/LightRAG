@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import os
 import warnings
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -38,6 +39,38 @@ pytestmark = pytest.mark.offline
 _REDIS_URL = "redis://localhost:6379/0"
 
 STORAGE_CLASSES = [RedisKVStorage, RedisDocStatusStorage]
+
+
+@pytest.mark.parametrize("cls", STORAGE_CLASSES)
+def test_physical_profile_overrides_environment_without_remapping_workspace(cls):
+    """Dedicated profiles must select their own Redis and retain the KB key."""
+    storage = cls.__new__(cls)
+    storage.workspace = "kb_workspace"
+    storage.namespace = "kv" if cls is RedisKVStorage else "doc_status"
+    storage.global_config = {
+        "storage_profile": {"redis": {"uri": "redis://profile-host:6380/2"}}
+    }
+    fake_pool = MagicMock()
+    fake_client = MagicMock()
+
+    with (
+        patch.dict(
+            os.environ,
+            {
+                "REDIS_URI": "redis://environment-host:6379/0",
+                "REDIS_WORKSPACE": "forced_workspace",
+            },
+        ),
+        patch.object(
+            RedisConnectionManager, "get_pool", return_value=fake_pool
+        ) as get_pool,
+        patch("lightrag.kg.redis_impl.Redis", return_value=fake_client),
+    ):
+        storage.__post_init__()
+
+    assert storage._redis_url == "redis://profile-host:6380/2"
+    assert storage.final_namespace == f"kb_workspace_{storage.namespace}"
+    get_pool.assert_called_once_with("redis://profile-host:6380/2")
 
 
 def _new_storage(cls, url: str = _REDIS_URL, pool=None):

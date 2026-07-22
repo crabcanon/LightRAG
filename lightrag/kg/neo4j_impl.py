@@ -77,8 +77,9 @@ class Neo4JStorage(BaseGraphStorage):
     )
 
     def __init__(self, namespace, global_config, embedding_func, workspace=None):
+        profile = global_config.get("storage_profile", {}).get("neo4j", {})
         # Read env and override the arg if present
-        neo4j_workspace = os.environ.get("NEO4J_WORKSPACE")
+        neo4j_workspace = None if profile else os.environ.get("NEO4J_WORKSPACE")
         original_workspace = workspace  # Save original value for logging
         if neo4j_workspace and neo4j_workspace.strip():
             workspace = neo4j_workspace
@@ -171,11 +172,14 @@ class Neo4JStorage(BaseGraphStorage):
 
     async def initialize(self):
         async with get_data_init_lock():
-            URI = os.environ.get("NEO4J_URI", config.get("neo4j", "uri", fallback=None))
-            USERNAME = os.environ.get(
+            profile = self.global_config.get("storage_profile", {}).get("neo4j", {})
+            URI = profile.get("uri") or os.environ.get(
+                "NEO4J_URI", config.get("neo4j", "uri", fallback=None)
+            )
+            USERNAME = profile.get("username") or os.environ.get(
                 "NEO4J_USERNAME", config.get("neo4j", "username", fallback=None)
             )
-            PASSWORD = os.environ.get(
+            PASSWORD = profile.get("password") or os.environ.get(
                 "NEO4J_PASSWORD", config.get("neo4j", "password", fallback=None)
             )
             MAX_CONNECTION_POOL_SIZE = int(
@@ -220,7 +224,7 @@ class Neo4JStorage(BaseGraphStorage):
                 "NEO4J_KEEP_ALIVE",
                 config.get("neo4j", "keep_alive", fallback="true"),
             ).lower() in ("true", "1", "yes", "on")
-            DATABASE = os.environ.get(
+            DATABASE = profile.get("database") or os.environ.get(
                 "NEO4J_DATABASE", re.sub(r"[^a-zA-Z0-9-]", "-", self.namespace)
             )
             """The default value approach for the DATABASE is only intended to maintain compatibility with legacy practices."""

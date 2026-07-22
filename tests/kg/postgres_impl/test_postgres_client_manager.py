@@ -8,6 +8,7 @@ from lightrag.kg.postgres_impl import ClientManager
 @pytest.fixture(autouse=True)
 def reset_client_manager_state() -> None:
     ClientManager._instances = {"db": None, "ref_count": 0, "vector_signature": None}
+    ClientManager._profile_instances = {}
 
 
 def test_pg_vector_storage_enables_vector() -> None:
@@ -40,6 +41,54 @@ def test_no_args_defaults_to_true() -> None:
     # Backward compatibility: calling without arguments preserves prior behavior.
     config = ClientManager.get_config()
     assert config["enable_vector"] is True
+
+
+def test_physical_profile_overrides_connection_without_forced_workspace() -> None:
+    config = ClientManager.get_config(
+        "PGVectorStorage",
+        storage_profile={
+            "id": "physical-a",
+            "postgres": {
+                "host": "postgres-a",
+                "port": 5544,
+                "database": "rag_a",
+                "user": "rag",
+                "password": "secret",
+            },
+        },
+    )
+
+    assert config["host"] == "postgres-a"
+    assert config["port"] == 5544
+    assert config["database"] == "rag_a"
+    assert config["workspace"] is None
+
+
+@pytest.mark.asyncio
+async def test_physical_profiles_use_independent_shared_pools() -> None:
+    first_db = MagicMock()
+    first_db.initdb = AsyncMock()
+    first_db.check_tables = AsyncMock()
+    second_db = MagicMock()
+    second_db.initdb = AsyncMock()
+    second_db.check_tables = AsyncMock()
+    profile_a = {"id": "physical-a", "postgres": {"database": "rag_a"}}
+    profile_b = {"id": "physical-b", "postgres": {"database": "rag_b"}}
+
+    with patch(
+        "lightrag.kg.postgres_impl.PostgreSQLDB",
+        side_effect=[first_db, second_db],
+    ) as db_cls:
+        first = await ClientManager.get_client("PGVectorStorage", profile_a)
+        first_again = await ClientManager.get_client("PGVectorStorage", profile_a)
+        second = await ClientManager.get_client("PGVectorStorage", profile_b)
+
+    assert first is first_db
+    assert first_again is first_db
+    assert second is second_db
+    assert ClientManager._profile_instances["physical-a"]["ref_count"] == 2
+    assert ClientManager._profile_instances["physical-b"]["ref_count"] == 1
+    assert db_cls.call_count == 2
 
 
 @pytest.mark.asyncio

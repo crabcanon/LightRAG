@@ -12,7 +12,6 @@ from fastapi.openapi.docs import (
 import asyncio
 import json
 import os
-import re
 import logging
 import logging.config
 import sys
@@ -65,6 +64,23 @@ from lightrag.parser.external.mineru.cache import MinerUParserOptions
 from lightrag.api.routers.query_routes import create_query_routes
 from lightrag.api.routers.graph_routes import create_graph_routes
 from lightrag.api.routers.ollama_api import OllamaAPI
+from lightrag.api.routers.knowledge_base_routes import (
+    create_knowledge_base_routes,
+)
+from lightrag.api.knowledge_bases import (
+    KnowledgeBaseHeader,
+    KnowledgeBaseCatalog,
+    KnowledgeBaseConflictError,
+    KnowledgeBaseManager,
+    KnowledgeBaseNotFoundError,
+    KnowledgeBaseRecord,
+    StorageProfileError,
+    storage_profiles_path_from_env,
+)
+from lightrag.kg.storage_profiles import (
+    build_default_resource_profile,
+    required_profile_sections,
+)
 
 from lightrag.utils import logger, set_verbose_debug
 from lightrag.kg.shared_storage import (
@@ -1275,6 +1291,14 @@ def create_app(args):
 
     # Initialize document manager with workspace support for data isolation
     doc_manager = DocumentManager(args.input_dir, workspace=args.workspace)
+    catalog_path = os.getenv(
+        "LIGHTRAG_KNOWLEDGE_BASE_CATALOG",
+        str(Path(args.working_dir) / "knowledge_bases.json"),
+    )
+    knowledge_base_catalog = KnowledgeBaseCatalog(catalog_path, args.workspace)
+    storage_profiles = KnowledgeBaseManager.load_storage_profiles(
+        storage_profiles_path_from_env()
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -1283,12 +1307,8 @@ def create_app(args):
         app.state.background_tasks = set()
 
         try:
-            # Initialize database connections
-            # Note: initialize_storages() now auto-initializes pipeline_status for rag.workspace
-            await rag.initialize_storages()
-
-            # Data migration regardless of storage implementation
-            await rag.check_and_migrate_data()
+            # Initialize the default knowledge base. Other instances are lazy.
+            await knowledge_base_manager.initialize()
 
             ASCIIColors.green("\nServer is ready to accept connections! 🚀\n")
 
@@ -1303,8 +1323,8 @@ def create_app(args):
                 app.state.background_tasks
             )
 
-            # Clean up database connections
-            await rag.finalize_storages()
+            # Clean up all knowledge-base storage instances.
+            await knowledge_base_manager.finalize()
 
             if "LIGHTRAG_GUNICORN_MODE" not in os.environ:
                 # Only perform cleanup in Uvicorn single-process mode
@@ -1459,36 +1479,6 @@ def create_app(args):
     # Non-enforcing dependency: reports whether the caller is authenticated so
     # /health can stay a public liveness probe while gating sensitive config.
     auth_status = get_auth_status_dependency(api_key)
-
-    def get_workspace_from_request(request: Request) -> str | None:
-        """
-        Extract workspace from HTTP request header or use default.
-
-        This enables multi-workspace API support by checking the custom
-        'LIGHTRAG-WORKSPACE' header. If not present, falls back to the
-        server's default workspace configuration.
-
-        Args:
-            request: FastAPI Request object
-
-        Returns:
-            Workspace identifier (may be empty string for global namespace)
-        """
-        # Check custom header first
-        workspace = request.headers.get("LIGHTRAG-WORKSPACE", "").strip()
-
-        if not workspace:
-            workspace = None
-        else:
-            sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", workspace)
-            if sanitized != workspace:
-                logger.warning(
-                    f"Workspace header '{workspace}' contains invalid characters. "
-                    f"Sanitized to '{sanitized}'."
-                )
-                workspace = sanitized
-
-        return workspace
 
     # Create working directory if it doesn't exist
     Path(args.working_dir).mkdir(parents=True, exist_ok=True)
@@ -2115,89 +2105,178 @@ def create_app(args):
         for spec in ROLES
     }
 
-    # Initialize RAG with unified configuration
-    try:
-        rag = LightRAG(
-            working_dir=args.working_dir,
-            workspace=args.workspace,
-            llm_model_func=create_llm_model_func(args.llm_binding),
-            llm_model_name=args.llm_model,
-            llm_model_max_async=args.max_async,
-            summary_max_tokens=args.summary_max_tokens,
-            summary_context_size=args.summary_context_size,
-            chunk_token_size=int(args.chunk_size),
-            chunk_overlap_token_size=int(args.chunk_overlap_size),
-            llm_model_kwargs=create_llm_model_kwargs(
-                args.llm_binding, args, llm_timeout
-            ),
-            embedding_func=embedding_func,
-            default_llm_timeout=llm_timeout,
-            default_embedding_timeout=embedding_timeout,
-            kv_storage=args.kv_storage,
-            graph_storage=args.graph_storage,
-            vector_storage=args.vector_storage,
-            doc_status_storage=args.doc_status_storage,
-            vector_db_storage_cls_kwargs={
-                "cosine_better_than_threshold": args.cosine_threshold
-            },
-            enable_llm_cache_for_entity_extract=args.enable_llm_cache_for_extract,
-            enable_llm_cache=args.enable_llm_cache,
-            vlm_process_enable=args.vlm_process_enable,
-            rerank_model_func=rerank_model_func,
-            rerank_model_max_async=args.rerank_max_async,
-            default_rerank_timeout=args.rerank_timeout,
-            max_parallel_insert=args.max_parallel_insert,
-            max_graph_nodes=args.max_graph_nodes,
-            addon_params=addon_params,
-            ollama_server_infos=ollama_server_infos,
-            role_llm_configs={
-                spec.name: RoleLLMConfig(
-                    func=role_llm_configs[spec.name]["func"],
-                    kwargs=role_llm_configs[spec.name]["kwargs"],
-                    max_async=role_llm_configs[spec.name]["max_async"],
-                    timeout=role_llm_configs[spec.name]["timeout"],
-                    metadata={
-                        "base_binding": args.llm_binding,
-                        "binding": role_llm_configs[spec.name]["binding"],
-                        "model": role_llm_configs[spec.name]["model"],
-                        "host": role_llm_configs[spec.name]["host"],
-                        "api_key": role_llm_configs[spec.name]["api_key"],
-                        "provider_options": role_llm_configs[spec.name][
-                            "provider_options"
-                        ],
-                        "bedrock_aws_options": role_llm_configs[spec.name][
-                            "bedrock_aws_options"
-                        ],
-                        "is_cross_provider": role_llm_configs[spec.name][
-                            "is_cross_provider"
-                        ],
-                    },
-                )
-                for spec in ROLES
-            },
-        )
-    except Exception as e:
-        logger.error(f"Failed to initialize LightRAG: {e}")
-        raise
+    def build_rag(
+        workspace: str,
+        *,
+        working_dir: str,
+        input_dir: str,
+        storage_profile: dict[str, Any] | None = None,
+    ) -> LightRAG:
+        """Build one fully independent RAG instance from server settings."""
+        try:
+            instance = LightRAG(
+                working_dir=working_dir,
+                input_dir=input_dir,
+                workspace=workspace,
+                llm_model_func=create_llm_model_func(args.llm_binding),
+                llm_model_name=args.llm_model,
+                llm_model_max_async=args.max_async,
+                summary_max_tokens=args.summary_max_tokens,
+                summary_context_size=args.summary_context_size,
+                chunk_token_size=int(args.chunk_size),
+                chunk_overlap_token_size=int(args.chunk_overlap_size),
+                llm_model_kwargs=create_llm_model_kwargs(
+                    args.llm_binding, args, llm_timeout
+                ),
+                embedding_func=embedding_func,
+                default_llm_timeout=llm_timeout,
+                default_embedding_timeout=embedding_timeout,
+                kv_storage=args.kv_storage,
+                graph_storage=args.graph_storage,
+                vector_storage=args.vector_storage,
+                doc_status_storage=args.doc_status_storage,
+                vector_db_storage_cls_kwargs={
+                    "cosine_better_than_threshold": args.cosine_threshold
+                },
+                enable_llm_cache_for_entity_extract=args.enable_llm_cache_for_extract,
+                enable_llm_cache=args.enable_llm_cache,
+                vlm_process_enable=args.vlm_process_enable,
+                rerank_model_func=rerank_model_func,
+                rerank_model_max_async=args.rerank_max_async,
+                default_rerank_timeout=args.rerank_timeout,
+                max_parallel_insert=args.max_parallel_insert,
+                max_graph_nodes=args.max_graph_nodes,
+                storage_profile=storage_profile or {},
+                addon_params=addon_params,
+                ollama_server_infos=ollama_server_infos,
+                role_llm_configs={
+                    spec.name: RoleLLMConfig(
+                        func=role_llm_configs[spec.name]["func"],
+                        kwargs=role_llm_configs[spec.name]["kwargs"],
+                        max_async=role_llm_configs[spec.name]["max_async"],
+                        timeout=role_llm_configs[spec.name]["timeout"],
+                        metadata={
+                            "base_binding": args.llm_binding,
+                            "binding": role_llm_configs[spec.name]["binding"],
+                            "model": role_llm_configs[spec.name]["model"],
+                            "host": role_llm_configs[spec.name]["host"],
+                            "api_key": role_llm_configs[spec.name]["api_key"],
+                            "provider_options": role_llm_configs[spec.name][
+                                "provider_options"
+                            ],
+                            "bedrock_aws_options": role_llm_configs[spec.name][
+                                "bedrock_aws_options"
+                            ],
+                            "is_cross_provider": role_llm_configs[spec.name][
+                                "is_cross_provider"
+                            ],
+                        },
+                    )
+                    for spec in ROLES
+                },
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize LightRAG: {e}")
+            raise
 
-    _log_role_provider_options(rag)
-
-    rag.register_role_llm_builder(
-        lambda role, meta: (
-            create_role_llm_func(role, meta),
-            create_role_llm_model_kwargs(role, meta),
+        _log_role_provider_options(instance)
+        instance.register_role_llm_builder(
+            lambda role, meta: (
+                create_role_llm_func(role, meta),
+                create_role_llm_model_kwargs(role, meta),
+            )
         )
+        return instance
+
+    rag = build_rag(
+        args.workspace,
+        working_dir=args.working_dir,
+        input_dir=args.input_dir,
     )
+
+    def build_knowledge_base_rag(
+        record: KnowledgeBaseRecord, profile: dict[str, Any] | None
+    ) -> LightRAG:
+        profile_with_id = (
+            {"id": record.storage_profile_id, **profile} if profile else None
+        )
+        working_dir = str(profile["working_dir"]) if profile else str(args.working_dir)
+        input_dir = str(profile["input_dir"]) if profile else str(args.input_dir)
+        return build_rag(
+            record.effective_workspace,
+            working_dir=working_dir,
+            input_dir=input_dir,
+            storage_profile=profile_with_id,
+        )
+
+    def build_knowledge_base_document_manager(
+        record: KnowledgeBaseRecord, profile: dict[str, Any] | None
+    ) -> DocumentManager:
+        input_dir = str(profile["input_dir"]) if profile else str(args.input_dir)
+        return DocumentManager(input_dir, workspace=record.effective_workspace)
+
+    active_storage_implementations = (
+        args.kv_storage,
+        args.vector_storage,
+        args.graph_storage,
+        args.doc_status_storage,
+    )
+    default_storage_profile = build_default_resource_profile(
+        working_dir=str(args.working_dir),
+        input_dir=str(args.input_dir),
+        workspace=str(args.workspace),
+        required_sections=required_profile_sections(active_storage_implementations),
+    )
+    knowledge_base_manager = KnowledgeBaseManager(
+        catalog=knowledge_base_catalog,
+        default_rag=rag,
+        default_document_manager=doc_manager,
+        rag_factory=build_knowledge_base_rag,
+        document_manager_factory=build_knowledge_base_document_manager,
+        storage_profiles=storage_profiles,
+        default_storage_profile=default_storage_profile,
+        active_storage_implementations=active_storage_implementations,
+        max_loaded_instances=int(
+            os.getenv("LIGHTRAG_MAX_LOADED_KNOWLEDGE_BASES", "32")
+        ),
+    )
+    app.state.knowledge_base_manager = knowledge_base_manager
 
     # Add routes
     # root_path is set on the app for reverse proxy support;
     # routes stay at their natural paths and are prefixed by the proxy or uvicorn --root-path
-    app.include_router(create_document_routes(rag, doc_manager, api_key))
-    app.include_router(create_query_routes(rag, api_key, args.top_k))
-    app.include_router(create_graph_routes(rag, api_key))
+    app.include_router(create_knowledge_base_routes(knowledge_base_manager, api_key))
+    app.include_router(
+        create_document_routes(
+            knowledge_base_manager.rag_proxy,
+            knowledge_base_manager.document_manager_proxy,
+            api_key,
+            context_dependency=knowledge_base_manager.request_dependency,
+        )
+    )
+    app.include_router(
+        create_query_routes(
+            knowledge_base_manager.rag_proxy,
+            api_key,
+            args.top_k,
+            context_dependency=knowledge_base_manager.request_dependency,
+        )
+    )
+    app.include_router(
+        create_graph_routes(
+            knowledge_base_manager.rag_proxy,
+            api_key,
+            context_dependency=knowledge_base_manager.request_dependency,
+        )
+    )
 
     # Add Ollama API routes
-    ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)
+    ollama_api = OllamaAPI(
+        knowledge_base_manager.rag_proxy,
+        top_k=args.top_k,
+        api_key=api_key,
+        context_dependency=knowledge_base_manager.request_dependency,
+    )
     app.include_router(ollama_api.router, prefix="/api")
 
     # Custom Swagger UI endpoint for offline support
@@ -2415,7 +2494,11 @@ def create_app(args):
             }
         },
     )
-    async def get_status(request: Request, authenticated: bool = Depends(auth_status)):
+    async def get_status(
+        request: Request,
+        authenticated: bool = Depends(auth_status),
+        knowledge_base_id: KnowledgeBaseHeader = None,
+    ):
         """Get current system status including WebUI availability.
 
         Stays a public liveness probe: unauthenticated callers receive only
@@ -2423,10 +2506,13 @@ def create_app(args):
         caller is authenticated (see get_auth_status_dependency).
         """
         try:
-            workspace = get_workspace_from_request(request)
+            selected_context = await knowledge_base_manager.get_context(
+                knowledge_base_id
+            )
+            selected_rag = selected_context.rag
+            selected_record = selected_context.metadata
+            workspace = selected_record.effective_workspace
             default_workspace = get_default_workspace()
-            if workspace is None:
-                workspace = default_workspace
             pipeline_status = await get_namespace_data(
                 "pipeline_status", workspace=workspace
             )
@@ -2468,6 +2554,7 @@ def create_app(args):
                 "webui_description": webui_description,
                 "pipeline_busy": pipeline_busy,
                 "pipeline_active": pipeline_active,
+                "knowledge_base_id": selected_record.id,
             }
 
             # Sensitive runtime configuration and operational diagnostics
@@ -2483,8 +2570,10 @@ def create_app(args):
 
             status_data.update(
                 {
-                    "working_directory": str(args.working_dir),
-                    "input_directory": str(args.input_dir),
+                    "working_directory": str(
+                        getattr(selected_rag, "working_dir", args.working_dir)
+                    ),
+                    "input_directory": str(selected_context.document_manager.input_dir),
                     "configuration": {
                         # LLM configuration binding/host address (if applicable)/model (if applicable)
                         "llm_binding": args.llm_binding,
@@ -2504,7 +2593,9 @@ def create_app(args):
                         "enable_llm_cache": args.enable_llm_cache,
                         "vlm_process_enable": args.vlm_process_enable,
                         "workspace": default_workspace,
-                        "storage_workspaces": _get_storage_workspaces(rag),
+                        "selected_workspace": workspace,
+                        "knowledge_base": selected_record.public_dict(),
+                        "storage_workspaces": _get_storage_workspaces(selected_rag),
                         "max_graph_nodes": args.max_graph_nodes,
                         # Rerank configuration
                         "enable_rerank": rerank_model_func is not None,
@@ -2529,7 +2620,7 @@ def create_app(args):
                         "embedding_func_max_async": args.embedding_func_max_async,
                         "embedding_batch_num": args.embedding_batch_num,
                         "embedding_timeout": args.embedding_timeout,
-                        "role_llm_config": rag.get_llm_role_config(),
+                        "role_llm_config": selected_rag.get_llm_role_config(),
                         # Parser routing snapshot — surfaced in the WebUI status card
                         "parser_routing": parser_rules_from_env(),
                         "mineru": _build_mineru_status(),
@@ -2543,14 +2634,20 @@ def create_app(args):
                     "pipeline_destructive_busy": pipeline_destructive_busy,
                     "pipeline_pending_enqueues": pipeline_pending_enqueues,
                     "keyed_locks": keyed_lock_info,
-                    "llm_queue_status": await rag.get_llm_queue_status(
+                    "llm_queue_status": await selected_rag.get_llm_queue_status(
                         include_base=True
                     ),
-                    "embedding_queue_status": await rag.get_embedding_queue_status(),
-                    "rerank_queue_status": await rag.get_rerank_queue_status(),
+                    "embedding_queue_status": await selected_rag.get_embedding_queue_status(),
+                    "rerank_queue_status": await selected_rag.get_rerank_queue_status(),
                 }
             )
             return status_data
+        except KnowledgeBaseNotFoundError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+        except KnowledgeBaseConflictError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        except StorageProfileError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
         except Exception as e:
             logger.error(f"Error getting health status: {str(e)}")
             raise internal_server_error(e)

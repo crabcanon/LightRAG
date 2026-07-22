@@ -9,6 +9,10 @@ type Language = 'en' | 'zh' | 'fr' | 'ar' | 'zh_TW' | 'ru' | 'ja' | 'de' | 'uk' 
 type Tab = 'documents' | 'knowledge-graph' | 'retrieval' | 'api'
 
 interface SettingsState {
+  // Knowledge-base routing
+  selectedKnowledgeBaseId: string
+  setSelectedKnowledgeBaseId: (knowledgeBaseId: string) => void
+
   // Document manager settings
   showFileName: boolean
   setShowFileName: (show: boolean) => void
@@ -110,6 +114,8 @@ const useSettingsStoreBase = create<SettingsState>()(
 
       apiKey: null,
 
+      selectedKnowledgeBaseId: 'default',
+
       currentTab: 'documents',
       showFileName: false,
       documentsPageSize: 10,
@@ -175,6 +181,9 @@ const useSettingsStoreBase = create<SettingsState>()(
 
       setApiKey: (apiKey: string | null) => set({ apiKey }),
 
+      setSelectedKnowledgeBaseId: (selectedKnowledgeBaseId: string) =>
+        set({ selectedKnowledgeBaseId, retrievalHistory: [] }),
+
       setCurrentTab: (tab: Tab) => set({ currentTab: tab }),
 
       setRetrievalHistory: (history: Message[]) => set({ retrievalHistory: history }),
@@ -229,7 +238,7 @@ const useSettingsStoreBase = create<SettingsState>()(
     {
       name: 'settings-storage',
       storage: createJSONStorage(() => localStorage),
-      version: 20,
+      version: 21,
       migrate: (state: any, version: number) => {
         if (version < 2) {
           state.showEdgeLabel = false
@@ -341,6 +350,9 @@ const useSettingsStoreBase = create<SettingsState>()(
             ...existing,
             ...suggestedUserPrompts.filter((p: string) => !existing.includes(p))
           ]
+        }
+        if (version < 21) {
+          state.selectedKnowledgeBaseId = 'default'
         }
         return state
       }

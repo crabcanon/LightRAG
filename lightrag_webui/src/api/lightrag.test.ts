@@ -9,6 +9,7 @@ type DocumentsRequest = {
 }
 
 type LightragApiModule = typeof import('./lightrag')
+type SettingsModule = typeof import('@/stores/settings')
 
 const storageMock = () => {
   const data = new Map<string, string>()
@@ -28,6 +29,7 @@ const storageMock = () => {
 }
 
 let apiModule: LightragApiModule
+let settingsModule: SettingsModule
 
 beforeAll(async () => {
   Object.defineProperty(globalThis, 'localStorage', {
@@ -40,10 +42,34 @@ beforeAll(async () => {
   })
 
   apiModule = await import('./lightrag')
+  settingsModule = await import('@/stores/settings')
 })
 
 afterEach(() => {
   apiModule.__resetPaginatedDocumentRequestsForTests()
+  settingsModule.useSettingsStore.getState().setSelectedKnowledgeBaseId('default')
+})
+
+describe('knowledge-base request routing', () => {
+  test('omits the header for the backward-compatible default library', () => {
+    settingsModule.useSettingsStore.getState().setSelectedKnowledgeBaseId('default')
+    expect(apiModule.buildKnowledgeBaseHeaders()).toEqual({})
+  })
+
+  test('adds the selected knowledge-base ID to every data request', () => {
+    settingsModule.useSettingsStore.getState().setSelectedKnowledgeBaseId('kb_project_a')
+    expect(apiModule.buildKnowledgeBaseHeaders()).toEqual({
+      'LIGHTRAG-KNOWLEDGE-BASE': 'kb_project_a'
+    })
+  })
+
+  test('lets an explicit batch target override the globally selected library', () => {
+    settingsModule.useSettingsStore.getState().setSelectedKnowledgeBaseId('kb_current')
+    expect(apiModule.buildKnowledgeBaseHeaders('kb_upload_target')).toEqual({
+      'LIGHTRAG-KNOWLEDGE-BASE': 'kb_upload_target'
+    })
+    expect(apiModule.buildKnowledgeBaseHeaders('default')).toEqual({})
+  })
 })
 
 describe('getDocumentsPaginated', () => {

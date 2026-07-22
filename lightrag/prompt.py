@@ -574,7 +574,8 @@ def resolve_entity_type_prompt_path(prompt_file_name: str | Path) -> Path:
         )
     if "\\" in file_name:
         raise ValueError(
-            "ENTITY_TYPE_PROMPT_FILE must not contain directory separators. "
+            "ENTITY_TYPE_PROMPT_FILE must be a file name only and must not "
+            "contain directory separators. "
             "Only file names inside PROMPT_DIR/entity_type are allowed."
         )
 

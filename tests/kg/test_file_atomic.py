@@ -118,6 +118,30 @@ def test_atomic_write_replace_exception_cleans_tmp_and_preserves_prior(tmp_path)
 
 
 @pytest.mark.offline
+def test_atomic_write_retries_transient_replace_permission_errors(tmp_path):
+    dst = str(tmp_path / "out.txt")
+    real_replace = os.replace
+    attempts = 0
+
+    def flaky_replace(src, destination):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise PermissionError(13, "transient sharing violation")
+        real_replace(src, destination)
+
+    with (
+        patch("lightrag.file_atomic.os.replace", side_effect=flaky_replace),
+        patch("lightrag.file_atomic.time.sleep") as sleep,
+    ):
+        atomic_write(dst, lambda tmp: open(tmp, "w").write("committed"))
+
+    assert attempts == 3
+    assert sleep.call_count == 2
+    assert open(dst).read() == "committed"
+
+
+@pytest.mark.offline
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX chmod semantics")
 def test_atomic_write_preserves_existing_mode(tmp_path):
     """The inode swap done by ``os.replace`` would otherwise inherit fresh

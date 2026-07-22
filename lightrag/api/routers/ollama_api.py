@@ -219,17 +219,27 @@ def parse_query_mode(query: str) -> tuple[str, SearchMode, bool, Optional[str]]:
 
 
 class OllamaAPI:
-    def __init__(self, rag: LightRAG, top_k: int = 60, api_key: Optional[str] = None):
+    def __init__(
+        self,
+        rag: LightRAG,
+        top_k: int = 60,
+        api_key: Optional[str] = None,
+        context_dependency=None,
+    ):
         self.rag = rag
         self.ollama_server_infos = rag.ollama_server_infos
         self.top_k = top_k
         self.api_key = api_key
+        self.context_dependency = context_dependency
         self.router = APIRouter(tags=["ollama"])
         self.setup_routes()
 
     def setup_routes(self):
         # Create combined auth dependency for Ollama API routes
         combined_auth = get_combined_auth_dependency(self.api_key)
+        data_dependencies = [Depends(combined_auth)]
+        if self.context_dependency:
+            data_dependencies.append(Depends(self.context_dependency))
 
         @self.router.get("/version", dependencies=[Depends(combined_auth)])
         async def get_version():
@@ -284,7 +294,7 @@ class OllamaAPI:
             )
 
         @self.router.post(
-            "/generate", dependencies=[Depends(combined_auth)], include_in_schema=True
+            "/generate", dependencies=data_dependencies, include_in_schema=True
         )
         async def generate(raw_request: Request):
             """Handle generate completion requests acting as an Ollama model
@@ -472,7 +482,7 @@ class OllamaAPI:
                 raise internal_server_error(e)
 
         @self.router.post(
-            "/chat", dependencies=[Depends(combined_auth)], include_in_schema=True
+            "/chat", dependencies=data_dependencies, include_in_schema=True
         )
         async def chat(raw_request: Request):
             """Process chat completion requests by acting as an Ollama model.

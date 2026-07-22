@@ -290,6 +290,16 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     working_dir: str = field(default="./rag_storage")
     """Directory where cache and temporary files are stored."""
 
+    input_dir: str | None = field(default=None)
+    """Base directory containing parser source files.
+
+    When set, parser source resolution uses this instance-local directory
+    instead of the process-wide ``INPUT_DIR`` environment variable.  The
+    workspace subdirectory is applied by the pipeline in the same way as the
+    API ``DocumentManager``.  This is required when multiple isolated
+    knowledge bases are served by one process.
+    """
+
     # Storage
     # ---
 
@@ -626,6 +636,14 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
 
     vector_db_storage_cls_kwargs: dict[str, Any] = field(default_factory=dict)
     """Additional parameters for vector database storage."""
+
+    storage_profile: dict[str, Any] = field(default_factory=dict, repr=False)
+    """Per-instance storage connection overrides for strict physical isolation.
+
+    The mapping is supplied by the API's administrator-managed profile file.
+    It may contain credentials, so it is never rendered in logs or repr output.
+    Normal deployments leave it empty and continue using environment variables.
+    """
 
     enable_llm_cache: bool = field(default=True)
     """Enables caching for LLM responses to avoid redundant computations."""
@@ -1090,7 +1108,12 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         # Restore original EmbeddingFunc object (asdict converts it to dict)
         global_config["embedding_func"] = original_embedding_func
 
-        _print_config = ",\n  ".join([f"{k} = {v}" for k, v in global_config.items()])
+        _print_config = ",\n  ".join(
+            [
+                f"{key} = {'<configured>' if key == 'storage_profile' and value else value}"
+                for key, value in global_config.items()
+            ]
+        )
         logger.debug(f"LightRAG init with param:\n  {_print_config}\n")
 
         # Step 2: Apply priority wrapper decorator to EmbeddingFunc's inner func

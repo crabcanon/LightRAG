@@ -208,6 +208,31 @@ def test_health_reads_pipeline_status_with_one_snapshot(monkeypatch):
     assert status.copy_calls == 1
 
 
+def test_health_rejects_unknown_knowledge_base_with_404(monkeypatch):
+    client = _build_client(monkeypatch)
+    _set_auth_mode(monkeypatch, auth_configured=False)
+
+    response = client.get("/health", headers={"LIGHTRAG-KNOWLEDGE-BASE": "kb_missing"})
+
+    assert response.status_code == 404
+    assert "does not exist" in response.json()["detail"]
+
+
+def test_health_openapi_publishes_knowledge_base_header(monkeypatch):
+    client = _build_client(monkeypatch)
+    operation = client.get("/openapi.json").json()["paths"]["/health"]["get"]
+    parameters = [
+        parameter
+        for parameter in operation.get("parameters", [])
+        if parameter.get("in") == "header"
+        and parameter.get("name") == "LIGHTRAG-KNOWLEDGE-BASE"
+    ]
+
+    assert len(parameters) == 1
+    assert parameters[0]["required"] is False
+    assert "GET /knowledge-bases" in parameters[0]["description"]
+
+
 # --------------------------------------------------------------------------- #
 # Password auth: anonymous gets liveness only; a valid token unlocks config.
 # --------------------------------------------------------------------------- #
