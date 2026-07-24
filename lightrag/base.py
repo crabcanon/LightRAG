@@ -15,7 +15,7 @@ from typing import (
     List,
     AsyncIterator,
 )
-from .utils import EmbeddingFunc
+from .utils import EmbeddingFunc, get_env_value
 from .types import KnowledgeGraph
 from .constants import (
     DEFAULT_TOP_K,
@@ -104,26 +104,26 @@ class QueryParam:
     stream: bool = False
     """If True, enables streaming output for real-time responses."""
 
-    top_k: int = int(os.getenv("TOP_K", str(DEFAULT_TOP_K)))
+    top_k: int = get_env_value("TOP_K", DEFAULT_TOP_K, int)
     """Number of top items to retrieve. Represents entities in 'local' mode and relationships in 'global' mode."""
 
-    chunk_top_k: int = int(os.getenv("CHUNK_TOP_K", str(DEFAULT_CHUNK_TOP_K)))
+    chunk_top_k: int = get_env_value("CHUNK_TOP_K", DEFAULT_CHUNK_TOP_K, int)
     """Number of text chunks to retrieve initially from vector search and keep after reranking.
     If None, defaults to top_k value.
     """
 
-    max_entity_tokens: int = int(
-        os.getenv("MAX_ENTITY_TOKENS", str(DEFAULT_MAX_ENTITY_TOKENS))
+    max_entity_tokens: int = get_env_value(
+        "MAX_ENTITY_TOKENS", DEFAULT_MAX_ENTITY_TOKENS, int
     )
     """Maximum number of tokens allocated for entity context in unified token control system."""
 
-    max_relation_tokens: int = int(
-        os.getenv("MAX_RELATION_TOKENS", str(DEFAULT_MAX_RELATION_TOKENS))
+    max_relation_tokens: int = get_env_value(
+        "MAX_RELATION_TOKENS", DEFAULT_MAX_RELATION_TOKENS, int
     )
     """Maximum number of tokens allocated for relationship context in unified token control system."""
 
-    max_total_tokens: int = int(
-        os.getenv("MAX_TOTAL_TOKENS", str(DEFAULT_MAX_TOTAL_TOKENS))
+    max_total_tokens: int = get_env_value(
+        "MAX_TOTAL_TOKENS", DEFAULT_MAX_TOTAL_TOKENS, int
     )
     """Maximum total tokens budget for the entire query context (entities + relations + chunks + system prompt)."""
 
@@ -896,9 +896,25 @@ class DocStatusStorage(BaseKVStorage, ABC):
 
     @abstractmethod
     async def get_docs_by_statuses(
-        self, statuses: list[DocStatus]
+        self, statuses: list[DocStatus], strict: bool = False
     ) -> dict[str, DocProcessingStatus]:
-        """Get all documents matching any of the given statuses"""
+        """Get all documents matching any of the given statuses.
+
+        ``strict`` selects the completeness contract:
+
+        * ``strict=False`` (default) — best-effort read for UI/listing paths:
+          a record that fails to deserialize is logged and skipped, and a
+          backend MAY return what it collected before a transport error.
+        * ``strict=True`` — scheduling control-plane contract: the result is
+          COMPLETE or the call raises.  Implementations must propagate any
+          transport/pagination failure, any incomplete response structure and
+          any record that cannot be converted to
+          :class:`DocProcessingStatus` — a partial result silently consumed
+          by the pipeline supervisor would strand the missed documents (the
+          caller has already consumed its wake-up signal).  A legitimately
+          empty result (nothing matches, index/collection not created yet)
+          is complete and returns ``{}``.
+        """
 
     @abstractmethod
     async def get_docs_by_track_id(
