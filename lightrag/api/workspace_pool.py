@@ -268,6 +268,29 @@ class WorkspaceInstancePool:
                 )
             return WorkspaceLease(self, context, kind)
 
+    async def acquire_existing(
+        self,
+        context: WorkspaceExecutionContext,
+        *,
+        kind: LeaseKind = "background",
+    ) -> WorkspaceLease:
+        """Atomically hand off the currently leased immutable instance."""
+
+        async with self._lock:
+            entry = self._entries.get(context.metadata.id)
+            if (
+                entry is None
+                or entry.state is not PoolEntryState.READY
+                or entry.context is None
+                or entry.context.rag is not context.rag
+            ):
+                raise WorkspacePoolBusyError(
+                    f"Workspace {context.metadata.id!r} cannot hand off its lease"
+                )
+            self._increment(entry, kind)
+            entry.last_used = time.monotonic()
+            return WorkspaceLease(self, entry.context, kind)
+
     async def _reserve(
         self, record: KnowledgeBaseRecord, *, kind: LeaseKind
     ) -> WorkspaceLease | WorkspaceExecutionContext | None:

@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from starlette.responses import StreamingResponse
 import pytest
 
+from lightrag.api.catalog import CatalogCASConflict, CatalogOperationState
 from lightrag.api.knowledge_bases import (
     DEFAULT_KNOWLEDGE_BASE_ID,
     KNOWLEDGE_BASE_HEADER,
@@ -22,6 +23,7 @@ from lightrag.api.knowledge_bases import (
     KnowledgeBaseManager,
     StorageProfileError,
 )
+from lightrag.kg.shared_storage import start_reserved_background_task
 from lightrag.workspace import (
     LEGACY_DEFAULT_CANONICAL_KEY,
     LEGACY_NAMESPACE_CODEC,
@@ -64,6 +66,7 @@ class _FakeRag:
         self.workspace = workspace
         self.initialized = False
         self.finalized = False
+        self.pipeline_recoveries = 0
         self.ollama_server_infos = SimpleNamespace()
         for attribute in (
             "llm_response_cache",
@@ -89,6 +92,9 @@ class _FakeRag:
 
     async def finalize_storages(self) -> None:
         self.finalized = True
+
+    async def apipeline_process_enqueue_documents(self) -> None:
+        self.pipeline_recoveries += 1
 
     async def get_graph_labels(self) -> list[str]:
         return [self.workspace]
@@ -650,7 +656,7 @@ async def test_side_effect_counters_expose_construction_init_and_migration(
     default_snapshot = manager.side_effect_counters.snapshot()
     assert default_snapshot == {
         "instance_constructions": 0,
-        "storage_initializations": 1,
+        "storage_initializations": 2,
         "migrations": 1,
     }
 
@@ -663,8 +669,8 @@ async def test_side_effect_counters_expose_construction_init_and_migration(
 
     assert manager.side_effect_counters.snapshot() == {
         "instance_constructions": 1,
-        "storage_initializations": 2,
-        "migrations": 2,
+        "storage_initializations": 3,
+        "migrations": 1,
     }
 
 
@@ -684,7 +690,7 @@ async def test_data_plane_pool_initialization_does_not_run_first_access_migratio
 
     assert manager.side_effect_counters.snapshot() == {
         "instance_constructions": 1,
-        "storage_initializations": 2,
+        "storage_initializations": 3,
         "migrations": 1,
     }
 
@@ -736,6 +742,217 @@ async def test_observation_context_reports_unloaded_without_side_effects(
 
     assert manager.side_effect_counters.snapshot() == before
     assert manager.instance_pool.peek(record.id)["entries"] == []
+
+
+@pytest.mark.asyncio
+async def test_managed_background_handoff_holds_explicit_pool_lease(
+    tmp_path: Path,
+):
+    manager = _manager(tmp_path)
+    record = manager.create(
+        name="Background handoff", isolation_level="logical", storage_profile_id=None
+    )
+    release_work = asyncio.Event()
+    managed_tasks: set[asyncio.Task] = set()
+
+    async def work(started: asyncio.Event) -> None:
+        started.set()
+        await release_work.wait()
+
+    async def backstop_release() -> None:
+        return None
+
+    async with manager.bind_request(record.id):
+        task = await start_reserved_background_task(
+            managed_tasks,
+            work=work,
+            backstop_release=backstop_release,
+        )
+
+    entry = manager.instance_pool.peek(record.id)["entries"][0]
+    assert entry["foreground_leases"] == 0
+    assert entry["background_leases"] == 1
+    with pytest.raises(Exception, match="active leases"):
+        await manager.instance_pool.reserve_delete(record.id)
+
+    release_work.set()
+    await task
+    assert manager.instance_pool.peek(record.id)["entries"][0]["background_leases"] == 0
+
+
+@pytest.mark.asyncio
+async def test_startup_reclaims_running_migration_and_fences_old_owner(
+    tmp_path: Path,
+):
+    first = _manager(tmp_path)
+    record = first.create(
+        name="Interrupted migration", isolation_level="logical", storage_profile_id=None
+    )
+    migrating, operation, _ = first.catalog.create_migration_operation(
+        workspace_id=record.id,
+        idempotency_key="interrupted-migration",
+        payload={"workspace_id": record.id},
+    )
+    old_claim = first.catalog.claim_operation(
+        operation.operation_id, owner_id="dead-owner"
+    )
+    assert migrating.lifecycle_state == "MIGRATING"
+
+    restarted = KnowledgeBaseManager(
+        catalog=first.catalog,
+        default_rag=_FakeRag("legacy"),
+        default_document_manager=_document_manager(tmp_path / "inputs", "legacy"),
+        rag_factory=lambda item, _profile: _FakeRag(item.effective_workspace),
+        document_manager_factory=lambda item, _profile: _document_manager(
+            tmp_path / "inputs", item.effective_workspace
+        ),
+    )
+    await restarted.initialize()
+
+    recovered = await restarted.catalog_provider.get_record(record.id)
+    terminal = await restarted.catalog_provider.get_operation(operation.operation_id)
+    assert recovered.lifecycle_state == "ACTIVE"
+    assert terminal.state is CatalogOperationState.SUCCEEDED
+    assert terminal.fencing_token > old_claim.fencing_token
+    with pytest.raises(CatalogCASConflict, match="fenced out"):
+        await restarted.catalog_provider.finish_operation(
+            operation.operation_id,
+            owner_id="dead-owner",
+            fencing_token=old_claim.fencing_token,
+            state=CatalogOperationState.SUCCEEDED,
+        )
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_pages_all_active_and_isolates_bad_workspace(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.setenv("LIGHTRAG_RECOVERY_PAGE_SIZE", "1")
+    recovered_rags: dict[str, _FakeRag] = {}
+
+    class SelectiveMigrationRag(_FakeRag):
+        async def check_and_migrate_data(self) -> None:
+            if self.workspace.endswith("bad"):
+                raise RuntimeError("simulated bad workspace")
+
+    def rag_factory(record, _profile):
+        rag = SelectiveMigrationRag(
+            "tenant_bad" if record.name == "Bad" else record.effective_workspace
+        )
+        recovered_rags[record.id] = rag
+        return rag
+
+    manager = _manager(
+        tmp_path,
+        rag_factory=rag_factory,
+    )
+    good = manager.create(
+        name="Good", isolation_level="logical", storage_profile_id=None
+    )
+    bad = manager.create(name="Bad", isolation_level="logical", storage_profile_id=None)
+
+    await manager.initialize()
+
+    good_record = await manager.catalog_provider.get_record(good.id)
+    bad_record = await manager.catalog_provider.get_record(
+        bad.id, include_tombstoned=True
+    )
+    report = manager.recovery_coordinator.last_report
+    assert good_record.lifecycle_state == "ACTIVE"
+    assert bad_record.lifecycle_state == "ERROR"
+    assert report.migrations_started == 3  # default + both named records
+    assert report.succeeded == 2
+    assert report.failed == 1
+    assert report.failures[0]["workspace_id"] == bad.id
+    assert recovered_rags[good.id].pipeline_recoveries == 1
+    assert recovered_rags[bad.id].pipeline_recoveries == 0
+
+
+@pytest.mark.asyncio
+async def test_delete_cleanup_journal_resumes_only_unfinished_resources(
+    tmp_path: Path,
+):
+    drop_counts: dict[str, int] = {}
+    created_rags: list[_FakeRag] = []
+
+    class CountingStorage(_FakeStorage):
+        def __init__(self, workspace: str, role: str) -> None:
+            super().__init__(workspace)
+            self.role = role
+
+        async def drop(self) -> None:
+            drop_counts[self.role] = drop_counts.get(self.role, 0) + 1
+            if self.role == "full_docs" and drop_counts[self.role] == 1:
+                raise RuntimeError("simulated partial drop")
+            await super().drop()
+
+    class CountingRag(_FakeRag):
+        def __init__(self, workspace: str) -> None:
+            super().__init__(workspace)
+            for role in (
+                "llm_response_cache",
+                "text_chunks",
+                "full_docs",
+                "full_entities",
+                "full_relations",
+                "entity_chunks",
+                "relation_chunks",
+                "chunk_entity_relation_graph",
+                "entities_vdb",
+                "relationships_vdb",
+                "chunks_vdb",
+                "doc_status",
+            ):
+                setattr(self, role, CountingStorage(workspace, role))
+            created_rags.append(self)
+
+    manager = _manager(
+        tmp_path,
+        rag_factory=lambda record, _profile: CountingRag(record.effective_workspace),
+    )
+    record = manager.create(
+        name="Resumable delete", isolation_level="logical", storage_profile_id=None
+    )
+    input_dir = Path(manager._document_manager_factory(record, None).input_dir)
+    (input_dir / "keep-until-complete.txt").write_text("data", encoding="utf-8")
+    _, operation, _ = await manager.catalog_provider.create_delete_operation(
+        workspace_id=record.id,
+        idempotency_key="resumable-delete",
+        payload={"workspace_id": record.id},
+    )
+
+    await manager._run_delete_lifecycle(operation.operation_id)
+
+    failed = await manager.catalog_provider.get_operation(operation.operation_id)
+    failed_record = await manager.catalog_provider.get_record(
+        record.id, include_tombstoned=True
+    )
+    assert failed.state is CatalogOperationState.FAILED
+    assert failed_record.lifecycle_state == "ERROR"
+    assert input_dir.exists()
+    assert "storage:llm_response_cache" in failed.metadata["cleanup_completed"]
+    assert "storage:full_docs" not in failed.metadata["cleanup_completed"]
+
+    await manager._run_delete_lifecycle(operation.operation_id)
+
+    terminal = await manager.catalog_provider.get_operation(operation.operation_id)
+    tombstone = await manager.catalog_provider.get_record(
+        record.id, include_tombstoned=True
+    )
+    assert terminal.state is CatalogOperationState.SUCCEEDED
+    assert terminal.metadata["cleanup_complete"] is True
+    assert tombstone.lifecycle_state == "TOMBSTONED"
+    assert not input_dir.exists()
+    assert drop_counts["full_docs"] == 2
+    assert all(count == 1 for role, count in drop_counts.items() if role != "full_docs")
+    assert len(created_rags) == 2
+    with pytest.raises(CatalogCASConflict, match="fenced out"):
+        await manager.catalog_provider.update_operation_metadata(
+            operation.operation_id,
+            owner_id=failed.owner_id or "",
+            fencing_token=failed.fencing_token,
+            metadata={"cleanup_complete": False},
+        )
 
 
 def test_pipeline_observation_returns_unloaded_without_constructing_instance(

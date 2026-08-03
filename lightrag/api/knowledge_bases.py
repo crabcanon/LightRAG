@@ -47,6 +47,7 @@ from lightrag.api.workspace_pool import (
     WorkspacePoolCapacityError,
     WorkspacePoolInitializationError,
 )
+from lightrag.api.workspace_recovery import WorkspaceRecoveryCoordinator
 from lightrag.exceptions import PipelineNotInitializedError
 from lightrag.file_atomic import atomic_write
 from lightrag.kg.shared_storage import get_namespace_data
@@ -64,6 +65,10 @@ from lightrag.workspace import (
     NamespaceCodec,
     WorkspaceBinding,
     WorkspaceKind,
+)
+from lightrag.workspace_scope import (
+    bind_background_lease_factory,
+    reset_background_lease_factory,
 )
 
 
@@ -633,13 +638,93 @@ class KnowledgeBaseCatalog:
                 raise
             return deleting, operation, True
 
-    def claim_operation(self, operation_id: str, *, owner_id: str) -> CatalogOperation:
+    def create_migration_operation(
+        self,
+        *,
+        workspace_id: str,
+        idempotency_key: str,
+        payload: Mapping[str, Any],
+    ) -> tuple[KnowledgeBaseRecord, CatalogOperation, bool]:
+        """Atomically persist ACTIVE -> MIGRATING for startup recovery."""
+
+        payload_hash = canonical_payload_hash(payload)
+        with self._lock:
+            existing = next(
+                (
+                    operation
+                    for operation in self._operations.values()
+                    if operation.idempotency_key == idempotency_key
+                ),
+                None,
+            )
+            if existing is not None:
+                if (
+                    existing.operation_type is not CatalogOperationType.MIGRATE
+                    or existing.payload_hash != payload_hash
+                    or existing.workspace_id != workspace_id
+                ):
+                    raise CatalogIdempotencyConflict(
+                        "Idempotency key is already used by a different request"
+                    )
+                return self._records[existing.workspace_id], existing, False
+
+            record = self.get(workspace_id)
+            if record.lifecycle_state != WorkspaceLifecycleState.ACTIVE.value:
+                raise CatalogCASConflict(
+                    f"Workspace {workspace_id!r} is not ACTIVE and cannot migrate"
+                )
+            now = _utc_now()
+            operation = CatalogOperation(
+                operation_id=f"op_{uuid4().hex}",
+                workspace_id=record.id,
+                operation_type=CatalogOperationType.MIGRATE,
+                state=CatalogOperationState.PENDING,
+                payload_hash=payload_hash,
+                idempotency_key=idempotency_key,
+                owner_id=None,
+                fencing_token=0,
+                revision=1,
+                created_at=now,
+                updated_at=now,
+                metadata=dict(payload),
+            )
+            migrating = replace(
+                record,
+                lifecycle_state=WorkspaceLifecycleState.MIGRATING.value,
+                revision=record.revision + 1,
+                current_operation_id=operation.operation_id,
+                error_code=None,
+                error_message=None,
+                updated_at=now,
+            )
+            self._records[record.id] = migrating
+            self._operations[operation.operation_id] = operation
+            try:
+                self._persist_locked()
+            except BaseException:
+                self._records[record.id] = record
+                self._operations.pop(operation.operation_id, None)
+                raise
+            return migrating, operation, True
+
+    def claim_operation(
+        self,
+        operation_id: str,
+        *,
+        owner_id: str,
+        reclaim_running: bool = False,
+    ) -> CatalogOperation:
         with self._lock:
             current = self.get_operation(operation_id)
-            if current.state not in {
+            claimable = current.state in {
                 CatalogOperationState.PENDING,
                 CatalogOperationState.FAILED,
-            }:
+            } or (
+                reclaim_running
+                and current.state is CatalogOperationState.RUNNING
+                and current.owner_id != owner_id
+            )
+            if not claimable:
                 raise CatalogCASConflict(
                     f"Catalog operation {operation_id!r} is not claimable"
                 )
@@ -651,7 +736,15 @@ class KnowledgeBaseCatalog:
                 fencing_token=self._fencing_token,
                 revision=current.revision + 1,
                 retry_count=current.retry_count
-                + (1 if current.state is CatalogOperationState.FAILED else 0),
+                + (
+                    1
+                    if current.state
+                    in {
+                        CatalogOperationState.FAILED,
+                        CatalogOperationState.RUNNING,
+                    }
+                    else 0
+                ),
                 error_code=None,
                 error_message=None,
                 updated_at=_utc_now(),
@@ -740,8 +833,36 @@ class KnowledgeBaseCatalog:
             self._persist_locked()
             return updated
 
+    def update_operation_metadata(
+        self,
+        operation_id: str,
+        *,
+        owner_id: str,
+        fencing_token: int,
+        metadata: Mapping[str, Any],
+    ) -> CatalogOperation:
+        with self._lock:
+            current = self.get_operation(operation_id)
+            if (
+                current.state is not CatalogOperationState.RUNNING
+                or current.owner_id != owner_id
+                or current.fencing_token != fencing_token
+            ):
+                raise CatalogCASConflict(
+                    f"Catalog operation {operation_id!r} progress was fenced out"
+                )
+            updated = replace(
+                current,
+                metadata={**dict(current.metadata), **dict(metadata)},
+                revision=current.revision + 1,
+                updated_at=_utc_now(),
+            )
+            self._operations[operation_id] = updated
+            self._persist_locked()
+            return updated
+
     def list_unfinished_operations(
-        self, *, limit: int = 100
+        self, *, limit: int = 100, cursor: str | None = None
     ) -> tuple[CatalogOperation, ...]:
         if not 1 <= limit <= 1000:
             raise ValueError("Operation page limit must be between 1 and 1000")
@@ -758,8 +879,12 @@ class KnowledgeBaseCatalog:
             ]
             return tuple(
                 sorted(
-                    unfinished,
-                    key=lambda item: (item.updated_at, item.operation_id),
+                    (
+                        operation
+                        for operation in unfinished
+                        if cursor is None or operation.operation_id > cursor
+                    ),
+                    key=lambda item: item.operation_id,
                 )[:limit]
             )
 
@@ -798,6 +923,25 @@ class KnowledgeBaseSideEffectCounters:
 _current_context: ContextVar[WorkspaceExecutionContext | None] = ContextVar(
     "lightrag_knowledge_base_context", default=None
 )
+
+
+class _BoundBackgroundLease:
+    """Rebind explicit authority while holding a pool background lease."""
+
+    def __init__(self, lease) -> None:
+        self.lease = lease
+        self._token = None
+
+    async def __aenter__(self) -> WorkspaceExecutionContext:
+        self._token = _current_context.set(self.lease.context)
+        return self.lease.context
+
+    async def __aexit__(self, exc_type, exc, traceback) -> None:
+        try:
+            if self._token is not None:
+                _current_context.reset(self._token)
+        finally:
+            await self.lease.release()
 
 
 class RequestScopedProxy:
@@ -908,6 +1052,13 @@ class KnowledgeBaseManager:
         self._lifecycle_tasks: dict[str, asyncio.Task[None]] = {}
         self._lifecycle_owner_id = (
             f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:12]}"
+        )
+        self.recovery_coordinator = WorkspaceRecoveryCoordinator(
+            catalog=self.catalog_provider,
+            run_create=self._run_create_lifecycle,
+            run_migrate=self._run_migration_lifecycle,
+            run_delete=self._run_delete_lifecycle,
+            page_size=int(os.getenv("LIGHTRAG_RECOVERY_PAGE_SIZE", "100") or "100"),
         )
         self._started = False
         self.side_effect_counters = KnowledgeBaseSideEffectCounters()
@@ -1149,10 +1300,19 @@ class KnowledgeBaseManager:
                 self.default_context.metadata
             )
             self.default_context.metadata = durable_default
-            await self._initialize_context(self.default_context)
+            await self.recovery_coordinator.recover()
+            durable_default = await self.catalog_provider.get_record(
+                DEFAULT_KNOWLEDGE_BASE_ID, include_tombstoned=True
+            )
+            if durable_default.lifecycle_state != WorkspaceLifecycleState.ACTIVE.value:
+                raise KnowledgeBaseError(
+                    "Default knowledge base did not recover to ACTIVE during startup"
+                )
+            self.default_context.metadata = durable_default
             self.default_execution_context = self._execution_context(
                 self.default_context
             )
+            await self._initialize_execution_context(self.default_execution_context)
             self.instance_pool.add_ready(
                 self.default_execution_context,
                 pinned=True,
@@ -1298,7 +1458,9 @@ class KnowledgeBaseManager:
         if existing is not None:
             existing.metadata = record
             if self._started:
-                await self._initialize_context(existing)
+                await self._initialize_execution_context(
+                    self._execution_context(existing)
+                )
             return existing
 
         profile = self._profile_for(record)
@@ -1318,7 +1480,7 @@ class KnowledgeBaseManager:
                 )
                 self._contexts[normalized] = context
         if self._started:
-            await self._initialize_context(context)
+            await self._initialize_execution_context(self._execution_context(context))
         return context
 
     @asynccontextmanager
@@ -1358,11 +1520,21 @@ class KnowledgeBaseManager:
         lease = await self.instance_pool.acquire(record, kind=lease_kind)
         context = lease.context
         token = _current_context.set(context)
+        background_factory_token = bind_background_lease_factory(
+            lambda: self._capture_background_lease(context)
+        )
         try:
             yield context
         finally:
+            reset_background_lease_factory(background_factory_token)
             _current_context.reset(token)
             await lease.release()
+
+    async def _capture_background_lease(
+        self, context: WorkspaceExecutionContext
+    ) -> _BoundBackgroundLease:
+        lease = await self.instance_pool.acquire_existing(context, kind="background")
+        return _BoundBackgroundLease(lease)
 
     @asynccontextmanager
     async def bind_observation(
@@ -1614,12 +1786,16 @@ class KnowledgeBaseManager:
         task.add_done_callback(_discard)
         return task
 
-    async def _run_create_lifecycle(self, operation_id: str) -> None:
+    async def _run_create_lifecycle(
+        self, operation_id: str, reclaim_running: bool = False
+    ) -> None:
         claim: CatalogOperation | None = None
         context: KnowledgeBaseContext | None = None
         try:
             claim = await self.catalog_provider.claim_operation(
-                operation_id, owner_id=self._lifecycle_owner_id
+                operation_id,
+                owner_id=self._lifecycle_owner_id,
+                reclaim_running=reclaim_running,
             )
             if claim.operation_type is not CatalogOperationType.CREATE:
                 raise CatalogCASConflict(
@@ -1633,6 +1809,7 @@ class KnowledgeBaseManager:
                 expected_revision=record.revision,
                 expected_states=(
                     WorkspaceLifecycleState.CREATING,
+                    WorkspaceLifecycleState.MIGRATING,
                     WorkspaceLifecycleState.ERROR,
                 ),
                 target_state=WorkspaceLifecycleState.MIGRATING,
@@ -1721,6 +1898,136 @@ class KnowledgeBaseManager:
                         operation_id,
                         update_error,
                     )
+
+    async def _run_migration_lifecycle(
+        self, operation_id: str, reclaim_running: bool = False
+    ) -> None:
+        """Run one startup-owned migration under catalog fencing."""
+
+        claim: CatalogOperation | None = None
+        context: KnowledgeBaseContext | None = None
+        record: KnowledgeBaseRecord | None = None
+        try:
+            claim = await self.catalog_provider.claim_operation(
+                operation_id,
+                owner_id=self._lifecycle_owner_id,
+                reclaim_running=reclaim_running,
+            )
+            if claim.operation_type is not CatalogOperationType.MIGRATE:
+                raise CatalogCASConflict(
+                    f"Operation {operation_id!r} is not a workspace migration"
+                )
+            record = await self.catalog_provider.get_record(
+                claim.workspace_id, include_tombstoned=True
+            )
+            migrating = await self.catalog_provider.transition_record(
+                record.id,
+                expected_revision=record.revision,
+                expected_states=(
+                    WorkspaceLifecycleState.MIGRATING,
+                    WorkspaceLifecycleState.ERROR,
+                ),
+                target_state=WorkspaceLifecycleState.MIGRATING,
+                operation_id=operation_id,
+                owner_id=self._lifecycle_owner_id,
+                fencing_token=claim.fencing_token,
+            )
+            profile = self._profile_for(migrating)
+            async with self._manager_lock:
+                context = self._contexts.get(migrating.id)
+                if context is None:
+                    self.side_effect_counters.instance_constructions += 1
+                    context = KnowledgeBaseContext(
+                        metadata=migrating,
+                        rag=self._rag_factory(migrating, profile),
+                        document_manager=self._document_manager_factory(
+                            migrating, profile
+                        ),
+                    )
+                    self._contexts[migrating.id] = context
+                else:
+                    context.metadata = migrating
+            await self._initialize_context(context)
+            recover_pipeline = getattr(
+                context.rag, "apipeline_process_enqueue_documents", None
+            )
+            if callable(recover_pipeline):
+                await recover_pipeline()
+            await context.rag.finalize_storages()
+            self._initialized_ids.discard(migrating.id)
+            if migrating.id != DEFAULT_KNOWLEDGE_BASE_ID:
+                self._contexts.pop(migrating.id, None)
+            await self.catalog_provider.transition_record(
+                migrating.id,
+                expected_revision=migrating.revision,
+                expected_states=(WorkspaceLifecycleState.MIGRATING,),
+                target_state=WorkspaceLifecycleState.ACTIVE,
+                operation_id=operation_id,
+                owner_id=self._lifecycle_owner_id,
+                fencing_token=claim.fencing_token,
+            )
+            await self.catalog_provider.finish_operation(
+                operation_id,
+                owner_id=self._lifecycle_owner_id,
+                fencing_token=claim.fencing_token,
+                state=CatalogOperationState.SUCCEEDED,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Workspace migration operation %s failed: %s", operation_id, exc
+            )
+            if claim is not None:
+                try:
+                    current = await self.catalog_provider.get_record(
+                        claim.workspace_id, include_tombstoned=True
+                    )
+                    if current.lifecycle_state in {
+                        WorkspaceLifecycleState.MIGRATING.value,
+                        WorkspaceLifecycleState.ERROR.value,
+                    }:
+                        await self.catalog_provider.transition_record(
+                            current.id,
+                            expected_revision=current.revision,
+                            expected_states=(
+                                WorkspaceLifecycleState(current.lifecycle_state),
+                            ),
+                            target_state=WorkspaceLifecycleState.ERROR,
+                            operation_id=operation_id,
+                            owner_id=self._lifecycle_owner_id,
+                            fencing_token=claim.fencing_token,
+                            error_code="workspace_migration_failed",
+                            error_message=type(exc).__name__,
+                        )
+                    await self.catalog_provider.finish_operation(
+                        operation_id,
+                        owner_id=self._lifecycle_owner_id,
+                        fencing_token=claim.fencing_token,
+                        state=CatalogOperationState.FAILED,
+                        error_code="workspace_migration_failed",
+                        error_message=type(exc).__name__,
+                    )
+                except Exception as update_error:
+                    logger.error(
+                        "Failed to persist workspace migration %s failure: %s",
+                        operation_id,
+                        update_error,
+                    )
+        finally:
+            if context is not None and record is not None:
+                if record.id in self._initialized_ids:
+                    try:
+                        await context.rag.finalize_storages()
+                    except Exception as cleanup_error:
+                        logger.error(
+                            "Failed to finalize migration workspace %s: %s",
+                            record.id,
+                            cleanup_error,
+                        )
+                    self._initialized_ids.discard(record.id)
+                if record.id != DEFAULT_KNOWLEDGE_BASE_ID:
+                    self._contexts.pop(record.id, None)
 
     async def wait_for_operation(
         self, operation_id: str, *, timeout: float
@@ -1844,7 +2151,9 @@ class KnowledgeBaseManager:
         task.add_done_callback(_discard)
         return task
 
-    async def _run_delete_lifecycle(self, operation_id: str) -> None:
+    async def _run_delete_lifecycle(
+        self, operation_id: str, reclaim_running: bool = False
+    ) -> None:
         claim: CatalogOperation | None = None
         context: KnowledgeBaseContext | None = None
         record: KnowledgeBaseRecord | None = None
@@ -1853,7 +2162,9 @@ class KnowledgeBaseManager:
             pending_operation = await self.catalog_provider.get_operation(operation_id)
             workspace_id = pending_operation.workspace_id
             claim = await self.catalog_provider.claim_operation(
-                operation_id, owner_id=self._lifecycle_owner_id
+                operation_id,
+                owner_id=self._lifecycle_owner_id,
+                reclaim_running=reclaim_running,
             )
             if claim.operation_type is not CatalogOperationType.DELETE:
                 raise CatalogCASConflict(
@@ -1904,14 +2215,37 @@ class KnowledgeBaseManager:
                         "failed; destructive cleanup was refused"
                     ) from exc
 
+            completed_steps = [
+                str(step)
+                for step in claim.metadata.get("cleanup_completed", ())
+                if isinstance(step, str)
+            ]
+            completed_set = set(completed_steps)
+
+            async def checkpoint(step: str) -> None:
+                if step not in completed_set:
+                    completed_set.add(step)
+                    completed_steps.append(step)
+                await self.catalog_provider.update_operation_metadata(
+                    operation_id,
+                    owner_id=self._lifecycle_owner_id,
+                    fencing_token=claim.fencing_token,
+                    metadata={"cleanup_completed": completed_steps},
+                )
+
             errors: list[str] = []
             for attribute in _STORAGE_ATTRIBUTES:
+                cleanup_step = f"storage:{attribute}"
+                if cleanup_step in completed_set:
+                    continue
                 storage = getattr(context.rag, attribute, None)
                 drop = getattr(storage, "drop", None)
                 if drop is None:
+                    await checkpoint(cleanup_step)
                     continue
                 try:
                     await drop()
+                    await checkpoint(cleanup_step)
                 except Exception as exc:
                     errors.append(f"{attribute}: {type(exc).__name__}")
             if errors:
@@ -1924,9 +2258,26 @@ class KnowledgeBaseManager:
             self._contexts.pop(record.id, None)
             input_dir = Path(context.document_manager.input_dir).resolve()
             base_input_dir = Path(context.document_manager.base_input_dir).resolve()
-            if input_dir != base_input_dir and base_input_dir in input_dir.parents:
+            if (
+                "input_directory" not in completed_set
+                and input_dir != base_input_dir
+                and base_input_dir in input_dir.parents
+            ):
                 if input_dir.exists():
                     shutil.rmtree(input_dir)
+                await checkpoint("input_directory")
+            elif "input_directory" not in completed_set:
+                await checkpoint("input_directory")
+
+            await self.catalog_provider.update_operation_metadata(
+                operation_id,
+                owner_id=self._lifecycle_owner_id,
+                fencing_token=claim.fencing_token,
+                metadata={
+                    "cleanup_completed": completed_steps,
+                    "cleanup_complete": True,
+                },
+            )
 
             tombstone = await self.catalog_provider.transition_record(
                 record.id,

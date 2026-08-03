@@ -2648,6 +2648,7 @@ def create_app(args):
             "default_lifecycle_state": default_record.lifecycle_state,
             "workspace_deployment": workspace_deployment.public_dict(),
             "pool": knowledge_base_manager.instance_pool.peek(),
+            "recovery": knowledge_base_manager.recovery_coordinator.last_report.public_dict(),
             "side_effect_counters": after,
         }
 

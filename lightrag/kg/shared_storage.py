@@ -55,6 +55,7 @@ from lightrag.kg.scan_job_store import (
     ScanJobStoreHub,
     _ScanJobStoreHubProxy,
 )
+from lightrag.workspace_scope import capture_background_workspace_lease
 
 DEBUG_LOCKS = False
 
@@ -3260,7 +3261,25 @@ async def start_reserved_background_task(
     the reservation is never stranded.
     """
     started = asyncio.Event()
-    task = asyncio.ensure_future(work(started))
+    try:
+        workspace_lease = await capture_background_workspace_lease()
+    except BaseException:
+        await backstop_release()
+        raise
+
+    async def _leased_work():
+        async with workspace_lease:
+            await work(started)
+
+    child_coro = _leased_work()
+    try:
+        task = asyncio.ensure_future(child_coro)
+    except BaseException:
+        child_coro.close()
+        async with workspace_lease:
+            pass
+        await backstop_release()
+        raise
     background_tasks.add(task)
 
     def _done(t):
@@ -3445,15 +3464,30 @@ async def start_committed_background_task(
     state: Dict[str, Any] = {"committed": False, "refusal": None}
     started = asyncio.Event()
 
-    async def _child():
-        refusal = await commit(state)
-        if refusal is not None:
-            state["refusal"] = refusal
-            return
-        started.set()
-        await work()
+    try:
+        workspace_lease = await capture_background_workspace_lease()
+    except BaseException:
+        await backstop_release()
+        raise
 
-    task = asyncio.ensure_future(_child())
+    async def _child():
+        async with workspace_lease:
+            refusal = await commit(state)
+            if refusal is not None:
+                state["refusal"] = refusal
+                return
+            started.set()
+            await work()
+
+    child_coro = _child()
+    try:
+        task = asyncio.ensure_future(child_coro)
+    except BaseException:
+        child_coro.close()
+        async with workspace_lease:
+            pass
+        await backstop_release()
+        raise
     background_tasks.add(task)
 
     def _done(t):

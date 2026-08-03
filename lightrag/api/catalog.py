@@ -187,14 +187,32 @@ class CatalogProvider(ABC):
         """Atomically move ACTIVE to DELETING and persist a PENDING operation."""
 
     @abstractmethod
+    async def create_migration_operation(
+        self,
+        *,
+        workspace_id: str,
+        idempotency_key: str,
+        payload: Mapping[str, Any],
+    ) -> tuple[Any, CatalogOperation, bool]:
+        """Atomically move ACTIVE to MIGRATING for startup-owned migration."""
+
+    @abstractmethod
     async def get_operation(self, operation_id: str) -> CatalogOperation:
         """Return the latest operation revision."""
 
     @abstractmethod
     async def claim_operation(
-        self, operation_id: str, *, owner_id: str
+        self,
+        operation_id: str,
+        *,
+        owner_id: str,
+        reclaim_running: bool = False,
     ) -> CatalogOperation:
-        """Claim an unfinished operation and allocate a monotonic fencing token."""
+        """Claim work and allocate a monotonic fencing token.
+
+        ``reclaim_running`` is reserved for the supported single-worker startup
+        coordinator, where every previous owner is known to be dead.
+        """
 
     @abstractmethod
     async def transition_record(
@@ -226,10 +244,21 @@ class CatalogProvider(ABC):
         """Fenced terminal operation update."""
 
     @abstractmethod
+    async def update_operation_metadata(
+        self,
+        operation_id: str,
+        *,
+        owner_id: str,
+        fencing_token: int,
+        metadata: Mapping[str, Any],
+    ) -> CatalogOperation:
+        """Fenced durable progress checkpoint for resumable lifecycle work."""
+
+    @abstractmethod
     async def list_unfinished_operations(
-        self, *, limit: int = 100
+        self, *, limit: int = 100, cursor: str | None = None
     ) -> tuple[CatalogOperation, ...]:
-        """List durable work requiring lifecycle/recovery ownership."""
+        """List durable work ordered by operation ID after an optional cursor."""
 
 
 class LocalCatalogProvider(CatalogProvider):
@@ -335,13 +364,34 @@ class LocalCatalogProvider(CatalogProvider):
             payload=payload,
         )
 
+    async def create_migration_operation(
+        self,
+        *,
+        workspace_id: str,
+        idempotency_key: str,
+        payload: Mapping[str, Any],
+    ) -> tuple[Any, CatalogOperation, bool]:
+        return self.catalog.create_migration_operation(
+            workspace_id=workspace_id,
+            idempotency_key=idempotency_key,
+            payload=payload,
+        )
+
     async def get_operation(self, operation_id: str) -> CatalogOperation:
         return self.catalog.get_operation(operation_id)
 
     async def claim_operation(
-        self, operation_id: str, *, owner_id: str
+        self,
+        operation_id: str,
+        *,
+        owner_id: str,
+        reclaim_running: bool = False,
     ) -> CatalogOperation:
-        return self.catalog.claim_operation(operation_id, owner_id=owner_id)
+        return self.catalog.claim_operation(
+            operation_id,
+            owner_id=owner_id,
+            reclaim_running=reclaim_running,
+        )
 
     async def transition_record(
         self,
@@ -387,10 +437,25 @@ class LocalCatalogProvider(CatalogProvider):
             error_message=error_message,
         )
 
+    async def update_operation_metadata(
+        self,
+        operation_id: str,
+        *,
+        owner_id: str,
+        fencing_token: int,
+        metadata: Mapping[str, Any],
+    ) -> CatalogOperation:
+        return self.catalog.update_operation_metadata(
+            operation_id,
+            owner_id=owner_id,
+            fencing_token=fencing_token,
+            metadata=metadata,
+        )
+
     async def list_unfinished_operations(
-        self, *, limit: int = 100
+        self, *, limit: int = 100, cursor: str | None = None
     ) -> tuple[CatalogOperation, ...]:
-        return self.catalog.list_unfinished_operations(limit=limit)
+        return self.catalog.list_unfinished_operations(limit=limit, cursor=cursor)
 
 
 _CATALOG_TABLE = "lightrag_workspace_catalog"
@@ -822,6 +887,89 @@ class PostgresCatalogProvider(CatalogProvider):
         self._cache[durable.id] = durable
         return durable, operation, created
 
+    async def create_migration_operation(
+        self,
+        *,
+        workspace_id: str,
+        idempotency_key: str,
+        payload: Mapping[str, Any],
+    ) -> tuple[Any, CatalogOperation, bool]:
+        payload_hash = canonical_payload_hash(payload)
+        operation_id = f"op_{uuid4().hex}"
+        now = utc_now()
+        async with self._connection() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    f"""
+                    INSERT INTO {_OPERATION_TABLE} (
+                        operation_id, workspace_id, operation_type, state,
+                        payload_hash, idempotency_key, owner_id,
+                        fencing_token, revision, retry_count, metadata,
+                        created_at, updated_at
+                    ) VALUES ($1, $2, 'MIGRATE', 'PENDING', $3, $4, NULL,
+                              0, 1, 0, $5::jsonb, $6::timestamptz, $6::timestamptz)
+                    ON CONFLICT (idempotency_key) DO NOTHING
+                    RETURNING *
+                    """,
+                    operation_id,
+                    workspace_id,
+                    payload_hash,
+                    idempotency_key,
+                    json.dumps(dict(payload)),
+                    now,
+                )
+                created = row is not None
+                if row is None:
+                    row = await connection.fetchrow(
+                        f"SELECT * FROM {_OPERATION_TABLE} WHERE idempotency_key = $1",
+                        idempotency_key,
+                    )
+                    if row is None:
+                        raise CatalogError(
+                            "Idempotent migration lost its operation row"
+                        )
+                    operation = self._operation_from_row(row)
+                    if (
+                        operation.operation_type is not CatalogOperationType.MIGRATE
+                        or operation.payload_hash != payload_hash
+                        or operation.workspace_id != workspace_id
+                    ):
+                        raise CatalogIdempotencyConflict(
+                            "Idempotency key is already used by a different request"
+                        )
+                    durable_row = await connection.fetchrow(
+                        f"SELECT * FROM {_CATALOG_TABLE} WHERE id = $1",
+                        operation.workspace_id,
+                    )
+                    if durable_row is None:
+                        raise CatalogError(
+                            "Idempotent migration references a missing workspace"
+                        )
+                    durable = self._record_from_row(durable_row)
+                    self._cache[durable.id] = durable
+                    return durable, operation, False
+
+                durable_row = await connection.fetchrow(
+                    f"""
+                    UPDATE {_CATALOG_TABLE}
+                    SET lifecycle_state = 'MIGRATING', revision = revision + 1,
+                        current_operation_id = $2, error_code = NULL,
+                        error_message = NULL, updated_at = NOW()
+                    WHERE id = $1 AND lifecycle_state = 'ACTIVE'
+                    RETURNING *
+                    """,
+                    workspace_id,
+                    operation_id,
+                )
+                if durable_row is None:
+                    raise CatalogCASConflict(
+                        f"Workspace {workspace_id!r} is not ACTIVE and cannot migrate"
+                    )
+        operation = self._operation_from_row(row)
+        durable = self._record_from_row(durable_row)
+        self._cache[durable.id] = durable
+        return durable, operation, created
+
     async def get_operation(self, operation_id: str) -> CatalogOperation:
         async with self._connection() as connection:
             row = await connection.fetchrow(
@@ -835,7 +983,11 @@ class PostgresCatalogProvider(CatalogProvider):
         return self._operation_from_row(row)
 
     async def claim_operation(
-        self, operation_id: str, *, owner_id: str
+        self,
+        operation_id: str,
+        *,
+        owner_id: str,
+        reclaim_running: bool = False,
     ) -> CatalogOperation:
         async with self._connection() as connection:
             async with connection.transaction():
@@ -847,14 +999,20 @@ class PostgresCatalogProvider(CatalogProvider):
                     UPDATE {_OPERATION_TABLE}
                     SET state = 'RUNNING', owner_id = $2, fencing_token = $3,
                         revision = revision + 1,
-                        retry_count = retry_count + CASE WHEN state = 'FAILED' THEN 1 ELSE 0 END,
+                        retry_count = retry_count + CASE
+                            WHEN state IN ('FAILED', 'RUNNING') THEN 1 ELSE 0 END,
                         error_code = NULL, error_message = NULL, updated_at = NOW()
-                    WHERE operation_id = $1 AND state IN ('PENDING', 'FAILED')
+                    WHERE operation_id = $1
+                      AND (
+                          state IN ('PENDING', 'FAILED')
+                          OR ($4::boolean AND state = 'RUNNING' AND owner_id <> $2)
+                      )
                     RETURNING *
                     """,
                     operation_id,
                     owner_id,
                     token,
+                    reclaim_running,
                 )
         if row is None:
             raise CatalogCASConflict(
@@ -945,8 +1103,37 @@ class PostgresCatalogProvider(CatalogProvider):
             )
         return self._operation_from_row(row)
 
+    async def update_operation_metadata(
+        self,
+        operation_id: str,
+        *,
+        owner_id: str,
+        fencing_token: int,
+        metadata: Mapping[str, Any],
+    ) -> CatalogOperation:
+        async with self._connection() as connection:
+            row = await connection.fetchrow(
+                f"""
+                UPDATE {_OPERATION_TABLE}
+                SET metadata = metadata || $4::jsonb,
+                    revision = revision + 1, updated_at = NOW()
+                WHERE operation_id = $1 AND owner_id = $2
+                  AND fencing_token = $3 AND state = 'RUNNING'
+                RETURNING *
+                """,
+                operation_id,
+                owner_id,
+                fencing_token,
+                json.dumps(dict(metadata)),
+            )
+        if row is None:
+            raise CatalogCASConflict(
+                f"Catalog operation {operation_id!r} progress was fenced out"
+            )
+        return self._operation_from_row(row)
+
     async def list_unfinished_operations(
-        self, *, limit: int = 100
+        self, *, limit: int = 100, cursor: str | None = None
     ) -> tuple[CatalogOperation, ...]:
         if not 1 <= limit <= 1000:
             raise ValueError("Operation page limit must be between 1 and 1000")
@@ -955,10 +1142,12 @@ class PostgresCatalogProvider(CatalogProvider):
                 f"""
                 SELECT * FROM {_OPERATION_TABLE}
                 WHERE state IN ('PENDING', 'RUNNING', 'FAILED')
-                ORDER BY updated_at, operation_id
+                  AND ($2::text IS NULL OR operation_id > $2)
+                ORDER BY operation_id
                 LIMIT $1
                 """,
                 limit,
+                cursor,
             )
         return tuple(self._operation_from_row(row) for row in rows)
 

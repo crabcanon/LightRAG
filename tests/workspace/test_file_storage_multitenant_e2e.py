@@ -1,6 +1,7 @@
 """End-to-end regression coverage for the default file-backed tenant boundary."""
 
 import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -168,6 +169,97 @@ async def test_default_file_storages_isolate_same_document_and_deletion(
         assert set(
             await rag_beta.doc_status.get_docs_by_status(DocStatus.PROCESSED)
         ) == {document_id}
+    finally:
+        if rag_alpha is not None:
+            await rag_alpha.finalize_storages()
+        if rag_beta is not None:
+            await rag_beta.finalize_storages()
+        finalize_share_data()
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_doc_status_same_hash_isolated_across_lifecycle_retry_and_restart(
+    tmp_path: Path,
+) -> None:
+    """The recovery queue must remain tenant-scoped at every pipeline state."""
+
+    initialize_share_data()
+    rag_alpha: LightRAG | None = None
+    rag_beta: LightRAG | None = None
+    document_id = "doc-shared-content-hash"
+    content_hash = "same-content-hash"
+
+    def status_record(workspace: str, status: DocStatus) -> dict[str, object]:
+        now = datetime.now(timezone.utc).isoformat()
+        return {
+            "content_summary": workspace,
+            "content_length": 17,
+            "file_path": "shared.txt",
+            "status": status.value,
+            "created_at": now,
+            "updated_at": now,
+            "track_id": f"track-{workspace}",
+            "chunks_count": 0,
+            "chunks_list": [],
+            "error_msg": "simulated" if status is DocStatus.FAILED else None,
+            "metadata": {"workspace_marker": workspace},
+            "content_hash": content_hash,
+        }
+
+    try:
+        rag_alpha, rag_beta = await asyncio.gather(
+            _new_rag(tmp_path, "alpha-status", "ALPHA_STATUS_ENTITY"),
+            _new_rag(tmp_path, "beta-status", "BETA_STATUS_ENTITY"),
+        )
+        await rag_beta.doc_status.upsert(
+            {document_id: status_record("beta", DocStatus.PENDING)}
+        )
+
+        for status in (
+            DocStatus.PENDING,
+            DocStatus.PARSING,
+            DocStatus.ANALYZING,
+            DocStatus.PROCESSING,
+            DocStatus.PROCESSED,
+            DocStatus.FAILED,
+            DocStatus.PENDING,  # retry
+        ):
+            await rag_alpha.doc_status.upsert(
+                {document_id: status_record("alpha", status)}
+            )
+            alpha = await rag_alpha.doc_status.get_by_id(document_id)
+            beta = await rag_beta.doc_status.get_by_id(document_id)
+            assert alpha is not None and alpha["status"] == status.value
+            assert alpha["content_hash"] == content_hash
+            assert alpha["metadata"]["workspace_marker"] == "alpha"
+            assert beta is not None and beta["status"] == DocStatus.PENDING.value
+            assert beta["content_hash"] == content_hash
+            assert beta["metadata"]["workspace_marker"] == "beta"
+
+        await asyncio.gather(
+            rag_alpha.finalize_storages(), rag_beta.finalize_storages()
+        )
+        rag_alpha = rag_beta = None
+        finalize_share_data()
+        initialize_share_data()
+
+        rag_alpha, rag_beta = await asyncio.gather(
+            _new_rag(tmp_path, "alpha-status", "ALPHA_STATUS_ENTITY"),
+            _new_rag(tmp_path, "beta-status", "BETA_STATUS_ENTITY"),
+        )
+        assert (await rag_alpha.doc_status.get_by_id(document_id))["metadata"][
+            "workspace_marker"
+        ] == "alpha"
+        assert (await rag_beta.doc_status.get_by_id(document_id))["metadata"][
+            "workspace_marker"
+        ] == "beta"
+
+        await rag_alpha.doc_status.delete([document_id])
+        await rag_alpha.doc_status.index_done_callback()
+        assert await rag_alpha.doc_status.get_by_id(document_id) is None
+        beta = await rag_beta.doc_status.get_by_id(document_id)
+        assert beta is not None and beta["content_hash"] == content_hash
     finally:
         if rag_alpha is not None:
             await rag_alpha.finalize_storages()

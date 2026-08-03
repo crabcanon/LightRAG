@@ -1,5 +1,6 @@
 """Catalog provider lifecycle, CAS, idempotency, and fencing tests."""
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -8,7 +9,9 @@ import pytest
 from lightrag.api.catalog import (
     CatalogCASConflict,
     CatalogIdempotencyConflict,
+    CatalogOperation,
     CatalogOperationState,
+    CatalogOperationType,
     LocalCatalogProvider,
     PostgresCatalogProvider,
     WorkspaceLifecycleState,
@@ -54,6 +57,10 @@ class _ScriptedConnection:
     async def fetchrow(self, statement, *args):
         self.statements.append(statement)
         return self.fetchrow_results.pop(0)
+
+    async def fetchval(self, statement, *args):
+        self.statements.append(statement)
+        return 7
 
 
 class _FakePool:
@@ -168,12 +175,10 @@ async def test_local_provider_idempotency_revision_and_fencing(
     assert finished.state is CatalogOperationState.SUCCEEDED
     assert await provider.list_unfinished_operations() == ()
 
-    deleting, delete_operation, delete_created = (
-        await provider.create_delete_operation(
-            workspace_id=active.id,
-            idempotency_key="delete-1",
-            payload={"workspace_id": active.id},
-        )
+    deleting, delete_operation, delete_created = await provider.create_delete_operation(
+        workspace_id=active.id,
+        idempotency_key="delete-1",
+        payload={"workspace_id": active.id},
     )
     assert delete_created is True
     assert deleting.lifecycle_state == WorkspaceLifecycleState.DELETING.value
@@ -205,12 +210,14 @@ async def test_local_provider_idempotency_revision_and_fencing(
         state=CatalogOperationState.SUCCEEDED,
     )
     assert tombstone.tombstoned_at is not None
-    replay_record, replay_operation, replay_created = (
-        await provider.create_delete_operation(
-            workspace_id=active.id,
-            idempotency_key="delete-1",
-            payload={"workspace_id": active.id},
-        )
+    (
+        replay_record,
+        replay_operation,
+        replay_created,
+    ) = await provider.create_delete_operation(
+        workspace_id=active.id,
+        idempotency_key="delete-1",
+        payload={"workspace_id": active.id},
     )
     assert replay_created is False
     assert replay_record.lifecycle_state == WorkspaceLifecycleState.TOMBSTONED.value
@@ -269,6 +276,78 @@ async def test_local_provider_rejects_stale_owner_after_retry(tmp_path: Path) ->
         fencing_token=second.fencing_token,
     )
     assert recovered.error_code is None
+
+
+@pytest.mark.asyncio
+async def test_local_migration_reclaims_dead_running_owner_with_progress_intact(
+    tmp_path: Path,
+) -> None:
+    catalog = KnowledgeBaseCatalog(tmp_path / "catalog.json", "")
+    provider = LocalCatalogProvider(catalog)
+    active = catalog.create(
+        name="Migration target",
+        isolation_level="logical",
+        storage_profile_id=None,
+    )
+    migrating, operation, created = await provider.create_migration_operation(
+        workspace_id=active.id,
+        idempotency_key="startup-run",
+        payload={"workspace_id": active.id},
+    )
+    assert created is True
+    assert migrating.lifecycle_state == WorkspaceLifecycleState.MIGRATING.value
+    old = await provider.claim_operation(operation.operation_id, owner_id="dead")
+    old = await provider.update_operation_metadata(
+        operation.operation_id,
+        owner_id="dead",
+        fencing_token=old.fencing_token,
+        metadata={"checkpoint": "initialized"},
+    )
+
+    reclaimed = await provider.claim_operation(
+        operation.operation_id,
+        owner_id="startup",
+        reclaim_running=True,
+    )
+
+    assert reclaimed.fencing_token > old.fencing_token
+    assert reclaimed.retry_count == 1
+    assert reclaimed.metadata["checkpoint"] == "initialized"
+    with pytest.raises(CatalogCASConflict, match="fenced out"):
+        await provider.update_operation_metadata(
+            operation.operation_id,
+            owner_id="dead",
+            fencing_token=old.fencing_token,
+            metadata={"checkpoint": "stale"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_unfinished_operation_cursor_pages_beyond_provider_limit(
+    tmp_path: Path,
+) -> None:
+    provider = LocalCatalogProvider(KnowledgeBaseCatalog(tmp_path / "catalog.json", ""))
+    expected_ids: set[str] = set()
+    for index in range(3):
+        _, operation, _ = await provider.create_workspace_operation(
+            record=_named_record(f"kb_cursor_{index}"),
+            idempotency_key=f"cursor-{index}",
+            payload={"index": index},
+        )
+        expected_ids.add(operation.operation_id)
+
+    seen: list[str] = []
+    cursor: str | None = None
+    while True:
+        page = await provider.list_unfinished_operations(limit=1, cursor=cursor)
+        if not page:
+            break
+        if cursor is not None:
+            assert page[0].operation_id > cursor
+        seen.append(page[0].operation_id)
+        cursor = page[0].operation_id
+
+    assert seen == sorted(expected_ids)
 
 
 @pytest.mark.asyncio
@@ -342,3 +421,60 @@ async def test_postgres_provider_bootstrap_and_mutations_emit_cas_guards() -> No
 
     await provider.finalize()
     assert pool.closed is True
+
+
+@pytest.mark.asyncio
+async def test_postgres_migration_and_reclaim_emit_atomic_fencing_guards() -> None:
+    active = _named_record("kb_pg_migrate")
+    now = datetime.now(timezone.utc).isoformat()
+    pending = CatalogOperation(
+        operation_id="op_pg_migrate",
+        workspace_id=active.id,
+        operation_type=CatalogOperationType.MIGRATE,
+        state=CatalogOperationState.PENDING,
+        payload_hash="a" * 64,
+        idempotency_key="startup-pg",
+        owner_id=None,
+        fencing_token=0,
+        revision=1,
+        created_at=now,
+        updated_at=now,
+        metadata={"workspace_id": active.id},
+    )
+    migrating = replace(
+        active,
+        lifecycle_state=WorkspaceLifecycleState.MIGRATING.value,
+        revision=2,
+        current_operation_id=pending.operation_id,
+    )
+    claimed = replace(
+        pending,
+        state=CatalogOperationState.RUNNING,
+        owner_id="startup",
+        fencing_token=7,
+        revision=2,
+    )
+    connection = _ScriptedConnection(
+        [pending.public_dict(), migrating.public_dict(), claimed.public_dict()]
+    )
+    provider = PostgresCatalogProvider({})
+    provider._pool = _FakePool(connection)
+
+    durable, operation, created = await provider.create_migration_operation(
+        workspace_id=active.id,
+        idempotency_key="startup-pg",
+        payload={"workspace_id": active.id},
+    )
+    reclaimed = await provider.claim_operation(
+        operation.operation_id,
+        owner_id="startup",
+        reclaim_running=True,
+    )
+
+    assert created is True
+    assert durable == migrating
+    assert reclaimed == claimed
+    sql = "\n".join(connection.statements)
+    assert "'MIGRATE', 'PENDING'" in sql
+    assert "lifecycle_state = 'MIGRATING'" in sql
+    assert "$4::boolean AND state = 'RUNNING'" in sql
