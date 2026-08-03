@@ -340,6 +340,11 @@ class RedisKVStorage(BaseKVStorage):
                     f"Using passed workspace parameter: '{effective_workspace}'"
                 )
 
+        # Preserve the resolved backend partition separately from ``workspace``.
+        # Some legacy code rewrites the latter for lock names, while namespace
+        # validation must observe the value that actually prefixes Redis keys.
+        self.effective_workspace = effective_workspace or ""
+
         # Build final_namespace with workspace prefix for data isolation
         # Keep original namespace unchanged for type detection logic
         if effective_workspace:
@@ -848,6 +853,10 @@ class RedisDocStatusStorage(DocStatusStorage):
                 logger.debug(
                     f"Using passed workspace parameter: '{effective_workspace}'"
                 )
+
+        # See RedisKVStorage: this is the physical Redis key partition, not the
+        # internal fallback used for shared-storage lock names.
+        self.effective_workspace = effective_workspace or ""
 
         # Build final_namespace with workspace prefix for data isolation
         # Keep original namespace unchanged for type detection logic

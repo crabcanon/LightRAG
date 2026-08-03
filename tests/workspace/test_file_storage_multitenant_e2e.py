@@ -6,10 +6,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from lightrag import LightRAG
+from lightrag import LightRAG, WorkspaceBinding
 from lightrag.base import DocStatus
 from lightrag.kg.shared_storage import finalize_share_data, initialize_share_data
 from lightrag.utils import EmbeddingFunc, Tokenizer
+from lightrag.workspace import WorkspaceKind
 
 
 class _TestTokenizer:
@@ -49,6 +50,7 @@ async def _new_rag(working_dir: Path, workspace: str, entity_name: str) -> Light
     rag = LightRAG(
         working_dir=str(working_dir),
         workspace=workspace,
+        workspace_binding=WorkspaceBinding.named(workspace),
         llm_model_func=_make_test_llm(entity_name),
         embedding_func=EmbeddingFunc(
             embedding_dim=4,
@@ -139,6 +141,15 @@ async def test_default_file_storages_isolate_same_document_and_deletion(
             "doc_status",
         )
         for rag, workspace in ((rag_alpha, "alpha-kb"), (rag_beta, "beta-kb")):
+            assert len(rag.storage_namespace_descriptors) == 12
+            assert {
+                descriptor.workspace_kind
+                for descriptor in rag.storage_namespace_descriptors
+            } == {WorkspaceKind.NAMED}
+            assert {
+                descriptor.canonical_workspace_key
+                for descriptor in rag.storage_namespace_descriptors
+            } == {workspace}
             for attribute in storage_attributes:
                 path = _storage_file_path(getattr(rag, attribute))
                 assert path.parent == tmp_path / workspace

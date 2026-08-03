@@ -1,5 +1,8 @@
 """Support-matrix tests for multi-workspace server deployment modes."""
 
+from pathlib import Path
+import sys
+
 import pytest
 
 from lightrag.api.workspace_config import (
@@ -9,6 +12,7 @@ from lightrag.api.workspace_config import (
     WorkspaceDeploymentError,
     resolve_workspace_deployment,
 )
+from lightrag.kg.storage_profiles import StorageWorkspaceConsistencyError
 
 
 pytestmark = pytest.mark.offline
@@ -98,3 +102,31 @@ def test_legacy_mode_rejects_stray_shared_provider_configuration() -> None:
 def test_worker_count_must_be_positive() -> None:
     with pytest.raises(WorkspaceDeploymentError, match="workers must be at least 1"):
         resolve_workspace_deployment(workers=0, environment={})
+
+
+def test_server_rejects_override_before_creating_catalog_artifacts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from lightrag.api.config import parse_args
+
+    original_argv = sys.argv[:]
+    try:
+        sys.argv = ["lightrag-server"]
+        args = parse_args()
+    finally:
+        sys.argv = original_argv
+
+    working_dir = tmp_path / "must-not-exist"
+    args.working_dir = str(working_dir)
+    args.input_dir = str(tmp_path / "inputs")
+    args.kv_storage = "RedisKVStorage"
+    args.workers = 1
+    monkeypatch.setenv("LIGHTRAG_MULTI_WORKSPACE_MODE", "multi")
+    monkeypatch.setenv("REDIS_WORKSPACE", "collapsed")
+
+    from lightrag.api.lightrag_server import create_app
+
+    with pytest.raises(StorageWorkspaceConsistencyError, match="REDIS_WORKSPACE"):
+        create_app(args)
+
+    assert not (working_dir / "knowledge_bases.json").exists()

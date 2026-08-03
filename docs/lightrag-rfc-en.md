@@ -258,7 +258,7 @@ The unnamed legacy workspace is represented internally by a tagged value such as
 - file stores may retain files directly under the working directory;
 - other backends retain their already deployed legacy representation.
 
-This compatibility mapping is explicit metadata, not each backend independently inventing a fallback. It allows zero-copy upgrade while making the core identity unambiguous. New named workspaces use an encoded `named-v1` policy and cannot use reserved legacy aliases. Consequently a literal new workspace named `default` cannot collide with unnamed PostgreSQL data.
+This compatibility mapping is explicit metadata, not each backend independently inventing a fallback. It allows zero-copy upgrade while making the core identity unambiguous. New named workspaces use an encoded `namespace-v1` policy and cannot use reserved legacy aliases. Consequently a literal new workspace named `default` cannot collide with unnamed PostgreSQL data.
 
 The catalog persists the codec version. All four storage families for a workspace must use the same codec policy generation. Changing it is a future explicit data-migration operation, never a configuration side effect.
 

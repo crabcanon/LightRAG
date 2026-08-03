@@ -73,6 +73,7 @@ from lightrag.api.routers.knowledge_base_routes import (
     create_knowledge_base_routes,
 )
 from lightrag.api.knowledge_bases import (
+    DEFAULT_KNOWLEDGE_BASE_ID,
     KnowledgeBaseHeader,
     KnowledgeBaseCatalog,
     KnowledgeBaseConflictError,
@@ -84,9 +85,11 @@ from lightrag.api.knowledge_bases import (
 )
 from lightrag.api.workspace_config import resolve_workspace_deployment
 from lightrag.kg.storage_profiles import (
+    audit_workspace_overrides,
     build_default_resource_profile,
     required_profile_sections,
 )
+from lightrag.workspace import WorkspaceBinding
 
 from lightrag.utils import logger, set_verbose_debug
 from lightrag.kg.shared_storage import (
@@ -1338,7 +1341,23 @@ def create_app(args):
     # Check if API key is provided either through env var or args
     api_key = os.getenv("LIGHTRAG_API_KEY") or args.key
 
-    # Initialize document manager with workspace support for data isolation
+    workspace_deployment = resolve_workspace_deployment(
+        workers=int(getattr(args, "workers", 1) or 1)
+    )
+    active_storage_implementations = {
+        "kv": args.kv_storage,
+        "vector": args.vector_storage,
+        "graph": args.graph_storage,
+        "doc_status": args.doc_status_storage,
+    }
+    workspace_override_audit = audit_workspace_overrides(
+        mode=workspace_deployment.mode.value,
+        storage_implementations=active_storage_implementations,
+        server_workspace=str(args.workspace),
+    )
+
+    # Only create local catalog/input artifacts after deployment preflight has
+    # proved that backend workspace overrides cannot collapse or split tenants.
     doc_manager = DocumentManager(args.input_dir, workspace=args.workspace)
     catalog_path = os.getenv(
         "LIGHTRAG_KNOWLEDGE_BASE_CATALOG",
@@ -1347,9 +1366,6 @@ def create_app(args):
     knowledge_base_catalog = KnowledgeBaseCatalog(catalog_path, args.workspace)
     storage_profiles = KnowledgeBaseManager.load_storage_profiles(
         storage_profiles_path_from_env()
-    )
-    workspace_deployment = resolve_workspace_deployment(
-        workers=int(getattr(args, "workers", 1) or 1)
     )
 
     @asynccontextmanager
@@ -2212,6 +2228,7 @@ def create_app(args):
         *,
         working_dir: str,
         input_dir: str,
+        workspace_binding: WorkspaceBinding,
         storage_profile: dict[str, Any] | None = None,
     ) -> LightRAG:
         """Build one fully independent RAG instance from server settings."""
@@ -2220,6 +2237,7 @@ def create_app(args):
                 working_dir=working_dir,
                 input_dir=input_dir,
                 workspace=workspace,
+                workspace_binding=workspace_binding,
                 llm_model_func=create_llm_model_func(args.llm_binding),
                 llm_model_name=args.llm_model,
                 llm_model_max_async=args.max_async,
@@ -2297,6 +2315,9 @@ def create_app(args):
         args.workspace,
         working_dir=args.working_dir,
         input_dir=args.input_dir,
+        workspace_binding=knowledge_base_catalog.get(
+            DEFAULT_KNOWLEDGE_BASE_ID
+        ).to_workspace_binding(server_mode=workspace_deployment.mode.value),
     )
 
     def build_knowledge_base_rag(
@@ -2311,6 +2332,9 @@ def create_app(args):
             record.effective_workspace,
             working_dir=working_dir,
             input_dir=input_dir,
+            workspace_binding=record.to_workspace_binding(
+                server_mode=workspace_deployment.mode.value
+            ),
             storage_profile=profile_with_id,
         )
 
@@ -2320,17 +2344,14 @@ def create_app(args):
         input_dir = str(profile["input_dir"]) if profile else str(args.input_dir)
         return DocumentManager(input_dir, workspace=record.effective_workspace)
 
-    active_storage_implementations = (
-        args.kv_storage,
-        args.vector_storage,
-        args.graph_storage,
-        args.doc_status_storage,
-    )
+    active_storage_implementation_names = tuple(active_storage_implementations.values())
     default_storage_profile = build_default_resource_profile(
         working_dir=str(args.working_dir),
         input_dir=str(args.input_dir),
         workspace=str(args.workspace),
-        required_sections=required_profile_sections(active_storage_implementations),
+        required_sections=required_profile_sections(
+            active_storage_implementation_names
+        ),
     )
     knowledge_base_manager = KnowledgeBaseManager(
         catalog=knowledge_base_catalog,
@@ -2340,7 +2361,7 @@ def create_app(args):
         document_manager_factory=build_knowledge_base_document_manager,
         storage_profiles=storage_profiles,
         default_storage_profile=default_storage_profile,
-        active_storage_implementations=active_storage_implementations,
+        active_storage_implementations=active_storage_implementation_names,
         max_loaded_instances=int(
             os.getenv("LIGHTRAG_MAX_LOADED_KNOWLEDGE_BASES", "32")
         ),
@@ -2348,6 +2369,7 @@ def create_app(args):
     )
     app.state.knowledge_base_manager = knowledge_base_manager
     app.state.workspace_deployment = workspace_deployment
+    app.state.workspace_override_audit = workspace_override_audit
 
     # Add routes
     # root_path is set on the app for reverse proxy support;

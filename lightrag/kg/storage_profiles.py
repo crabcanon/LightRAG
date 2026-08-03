@@ -27,6 +27,37 @@ class StorageIsolationCapability:
     workspace_environment_variable: str | None
 
 
+class StorageWorkspaceConsistencyError(ValueError):
+    """Raised when backend workspace overrides would split storage families."""
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceOverrideSource:
+    storage_family: str
+    implementation: str
+    source: str
+    value: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceOverrideAudit:
+    """Side-effect-free startup result for active workspace override sources."""
+
+    mode: str
+    resolved_workspace: str
+    overrides: tuple[WorkspaceOverrideSource, ...]
+    effective_workspaces: tuple[tuple[str, str], ...]
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "override_sources": [item.source for item in self.overrides],
+            "effective_workspace_families": [
+                family for family, _value in self.effective_workspaces
+            ],
+        }
+
+
 STORAGE_ISOLATION_CAPABILITIES: dict[str, StorageIsolationCapability] = {
     # File-backed implementations use the profile's dedicated working_dir.
     "JsonKVStorage": StorageIsolationCapability(None, None),
@@ -113,6 +144,93 @@ def resolve_workspace_override(
     return value or None
 
 
+def audit_workspace_overrides(
+    *,
+    mode: str,
+    storage_implementations: Mapping[str, str],
+    server_workspace: str,
+    environment: Mapping[str, str] | None = None,
+    config_path: str | Path = "config.ini",
+) -> WorkspaceOverrideAudit:
+    """Resolve all active legacy override sources before storage construction.
+
+    In multi-workspace mode any active override is rejected.  Legacy mode keeps
+    the historic precedence only when every active storage family resolves to
+    the same logical workspace.  Values are retained only in the in-memory
+    result and are omitted from error messages and public diagnostics.
+    """
+
+    if mode not in {"legacy", "multi"}:
+        raise StorageWorkspaceConsistencyError(
+            f"Unsupported workspace mode for override audit: {mode!r}"
+        )
+    environ = os.environ if environment is None else environment
+    parser = configparser.ConfigParser()
+    parser.read(config_path, encoding="utf-8")
+    overrides: list[WorkspaceOverrideSource] = []
+    effective: list[tuple[str, str]] = []
+
+    for family, implementation in storage_implementations.items():
+        try:
+            capability = STORAGE_ISOLATION_CAPABILITIES[implementation]
+        except KeyError as exc:
+            raise StorageWorkspaceConsistencyError(
+                f"Storage implementation {implementation!r} has no isolation capability"
+            ) from exc
+
+        override: WorkspaceOverrideSource | None = None
+        variable = capability.workspace_environment_variable
+        if variable and variable in environ:
+            value = str(environ[variable]).strip()
+            if value:
+                override = WorkspaceOverrideSource(
+                    storage_family=family,
+                    implementation=implementation,
+                    source=variable,
+                    value=value,
+                )
+        elif variable == "POSTGRES_WORKSPACE":
+            value = parser.get("postgres", "workspace", fallback="").strip()
+            if value:
+                override = WorkspaceOverrideSource(
+                    storage_family=family,
+                    implementation=implementation,
+                    source="config.ini[postgres].workspace",
+                    value=value,
+                )
+
+        if override is not None:
+            overrides.append(override)
+            effective.append((family, override.value))
+        else:
+            effective.append((family, server_workspace))
+
+    if mode == "multi" and overrides:
+        sources = ", ".join(sorted({item.source for item in overrides}))
+        raise StorageWorkspaceConsistencyError(
+            "Multi-workspace mode forbids logical workspace overrides for "
+            f"active storage backends: {sources}"
+        )
+
+    distinct = {value for _family, value in effective}
+    if len(distinct) > 1:
+        details = ", ".join(
+            f"{family}={next((item.source for item in overrides if item.storage_family == family), 'server workspace')}"
+            for family, _value in effective
+        )
+        raise StorageWorkspaceConsistencyError(
+            "Active storage families resolve to different legacy workspaces: " + details
+        )
+
+    resolved_workspace = next(iter(distinct), server_workspace)
+    return WorkspaceOverrideAudit(
+        mode=mode,
+        resolved_workspace=resolved_workspace,
+        overrides=tuple(overrides),
+        effective_workspaces=tuple(effective),
+    )
+
+
 def required_profile_sections(
     storage_implementations: Sequence[str],
 ) -> tuple[str, ...]:
@@ -169,6 +287,11 @@ def validate_storage_profile(
         if not isinstance(value, Mapping):
             raise ValueError(
                 f"Storage profile {profile_id!r} section {section!r} must be an object"
+            )
+        if value.get("workspace") not in (None, ""):
+            raise ValueError(
+                f"Storage profile {profile_id!r} section {section!r} cannot "
+                "override logical workspace identity"
             )
         missing = [
             field

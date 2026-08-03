@@ -32,6 +32,14 @@ from lightrag.kg.storage_profiles import (
     validate_storage_profile,
 )
 from lightrag.utils import logger, validate_workspace
+from lightrag.workspace import (
+    LEGACY_DEFAULT_CANONICAL_KEY,
+    LEGACY_NAMESPACE_CODEC,
+    NAMED_NAMESPACE_CODEC,
+    NamespaceCodec,
+    WorkspaceBinding,
+    WorkspaceKind,
+)
 
 
 KNOWLEDGE_BASE_HEADER = "LIGHTRAG-KNOWLEDGE-BASE"
@@ -101,13 +109,19 @@ class KnowledgeBaseRecord:
     storage_profile_id: str | None
     created_at: str
     updated_at: str
+    workspace_kind: Literal["legacy_default", "named"]
+    canonical_workspace_key: str
+    namespace_codec_version: Literal["legacy-v1", "namespace-v1"]
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "KnowledgeBaseRecord":
+        record_id = str(value["id"])
+        is_default = record_id == DEFAULT_KNOWLEDGE_BASE_ID
+        effective_workspace = str(value.get("effective_workspace", ""))
         record = cls(
-            id=str(value["id"]),
+            id=record_id,
             name=str(value["name"]),
-            effective_workspace=str(value.get("effective_workspace", "")),
+            effective_workspace=effective_workspace,
             isolation_level=str(value.get("isolation_level", "logical")),  # type: ignore[arg-type]
             storage_profile_id=(
                 str(value["storage_profile_id"])
@@ -116,6 +130,21 @@ class KnowledgeBaseRecord:
             ),
             created_at=str(value["created_at"]),
             updated_at=str(value["updated_at"]),
+            workspace_kind=str(
+                value.get("workspace_kind", "legacy_default" if is_default else "named")
+            ),  # type: ignore[arg-type]
+            canonical_workspace_key=str(
+                value.get(
+                    "canonical_workspace_key",
+                    LEGACY_DEFAULT_CANONICAL_KEY if is_default else effective_workspace,
+                )
+            ),
+            namespace_codec_version=str(
+                value.get(
+                    "namespace_codec_version",
+                    LEGACY_NAMESPACE_CODEC if is_default else NAMED_NAMESPACE_CODEC,
+                )
+            ),  # type: ignore[arg-type]
         )
         record.validate()
         return record
@@ -132,6 +161,19 @@ class KnowledgeBaseRecord:
             raise ValueError("Physical isolation requires a storage profile")
         if self.isolation_level == "logical" and self.storage_profile_id:
             raise ValueError("Logical isolation cannot reference a storage profile")
+        self.to_workspace_binding().validate()
+
+    def to_workspace_binding(self, *, server_mode: str = "multi") -> WorkspaceBinding:
+        return WorkspaceBinding(
+            public_id=self.id,
+            kind=WorkspaceKind(self.workspace_kind),
+            canonical_key=self.canonical_workspace_key,
+            codec_version=NamespaceCodec(self.namespace_codec_version),
+            physical_workspace=self.effective_workspace,
+            storage_profile_id=self.storage_profile_id,
+            catalog_revision=0,
+            server_mode=server_mode,
+        )
 
     def public_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -159,6 +201,9 @@ class KnowledgeBaseCatalog:
             storage_profile_id=None,
             created_at=now,
             updated_at=now,
+            workspace_kind="legacy_default",
+            canonical_workspace_key=LEGACY_DEFAULT_CANONICAL_KEY,
+            namespace_codec_version=LEGACY_NAMESPACE_CODEC,
         )
 
     def _load_or_create(self) -> None:
@@ -199,6 +244,13 @@ class KnowledgeBaseCatalog:
             if len(set(workspaces)) != len(workspaces):
                 raise KnowledgeBaseError(
                     "Knowledge-base catalog contains duplicate effective workspaces"
+                )
+            canonical_keys = [
+                record.canonical_workspace_key for record in parsed_records
+            ]
+            if len(set(canonical_keys)) != len(canonical_keys):
+                raise KnowledgeBaseError(
+                    "Knowledge-base catalog contains duplicate canonical workspaces"
                 )
             default_record = records.get(DEFAULT_KNOWLEDGE_BASE_ID)
             if default_record is None:
@@ -273,6 +325,9 @@ class KnowledgeBaseCatalog:
                 storage_profile_id=storage_profile_id,
                 created_at=now,
                 updated_at=now,
+                workspace_kind="named",
+                canonical_workspace_key=knowledge_base_id,
+                namespace_codec_version=NAMED_NAMESPACE_CODEC,
             )
             record.validate()
             self._records[record.id] = record
@@ -535,6 +590,9 @@ class KnowledgeBaseManager:
             storage_profile_id=profile_id,
             created_at=_utc_now(),
             updated_at=_utc_now(),
+            workspace_kind="named",
+            canonical_workspace_key="candidate",
+            namespace_codec_version=NAMED_NAMESPACE_CODEC,
         )
         self._profile_for(candidate)
         for record in self.catalog.list():
@@ -705,6 +763,9 @@ class KnowledgeBaseManager:
                 storage_profile_id=None,
                 created_at=_utc_now(),
                 updated_at=_utc_now(),
+                workspace_kind="named",
+                canonical_workspace_key="candidate",
+                namespace_codec_version=NAMED_NAMESPACE_CODEC,
             )
             self._profile_for(candidate)
         return self.catalog.create(
@@ -745,6 +806,15 @@ class KnowledgeBaseManager:
                 raise KnowledgeBaseConflictError(
                     f"Knowledge base {normalized!r} has an active pipeline"
                 )
+            validate_bindings = getattr(context.rag, "validate_storage_bindings", None)
+            if callable(validate_bindings):
+                try:
+                    validate_bindings(stage="pre-delete")
+                except ValueError as exc:
+                    raise KnowledgeBaseConflictError(
+                        f"Knowledge base {normalized!r} storage binding validation "
+                        "failed; destructive cleanup was refused"
+                    ) from exc
             errors: list[str] = []
             for attribute in _STORAGE_ATTRIBUTES:
                 storage = getattr(context.rag, attribute, None)

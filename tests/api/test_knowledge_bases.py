@@ -15,9 +15,17 @@ from lightrag.api.knowledge_bases import (
     DEFAULT_KNOWLEDGE_BASE_ID,
     KNOWLEDGE_BASE_HEADER,
     KnowledgeBaseCatalog,
+    KnowledgeBaseConflictError,
     KnowledgeBaseError,
     KnowledgeBaseManager,
     StorageProfileError,
+)
+from lightrag.workspace import (
+    LEGACY_DEFAULT_CANONICAL_KEY,
+    LEGACY_NAMESPACE_CODEC,
+    NAMED_NAMESPACE_CODEC,
+    WorkspaceBindingError,
+    WorkspaceKind,
 )
 
 _original_argv = sys.argv[:]
@@ -148,9 +156,45 @@ def test_catalog_preserves_default_workspace_and_survives_reload(tmp_path: Path)
     )
     assert reloaded.get(created.id) == created
     assert created.effective_workspace == created.id
+    assert (
+        reloaded.get(DEFAULT_KNOWLEDGE_BASE_ID).canonical_workspace_key
+        == LEGACY_DEFAULT_CANONICAL_KEY
+    )
+    assert (
+        reloaded.get(DEFAULT_KNOWLEDGE_BASE_ID).namespace_codec_version
+        == LEGACY_NAMESPACE_CODEC
+    )
+    assert created.workspace_kind == WorkspaceKind.NAMED.value
+    assert created.namespace_codec_version == NAMED_NAMESPACE_CODEC
+    assert created.to_workspace_binding().canonical_key == created.id
 
     with pytest.raises(KnowledgeBaseError, match="refusing to remap"):
         KnowledgeBaseCatalog(path, "different_workspace")
+
+
+def test_catalog_bootstraps_binding_tags_from_pre_phase_one_file(tmp_path: Path):
+    path = tmp_path / "knowledge_bases.json"
+    catalog = KnowledgeBaseCatalog(path, "legacy_workspace")
+    created = catalog.create(
+        name="Independent",
+        isolation_level="logical",
+        storage_profile_id=None,
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for record in payload["knowledge_bases"]:
+        record.pop("workspace_kind")
+        record.pop("canonical_workspace_key")
+        record.pop("namespace_codec_version")
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    reloaded = KnowledgeBaseCatalog(path, "legacy_workspace")
+
+    assert reloaded.get("default").workspace_kind == "legacy_default"
+    assert (
+        reloaded.get("default").canonical_workspace_key == LEGACY_DEFAULT_CANONICAL_KEY
+    )
+    assert reloaded.get(created.id).workspace_kind == "named"
+    assert reloaded.get(created.id).canonical_workspace_key == created.id
 
 
 def test_catalog_rejects_workspace_aliases(tmp_path: Path):
@@ -165,7 +209,7 @@ def test_catalog_rejects_workspace_aliases(tmp_path: Path):
     payload["knowledge_bases"].append(alias)
     path.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(KnowledgeBaseError, match="duplicate effective workspaces"):
+    with pytest.raises(WorkspaceBindingError, match="public ID 'default'"):
         KnowledgeBaseCatalog(path, "legacy_workspace")
 
 
@@ -427,6 +471,39 @@ async def test_delete_drops_all_storages_and_removes_catalog_record(
     )
     with pytest.raises(Exception, match="does not exist"):
         manager.catalog.get(record.id)
+
+
+@pytest.mark.asyncio
+async def test_delete_refuses_storage_binding_mismatch_before_drop(
+    monkeypatch, tmp_path: Path
+):
+    async def idle_pipeline_status(*_args, **_kwargs):
+        return {"busy": False, "scanning": False, "pending_enqueues": 0}
+
+    monkeypatch.setattr(
+        "lightrag.api.knowledge_bases.get_namespace_data", idle_pipeline_status
+    )
+    manager = _manager(tmp_path)
+    record = manager.create(
+        name="Protected", isolation_level="logical", storage_profile_id=None
+    )
+    context = await manager.get_context(record.id)
+
+    def reject_binding(*, stage: str):
+        assert stage == "pre-delete"
+        raise WorkspaceBindingError("simulated descriptor mismatch")
+
+    context.rag.validate_storage_bindings = reject_binding
+
+    with pytest.raises(KnowledgeBaseConflictError, match="cleanup was refused"):
+        await manager.delete(record.id)
+
+    assert manager.catalog.get(record.id) == record
+    assert all(
+        not storage.dropped
+        for storage in vars(context.rag).values()
+        if isinstance(storage, _FakeStorage)
+    )
 
 
 @pytest.mark.asyncio

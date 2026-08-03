@@ -41,6 +41,13 @@ from lightrag.prompt import (
     resolve_entity_extraction_prompt_profile,
     validate_entity_extraction_prompt_profile_for_mode,
 )
+from lightrag.workspace import (
+    StorageNamespaceDescriptor,
+    WorkspaceBinding,
+    WorkspaceBindingError,
+    WorkspaceKind,
+    validate_storage_namespace_descriptors,
+)
 from lightrag.constants import (
     DEFAULT_CHUNK_P_SIZE,
     DEFAULT_MAX_GLEANING,
@@ -419,6 +426,13 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
 
     workspace: str = field(default_factory=lambda: os.getenv("WORKSPACE", ""))
     """Workspace for data isolation. Defaults to empty string if WORKSPACE environment variable is not set."""
+
+    workspace_binding: WorkspaceBinding | None = field(default=None, repr=False)
+    """Immutable canonical identity shared by every storage in this instance.
+
+    API-server instances receive this from the knowledge-base catalog. Direct
+    library callers that omit it retain the legacy single-workspace codec.
+    """
 
     # ---
     # TODO: Deprecated, use setup_logger in utils.py instead
@@ -1172,6 +1186,10 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         # instance's, so every "independent" copy already shared one CoreBPE. Now
         # that the injection contract is thread safety, sharing is what it asks for.
         global_config["tokenizer"] = self.tokenizer
+        # ``asdict`` recursively converts frozen dataclasses into dictionaries.
+        # Storage constructors need the validated binding object itself so its
+        # enum tags and immutability survive the construction chain.
+        global_config["workspace_binding"] = self.workspace_binding
         global_config.pop("_addon_params", None)
         global_config.pop("_addon_params_dirty", None)
         global_config.pop("_cached_entity_extraction_use_json", None)
@@ -1219,6 +1237,18 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 "ERROR: ENTITY_TYPES environment variable is no longer supported. "
                 "Please customize entity type guidance through the prompt template instead. "
                 "Set addon_params={'entity_types_guidance': '...'} or replace the prompt template."
+            )
+
+        if self.workspace_binding is None:
+            self.workspace_binding = WorkspaceBinding.legacy_default(self.workspace)
+        self.workspace_binding.validate()
+        if (
+            self.workspace_binding.kind is WorkspaceKind.NAMED
+            and self.workspace != self.workspace_binding.physical_workspace
+        ):
+            raise WorkspaceBindingError(
+                "A named LightRAG instance workspace must equal its immutable "
+                "binding's physical workspace"
             )
 
         self._replace_addon_params(addon_params, mark_dirty=False)
@@ -1458,6 +1488,10 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             embedding_func=None,
         )
 
+        self.storage_namespace_descriptors: tuple[StorageNamespaceDescriptor, ...] = (
+            self.validate_storage_bindings(stage="construction")
+        )
+
         # Per-role isolated LLM wrappers (independent queues per role).
         # The base ``self.llm_model_func`` is intentionally NOT queue-wrapped:
         # every code path that calls an LLM goes through one of the role
@@ -1540,6 +1574,35 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
 
         self._storages_status = StoragesStatus.CREATED
 
+    def _workspace_storages(self) -> tuple[StorageNameSpace, ...]:
+        """Return every storage whose namespace must match the binding."""
+
+        return (
+            self.full_docs,
+            self.text_chunks,
+            self.full_entities,
+            self.full_relations,
+            self.entity_chunks,
+            self.relation_chunks,
+            self.entities_vdb,
+            self.relationships_vdb,
+            self.chunks_vdb,
+            self.chunk_entity_relation_graph,
+            self.llm_response_cache,
+            self.doc_status,
+        )
+
+    def validate_storage_bindings(
+        self, *, stage: str
+    ) -> tuple[StorageNamespaceDescriptor, ...]:
+        """Fail closed when any storage no longer matches this instance binding."""
+
+        return validate_storage_namespace_descriptors(
+            self._workspace_storages(),
+            self.workspace_binding,
+            stage=stage,
+        )
+
     async def initialize_storages(self):
         """Storage initialization must be called one by one to prevent deadlock"""
         if self._storages_status == StoragesStatus.CREATED:
@@ -1564,23 +1627,14 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
 
             await initialize_pipeline_status(workspace=self.workspace)
 
-            for storage in (
-                self.full_docs,
-                self.text_chunks,
-                self.full_entities,
-                self.full_relations,
-                self.entity_chunks,
-                self.relation_chunks,
-                self.entities_vdb,
-                self.relationships_vdb,
-                self.chunks_vdb,
-                self.chunk_entity_relation_graph,
-                self.llm_response_cache,
-                self.doc_status,
-            ):
+            for storage in self._workspace_storages():
                 if storage:
                     # logger.debug(f"Initializing storage: {storage}")
                     await storage.initialize()
+
+            self.storage_namespace_descriptors = self.validate_storage_bindings(
+                stage="post-connect"
+            )
 
             # After initialize(), so a backend that derives capabilities during
             # startup (Redis builds its status/source indexes there) is judged on
