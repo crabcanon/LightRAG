@@ -1,6 +1,6 @@
 # LightRAG 多知识库 RFC 实现差距与新一轮优化方案
 
-- 状态：架构决策已确认；Phase 0～3 已完成，Phase 4 待实施
+- 状态：架构决策已确认；Phase 0～4 已完成，Phase 5 待实施
 - RFC 基线：`docs/lightrag-rfc-en.md`（2026-07-29）
 - 代码基线：`dev@64713519`，已包含 `upstream/main@301e715c`
 - 审计日期：2026-08-03（Asia/Shanghai）
@@ -17,8 +17,11 @@
 > `09d61a07` 已完成 Phase 3：immutable execution context、foreground/stream/
 > background lease、single-flight、weighted safe LRU、failure backoff、严格 selector、
 > resolved response header，以及 side-effect-free health/ready/runtime observation。
-> 跨 workspace migration/recovery、pipeline handoff、durable cleanup 与共享调度仍按
-> Phase 4～5 实施；在这些 Gate 完成前，non-default write 默认关闭。
+> `9f2cba61` 已完成 Phase 4：全 catalog 游标恢复、startup-owned migration、
+> 显式 background lease handoff、pipeline restart recovery、fenced cleanup journal
+> 与同 hash doc-status 全生命周期隔离。共享 provider admission、公平 pipeline
+> 调度及 Gunicorn coordinator 仍按 Phase 5 实施；在这些 Gate 完成前，
+> non-default write 默认关闭。
 
 ## 1. 结论
 
@@ -518,6 +521,8 @@ sequenceDiagram
 范围：显式 background handoff、catalog-driven migration/recovery、pipeline owner lease/fence、durable destructive journal；接入已有 ingress/bounded scheduling。
 
 验收：多 workspace worker kill/full restart；同 content hash 不串 doc-status；一个坏 workspace 不阻塞其他；旧 owner late commit 被拒绝。通过后才开放非默认 upload/scan/mutation。
+
+实施结论：已由 `9f2cba61` 完成单 worker 支持矩阵内的全部 Phase 4 范围；恢复与清理均使用 durable operation fencing，后台任务在父 request 释放前原子接管 lease。由于 Phase 5 的 deployment-global admission 与 coordinator 尚未完成，non-default write 仍保持关闭，而不是仅凭本阶段通过即提前开放。
 
 ### Phase 5：全模式 shared admission 与公平 scheduler
 
