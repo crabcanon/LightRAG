@@ -170,12 +170,12 @@ WebUI/API 请求
 | F. 本地基础设施 | 已完成 | PostgreSQL、Neo4j、Redis Compose 健康 |
 | G. 前后端启动与 E2E | 已完成 | 服务、WebUI、四类存储和真实最小流程验证通过 |
 | H. 文档与交付 | 已完成 | 配置、运行手册、限制、验证证据齐全 |
-| I. 第二轮 Prompt 与全量审计 | 进行中 | Prompt 冻结；上传、OpenAPI、全部注册存储的差距矩阵有代码证据 |
-| J. 上传目标体验优化 | 待开始 | “新建独立知识库”置顶；所有存量库以名称和 ID 可选并正确上传 |
-| K. OpenAPI 请求头完整发布 | 待开始 | 所有知识库数据面 API 均在 OpenAPI/Swagger 中显式提供知识库请求头 |
-| L. 全存储隔离补齐 | 待开始 | 每个注册后端的 logical/physical 能力明确、实现完整且不静默降级 |
-| M. 第二轮自动化与浏览器验收 | 待开始 | 后端、前端、构建、OpenAPI、逐后端和真实 WebUI 验证通过 |
-| N. 第二轮文档与交付 | 待开始 | 隔离矩阵、限制、证据和最终时间线完整 |
+| I. 第二轮 Prompt 与全量审计 | 已完成 | Prompt 冻结；上传、OpenAPI、全部注册存储的差距矩阵有代码证据 |
+| J. 上传目标体验优化 | 已完成 | “新建独立知识库”置顶；所有存量库以名称和 ID 可选并正确上传 |
+| K. OpenAPI 请求头完整发布 | 已完成 | 所有知识库数据面 API 均在 OpenAPI/Swagger 中显式提供知识库请求头 |
+| L. 全存储隔离补齐 | 进行中 | 每个注册后端的 logical/physical 能力明确、实现完整且不静默降级 |
+| M. 第二轮自动化与浏览器验收 | 进行中 | 自动化门禁已通过；真实 WebUI 与真实外部后端仍需环境验收 |
+| N. 第二轮文档与交付 | 进行中 | 隔离矩阵、限制、证据和最终时间线完整 |
 
 ## 5. 可直接交给 Codex GPT-5.6 Sol 的完整主 Prompt
 
@@ -1490,7 +1490,7 @@ Prompt 依据：OpenAI 官方 [GPT-5.6 model guidance](https://developers.openai
 | RFC-I15 | Phase 5 | 增加 global active-pipeline cap、workspace DRR/aging、公平和 bounded overload | RFC-I11、RFC-I14 | 已完成 | A 持续 bulk ingest 时 B 在约定上限内获得服务；queue 饱和返回 429/503 且内存有界 |
 | RFC-I16 | Phase 5 | 将 same-host Manager 能力封装为 coordinator provider，完成 Gunicorn support matrix | RFC-I06、RFC-I11、RFC-I15 | 代码完成，外部 Gate 待验证 | 任意 worker 路由、catalog revision、worker kill、provider cap 和 pipeline owner 测试通过；无 sticky session |
 | RFC-I17 | Phase 6 | 实现 Ollama model alias、header/model conflict 和 metadata side-effect-free | RFC-I08、RFC-I10 | 已完成 | 标准 client 仅用 model 可选非默认库；unknown 不创建；conflict 400；tags/ps 不 load instance |
-| RFC-I18 | Phase 7 | 基于新 contract 重接 WebUI 与 API selector，修正 stale `LIGHTRAG-WORKSPACE` 文案/header | RFC-I08、RFC-I10、RFC-I17 | 未开始 | UI 创建项置顶、全库 name+ID 可选；Bun 全测/build；API Vary/header 一致 |
+| RFC-I18 | Phase 7 | 基于新 contract 重接 WebUI 与 API selector，修正 stale `LIGHTRAG-WORKSPACE` 文案/header | RFC-I08、RFC-I10、RFC-I17 | 已完成 | UI 创建项置顶、全库 name+ID 可选；Bun 全测/build；API Vary/header 一致 |
 | RFC-I19 | Phase 7+ | 按 backend 分拆 strict physical profile 的 provision/migration/delete/backup 硬化 | RFC-I04、RFC-I07、RFC-I13 | 未开始 | 每个 backend 独立 PR、真实服务 integration、resource ownership 与恢复文档，不混入 core PR |
 | RFC-I20 | Later | 实现 external coordinator 并验证多节点 | RFC-I16 | 未开始 | TTL/heartbeat/fencing、网络故障、node kill、global admission 和无 sticky session 全部通过后才更新支持声明 |
 
@@ -1607,3 +1607,13 @@ Prompt 依据：OpenAI 官方 [GPT-5.6 model guidance](https://developers.openai
 - 严格验证：Ollama selector、真实 chat/generate 同步与流式路由、input limit、OpenAPI header 和 metadata 聚焦 suite 在最终补强后为 `78 passed`；覆盖 model-only named routing、matching header、conflict、malformed JSON、unknown no-create、alias response echo、reserved-name startup gate、tags/ps 零副作用和 ps loaded-only。扩大 API 绿门禁为 `766 passed, 17 deselected`，全仓 pre-commit 全部通过。
 - 基线与环境边界：未过滤 API sweep（显式忽略在 Windows 无法收集的 Gunicorn orphan 文件）为 `766 passed, 14 deselected, 3 failed`；三个失败仍为 Windows 缺 POSIX `fcntl` 与两个既有 API-key-only 401/403 断言差异，本阶段新增失败为 0。未引入外部服务依赖；RFC-I16 的真实 Linux Gunicorn/PostgreSQL Gate 仍未完成，不能据此升级 multi-worker 支持声明。
 - 安全、回滚与下一项：alias 是路由选择而非 per-workspace authorization，继续使用现有 server-wide auth；删除该阶段 router/provider 注入即可回到仅 header 的旧协议，未发生数据迁移。RFC-I17 完成，下一项为 RFC-I18 WebUI/API selector contract 与 stale header/Vary 清理。
+
+### 2026-08-03T22:22:56+08:00 — RFC-I18 Phase 7 WebUI/API selector contract
+
+- 代码基线与提交：基于 `dev@ab939ae3` 实施，形成 `d6959b99 feat(webui): align knowledge-base lifecycle routing`；未跟踪的 `.codex/` 与历史测试临时目录未暂存、未提交。
+- Catalog 与选择体验：WebUI 按 cursor 分页读取全部 ACTIVE record，不再只显示首个 catalog page；顶部 selector 与上传目标统一显示 `name (immutable-id)`。上传目标使用确定性 builder 保证 multi mode 第一项为“新建独立知识库”，legacy mode 隐藏创建项并回落 default，display name 从不参与 namespace 路由。
+- Lifecycle 与安全：create/delete 适配 `202 operation`、`Prefer: wait=10`、幂等键和终态轮询，不再把 lifecycle wrapper 错当成直接 record。管理端要求 Admin Key 时只在创建表单使用 password input 临时接收，不进入持久 store。Axios 自动 selector 仅注入 documents/query/graph 数据面，knowledge-base catalog、health、ready、auth 与 Ollama metadata 保持控制面无 selector 副作用。
+- API 契约清理：knowledge-base list 增加 `multi_workspace_enabled` 与 `admin_key_required` capability；`supported_file_types` 的 `Vary` 和相关 storage/test 文案从 stale `LIGHTRAG-WORKSPACE` 统一为 canonical `LIGHTRAG-KNOWLEDGE-BASE`，代码与测试目录扫描无旧 header 残留。
+- 严格验证：新增 catalog 全分页、重复 cursor fail-fast、lifecycle unwrap/failure、data/control-plane URL 分类和创建项顺序/legacy 隐藏测试。前端全量为 `99 passed, 0 failed`，ESLint 通过，Vite production build 成功；后端聚焦为 `73 passed`，API 绿门禁为 `767 passed, 17 deselected`；全仓 pre-commit 全部通过。
+- 可视验收边界：尝试连接已打开的 `http://127.0.0.1:9621/webui/#/` 做只读 DOM 验证时，被浏览器 URL 安全策略明确阻止；未使用其他浏览器或底层协议绕过。因此“真实页面打开上传对话框并目视确认”保留为人工 Gate，不宣称自动浏览器验收通过。
+- 兼容、回滚与下一项：legacy mode/default header 省略规则不变；旧的直接 KnowledgeBase create response 仍可解包。回滚不迁移数据，只需撤销 WebUI lifecycle/catalog adapter。RFC-I18 完成；下一项 RFC-I19 必须按 backend 独立审计和实现 strict physical provision/migration/delete/backup，并对真实服务逐项 Gate，不能以现有 mock/offline logical isolation 代替。

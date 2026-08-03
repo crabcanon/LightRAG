@@ -1,6 +1,6 @@
 # LightRAG 多知识库 RFC 实现差距与新一轮优化方案
 
-- 状态：架构决策已确认；Phase 0～5 单进程 Gate 已完成，Phase 6 待实施；同机 Gunicorn 外部集成 Gate 待验证
+- 状态：架构决策已确认；Phase 0～7 的 core/WebUI Gate 已完成；physical backend hardening 与同机 Gunicorn 外部集成 Gate 待验证
 - RFC 基线：`docs/lightrag-rfc-en.md`（2026-07-29）
 - 代码基线：`dev@64713519`，已包含 `upstream/main@301e715c`
 - 审计日期：2026-08-03（Asia/Shanghai）
@@ -25,6 +25,10 @@
 > 在这些 Gate 通过后开放已验证的单 worker 写入路径。单 worker
 > multi-workspace write 已通过 Gate 并默认开放；同机 Gunicorn write 仍默认关闭，
 > 等待真实 PostgreSQL、POSIX worker-kill 与 Gunicorn E2E 后再更新生产支持结论。
+> `79679fb3` 已完成 Phase 6 的 Ollama model alias 与 fail-closed selector；
+> `d6959b99` 已完成 Phase 7 的 WebUI lifecycle/catalog 接入、全分页 ACTIVE
+> selector、name+ID 显示、创建项置顶、临时 Admin Key 以及 control/data-plane
+> header 分流。RFC-I18 已完成；逐 backend 的 strict physical lifecycle 属于 RFC-I19。
 
 ## 1. 结论
 
@@ -550,6 +554,19 @@ sequenceDiagram
 范围：在 core contract 稳定后重接现有 WebUI；逐 backend 审核 profile resource ownership、provision/delete/migration/backup。
 
 验收：每个 backend 独立小 PR；UI 第一项为新建独立库，列表显示 name+ID；UI 不把 display name 当 namespace。
+
+实施结论：`d6959b99` 完成 RFC-I18。WebUI 现在分页拉取全部 ACTIVE catalog
+record，选择器和上传目标显示不可变 ID 与 display name；multi mode 的“新建独立
+知识库”由可测试的 target builder 保证排在首位，legacy mode 不显示创建入口。
+create/delete 遵循异步 lifecycle operation、`Prefer: wait`、幂等键与轮询终态，
+需要时只在当前创建表单临时接收 Admin Key。Axios 仅给 documents/query/graph
+数据面注入 canonical selector，catalog/health/auth 等控制面不再携带 workspace；
+`supported_file_types` 的 `Vary` 也统一为 `LIGHTRAG-KNOWLEDGE-BASE`。
+前端全量 `99 passed`、lint、production build、后端聚焦 `73 passed`、API 绿门禁
+`767 passed, 17 deselected` 与全仓 pre-commit 均通过。浏览器安全策略阻止了
+localhost 自动化，因此真实页面的可视交互保留为人工验收项，不伪报通过。
+physical backend 的 provision/migration/delete/backup 未混入本提交，继续由
+RFC-I19 按 backend 独立完成并以真实服务 integration 作为 Gate。
 
 ### Later：external coordinator 与多节点
 
