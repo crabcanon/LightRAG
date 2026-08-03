@@ -543,6 +543,8 @@ sequenceDiagram
 
 验收：不带 custom header 的标准 client 可选择非默认 ACTIVE record；unknown 不创建；metadata route 不 load instance。
 
+实施结论：`79679fb3` 已实现 catalog-backed `lightrag:latest`、`lightrag:default`、`lightrag:<knowledge-base-id>` 映射，并使 chat/generate 的 model-only、matching header 与 conflict fail-closed 契约覆盖同步和流式响应。unknown alias 在实例构造前返回 Ollama-compatible 404；tags 只读 ACTIVE catalog，ps 只读已加载 pool，两者均由副作用计数器证明不会 load instance。multi mode 对与保留 alias 命名空间冲突的自定义模拟模型名启动失败。最终聚焦回归 `78 passed`，API 绿门禁 `766 passed, 17 deselected`；RFC-I17 已完成。
+
 ### Phase 7：WebUI 与 physical backend hardening
 
 范围：在 core contract 稳定后重接现有 WebUI；逐 backend 审核 profile resource ownership、provision/delete/migration/backup。

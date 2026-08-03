@@ -1489,7 +1489,7 @@ Prompt 依据：OpenAI 官方 [GPT-5.6 model guidance](https://developers.openai
 | RFC-I14 | Phase 5 | 将现有 Gunicorn global slot 提升为单进程/Gunicorn 共用的 service-level provider admission | RFC-I09、RFC-I12 | 已完成 | N workspace 的 LLM/embedding/rerank observed peak 不超过 deployment total C |
 | RFC-I15 | Phase 5 | 增加 global active-pipeline cap、workspace DRR/aging、公平和 bounded overload | RFC-I11、RFC-I14 | 已完成 | A 持续 bulk ingest 时 B 在约定上限内获得服务；queue 饱和返回 429/503 且内存有界 |
 | RFC-I16 | Phase 5 | 将 same-host Manager 能力封装为 coordinator provider，完成 Gunicorn support matrix | RFC-I06、RFC-I11、RFC-I15 | 代码完成，外部 Gate 待验证 | 任意 worker 路由、catalog revision、worker kill、provider cap 和 pipeline owner 测试通过；无 sticky session |
-| RFC-I17 | Phase 6 | 实现 Ollama model alias、header/model conflict 和 metadata side-effect-free | RFC-I08、RFC-I10 | 未开始 | 标准 client 仅用 model 可选非默认库；unknown 不创建；conflict 400；tags/ps 不 load instance |
+| RFC-I17 | Phase 6 | 实现 Ollama model alias、header/model conflict 和 metadata side-effect-free | RFC-I08、RFC-I10 | 已完成 | 标准 client 仅用 model 可选非默认库；unknown 不创建；conflict 400；tags/ps 不 load instance |
 | RFC-I18 | Phase 7 | 基于新 contract 重接 WebUI 与 API selector，修正 stale `LIGHTRAG-WORKSPACE` 文案/header | RFC-I08、RFC-I10、RFC-I17 | 未开始 | UI 创建项置顶、全库 name+ID 可选；Bun 全测/build；API Vary/header 一致 |
 | RFC-I19 | Phase 7+ | 按 backend 分拆 strict physical profile 的 provision/migration/delete/backup 硬化 | RFC-I04、RFC-I07、RFC-I13 | 未开始 | 每个 backend 独立 PR、真实服务 integration、resource ownership 与恢复文档，不混入 core PR |
 | RFC-I20 | Later | 实现 external coordinator 并验证多节点 | RFC-I16 | 未开始 | TTL/heartbeat/fencing、网络故障、node kill、global admission 和无 sticky session 全部通过后才更新支持声明 |
@@ -1597,3 +1597,13 @@ Prompt 依据：OpenAI 官方 [GPT-5.6 model guidance](https://developers.openai
 - 扩大 API 回归：排除不可导入的 Gunicorn orphan 文件后为 `758 passed, 14 skipped, 3 failed`。三个失败仍是 Windows 无 `fcntl` 与两个既有 API-key-only 401/403 断言差异；新增 Phase 5 失败为 0。全仓 pre-commit 所有 hook 通过。
 - 外部验证边界：`docker ps` 证实本机 Docker Desktop Linux Engine 未运行，127.0.0.1:5432 也无 PostgreSQL；Windows 不提供真实 Gunicorn/POSIX `SIGKILL`。因此真实 PostgreSQL transaction/cache revision、Linux Gunicorn 任意 worker 路由、worker kill、no-sticky-session 仍未验证，RFC-I16 保持“代码完成，外部 Gate 待验证”，不得宣称 multi-worker production-ready；multi-node 仍属于 RFC-I20。
 - 状态：RFC-I14、RFC-I15 完成；RFC-I16 的实现与离线 Manager fault test 完成，真实部署 Gate 待外部环境。下一项可独立进入 RFC-I17 Ollama selector，同时保留 Gunicorn 生产声明门禁。
+
+### 2026-08-03T22:09:49+08:00 — RFC-I17 Phase 6 Ollama model selector
+
+- 代码基线与提交：基于 `dev@794028b4` 实施，形成 `79679fb3 feat(api): add Ollama workspace aliases`；未跟踪的 `.codex/` 与测试临时目录未暂存、未提交。
+- Selector 契约：`lightrag:latest`、`lightrag:default` 与当前兼容模型名选择 default，`lightrag:<knowledge-base-id>` 通过同一 durable catalog 选择 ACTIVE record；`/api/chat` 和 `/api/generate` 均在实例 lease 前解析 body。model-only 标准客户端可选择 named workspace；model 与 `LIGHTRAG-KNOWLEDGE-BASE` 同时存在时必须解析为同一 record，否则返回 `400 selector_conflict`。
+- Fail-closed 与兼容错误：unknown/非法 alias 不 auto-create、不构造实例，返回稳定 Ollama 错误体 `{"error", "code"}`；workspace 生命周期、pool 容量/初始化与 physical profile 失败同样保持 Ollama 错误结构，retryable 失败保留 `Retry-After`。成功的同步及流式响应回显请求 alias。multi mode 启动时拒绝与保留的 `lightrag:<id>` 命名空间冲突的自定义模拟模型名，legacy mode 保留旧配置行为。
+- Metadata observation：`/api/tags` 仅分页读取 ACTIVE catalog snapshot 并发布 default/named aliases；`/api/ps` 只与 per-worker pool peek 求交集，返回已加载的 ACTIVE workspace。两条路由都不 acquire lease、不初始化 storage、不迁移数据。alias 响应数量由 `LIGHTRAG_OLLAMA_MAX_ALIASES` 在 1～1000 内显式限制。
+- 严格验证：Ollama selector、真实 chat/generate 同步与流式路由、input limit、OpenAPI header 和 metadata 聚焦 suite 在最终补强后为 `78 passed`；覆盖 model-only named routing、matching header、conflict、malformed JSON、unknown no-create、alias response echo、reserved-name startup gate、tags/ps 零副作用和 ps loaded-only。扩大 API 绿门禁为 `766 passed, 17 deselected`，全仓 pre-commit 全部通过。
+- 基线与环境边界：未过滤 API sweep（显式忽略在 Windows 无法收集的 Gunicorn orphan 文件）为 `766 passed, 14 deselected, 3 failed`；三个失败仍为 Windows 缺 POSIX `fcntl` 与两个既有 API-key-only 401/403 断言差异，本阶段新增失败为 0。未引入外部服务依赖；RFC-I16 的真实 Linux Gunicorn/PostgreSQL Gate 仍未完成，不能据此升级 multi-worker 支持声明。
+- 安全、回滚与下一项：alias 是路由选择而非 per-workspace authorization，继续使用现有 server-wide auth；删除该阶段 router/provider 注入即可回到仅 header 的旧协议，未发生数据迁移。RFC-I17 完成，下一项为 RFC-I18 WebUI/API selector contract 与 stale header/Vary 清理。
