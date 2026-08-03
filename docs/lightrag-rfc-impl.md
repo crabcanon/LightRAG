@@ -1,6 +1,6 @@
 # LightRAG 多知识库 RFC 实现差距与新一轮优化方案
 
-- 状态：架构决策已确认；Phase 0～2 已完成，Phase 3 待实施
+- 状态：架构决策已确认；Phase 0～3 已完成，Phase 4 待实施
 - RFC 基线：`docs/lightrag-rfc-en.md`（2026-07-29）
 - 代码基线：`dev@64713519`，已包含 `upstream/main@301e715c`
 - 审计日期：2026-08-03（Asia/Shanghai）
@@ -14,7 +14,11 @@
 > `638a778d` 已继续完成 Phase 2：local/PostgreSQL `CatalogProvider`、revision/CAS、
 > 分页和唯一约束、幂等 create/delete、CREATING～TOMBSTONED 状态机、operation
 > journal、fencing、ACTIVE 数据面门禁、独立 Admin API Key 和有限 `Prefer: wait`。
-> lease pool、显式 execution context、跨 workspace recovery 与调度仍按 Phase 3～5 实施。
+> `09d61a07` 已完成 Phase 3：immutable execution context、foreground/stream/
+> background lease、single-flight、weighted safe LRU、failure backoff、严格 selector、
+> resolved response header，以及 side-effect-free health/ready/runtime observation。
+> 跨 workspace migration/recovery、pipeline handoff、durable cleanup 与共享调度仍按
+> Phase 4～5 实施；在这些 Gate 完成前，non-default write 默认关闭。
 
 ## 1. 结论
 
