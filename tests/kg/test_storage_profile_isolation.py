@@ -11,6 +11,8 @@ from lightrag.kg.storage_profiles import (
     STORAGE_ISOLATION_CAPABILITIES,
     build_default_resource_profile,
     forced_workspace_variables,
+    physical_profile_lifecycle,
+    profile_binding_fingerprint,
     profile_resource_fingerprints,
     required_profile_sections,
     validate_storage_profile,
@@ -198,6 +200,35 @@ def test_resource_fingerprint_ignores_credentials_but_detects_resource_changes(
         profile_resource_fingerprints(changed_database, required)["mongo"]
         != first["mongo"]
     )
+    assert profile_binding_fingerprint(base, required) == profile_binding_fingerprint(
+        changed_credentials, required
+    )
+    assert profile_binding_fingerprint(base, required) != profile_binding_fingerprint(
+        changed_database, required
+    )
+
+
+def test_physical_lifecycle_is_explicit_and_rejects_destructive_escalation() -> None:
+    expected = {
+        "resource_ownership": "operator",
+        "provisioning": "preprovisioned",
+        "deletion": "drop_workspace_namespaces",
+        "backup": "operator_managed",
+    }
+
+    assert physical_profile_lifecycle("profile-a", {}).public_dict() == expected
+    assert (
+        physical_profile_lifecycle("profile-a", {"lifecycle": expected}).public_dict()
+        == expected
+    )
+    with pytest.raises(ValueError, match="deletion"):
+        physical_profile_lifecycle(
+            "profile-a", {"lifecycle": {"deletion": "drop_database"}}
+        )
+    with pytest.raises(ValueError, match="unknown fields"):
+        physical_profile_lifecycle(
+            "profile-a", {"lifecycle": {"delete_endpoint": True}}
+        )
 
 
 def test_malformed_uri_has_a_stable_resource_fingerprint(tmp_path: Path) -> None:

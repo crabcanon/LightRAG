@@ -61,6 +61,8 @@ from lightrag.file_atomic import atomic_write
 from lightrag.kg.shared_storage import get_namespace_data
 from lightrag.kg.storage_profiles import (
     forced_workspace_variables,
+    physical_profile_lifecycle,
+    profile_binding_fingerprint,
     profile_resource_fingerprints,
     required_profile_sections,
     validate_storage_profile,
@@ -195,6 +197,8 @@ class KnowledgeBaseRecord:
     workspace_kind: Literal["legacy_default", "named"]
     canonical_workspace_key: str
     namespace_codec_version: Literal["legacy-v1", "namespace-v1"]
+    storage_profile_fingerprint: str | None = None
+    storage_resource_fingerprints: tuple[tuple[str, str], ...] = ()
     lifecycle_state: str = WorkspaceLifecycleState.ACTIVE.value
     revision: int = 1
     schema_version: int = CATALOG_SCHEMA_VERSION
@@ -224,6 +228,11 @@ class KnowledgeBaseRecord:
         record_id = str(value["id"])
         is_default = record_id == DEFAULT_KNOWLEDGE_BASE_ID
         effective_workspace = str(value.get("effective_workspace", ""))
+        raw_resource_fingerprints = value.get("storage_resource_fingerprints") or {}
+        if isinstance(raw_resource_fingerprints, str):
+            raw_resource_fingerprints = json.loads(raw_resource_fingerprints)
+        if not isinstance(raw_resource_fingerprints, Mapping):
+            raise ValueError("Storage resource fingerprints must be an object")
         record = cls(
             id=record_id,
             name=str(value["name"]),
@@ -251,6 +260,17 @@ class KnowledgeBaseRecord:
                     LEGACY_NAMESPACE_CODEC if is_default else NAMED_NAMESPACE_CODEC,
                 )
             ),  # type: ignore[arg-type]
+            storage_profile_fingerprint=(
+                str(value["storage_profile_fingerprint"])
+                if value.get("storage_profile_fingerprint")
+                else None
+            ),
+            storage_resource_fingerprints=tuple(
+                sorted(
+                    (str(section), str(fingerprint))
+                    for section, fingerprint in raw_resource_fingerprints.items()
+                )
+            ),
             lifecycle_state=str(
                 value.get("lifecycle_state", WorkspaceLifecycleState.ACTIVE.value)
             ),
@@ -284,6 +304,21 @@ class KnowledgeBaseRecord:
             raise ValueError("Physical isolation requires a storage profile")
         if self.isolation_level == "logical" and self.storage_profile_id:
             raise ValueError("Logical isolation cannot reference a storage profile")
+        if self.isolation_level == "logical" and (
+            self.storage_profile_fingerprint or self.storage_resource_fingerprints
+        ):
+            raise ValueError("Logical isolation cannot bind physical storage resources")
+        if self.storage_profile_fingerprint and not re.fullmatch(
+            r"[0-9a-f]{64}", self.storage_profile_fingerprint
+        ):
+            raise ValueError("Storage profile fingerprint must be a SHA-256 digest")
+        for section, fingerprint in self.storage_resource_fingerprints:
+            if not section or not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+                raise ValueError("Storage resource fingerprints are invalid")
+        if len(dict(self.storage_resource_fingerprints)) != len(
+            self.storage_resource_fingerprints
+        ):
+            raise ValueError("Storage resource fingerprint sections must be unique")
         WorkspaceLifecycleState(self.lifecycle_state)
         if self.revision < 1:
             raise ValueError("Knowledge-base revision must be positive")
@@ -304,7 +339,11 @@ class KnowledgeBaseRecord:
         )
 
     def public_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["storage_resource_fingerprints"] = dict(
+            self.storage_resource_fingerprints
+        )
+        return payload
 
 
 class KnowledgeBaseCatalog:
@@ -461,6 +500,8 @@ class KnowledgeBaseCatalog:
         name: str,
         isolation_level: Literal["logical", "physical"],
         storage_profile_id: str | None,
+        storage_profile_fingerprint: str | None = None,
+        storage_resource_fingerprints: tuple[tuple[str, str], ...] = (),
     ) -> KnowledgeBaseRecord:
         name = name.strip()
         if not name or len(name) > 128:
@@ -482,6 +523,8 @@ class KnowledgeBaseCatalog:
                 workspace_kind="named",
                 canonical_workspace_key=knowledge_base_id,
                 namespace_codec_version=NAMED_NAMESPACE_CODEC,
+                storage_profile_fingerprint=storage_profile_fingerprint,
+                storage_resource_fingerprints=storage_resource_fingerprints,
             )
             record.validate()
             self._records[record.id] = record
@@ -810,6 +853,8 @@ class KnowledgeBaseCatalog:
         fencing_token: int,
         error_code: str | None = None,
         error_message: str | None = None,
+        storage_profile_fingerprint: str | None = None,
+        storage_resource_fingerprints: Mapping[str, str] | None = None,
     ) -> KnowledgeBaseRecord:
         with self._lock:
             record = self.get(workspace_id)
@@ -826,6 +871,21 @@ class KnowledgeBaseCatalog:
                 raise CatalogCASConflict(
                     f"Workspace {workspace_id!r} lifecycle CAS was rejected"
                 )
+            resource_fingerprints = tuple(
+                sorted((storage_resource_fingerprints or {}).items())
+            )
+            if (
+                storage_profile_fingerprint is not None
+                and record.storage_profile_fingerprint
+                not in (None, storage_profile_fingerprint)
+            ) or (
+                resource_fingerprints
+                and record.storage_resource_fingerprints
+                and record.storage_resource_fingerprints != resource_fingerprints
+            ):
+                raise CatalogCASConflict(
+                    f"Workspace {workspace_id!r} physical profile binding changed"
+                )
             now = _utc_now()
             updated = replace(
                 record,
@@ -833,6 +893,12 @@ class KnowledgeBaseCatalog:
                 revision=record.revision + 1,
                 error_code=error_code,
                 error_message=error_message,
+                storage_profile_fingerprint=(
+                    record.storage_profile_fingerprint or storage_profile_fingerprint
+                ),
+                storage_resource_fingerprints=(
+                    record.storage_resource_fingerprints or resource_fingerprints
+                ),
                 tombstoned_at=(
                     now
                     if target_state is WorkspaceLifecycleState.TOMBSTONED
@@ -1198,6 +1264,12 @@ class KnowledgeBaseManager:
         result: list[dict[str, Any]] = []
         for profile_id, profile in sorted(self._storage_profiles.items()):
             try:
+                lifecycle = physical_profile_lifecycle(
+                    profile_id, profile
+                ).public_dict()
+            except ValueError:
+                lifecycle = None
+            try:
                 self._assert_profile_available(profile_id)
                 available = True
             except StorageProfileError:
@@ -1207,6 +1279,7 @@ class KnowledgeBaseManager:
                     "id": profile_id,
                     "available": available,
                     "dedicated": profile.get("dedicated") is True,
+                    "lifecycle": lifecycle,
                 }
             )
         return result
@@ -1274,6 +1347,66 @@ class KnowledgeBaseManager:
             current.id, expected_revision=current.revision, name=name
         )
 
+    def _configured_profile_snapshot(
+        self, profile_id: str | None
+    ) -> tuple[Mapping[str, Any], str, tuple[tuple[str, str], ...]]:
+        if not profile_id:
+            raise StorageProfileError("Physical isolation requires storage_profile_id")
+        profile = self._storage_profiles.get(profile_id)
+        if profile is None:
+            raise StorageProfileError(
+                f"Storage profile {profile_id!r} is not configured"
+            )
+        try:
+            validate_storage_profile(
+                profile_id, profile, self._required_profile_sections
+            )
+            resources = profile_resource_fingerprints(
+                profile, self._required_profile_sections
+            )
+            binding = profile_binding_fingerprint(
+                profile, self._required_profile_sections
+            )
+        except ValueError as exc:
+            raise StorageProfileError(str(exc)) from exc
+        return profile, binding, tuple(sorted(resources.items()))
+
+    def _physical_profile_for_record(
+        self, record: KnowledgeBaseRecord, *, allow_unbound: bool = False
+    ) -> tuple[Mapping[str, Any], str, tuple[tuple[str, str], ...]]:
+        profile, binding, resources = self._configured_profile_snapshot(
+            record.storage_profile_id
+        )
+        if (
+            record.storage_profile_fingerprint is not None
+            and record.storage_profile_fingerprint != binding
+        ):
+            raise StorageProfileError(
+                f"Storage profile {record.storage_profile_id!r} changed after it "
+                f"was bound to knowledge base {record.id!r}"
+            )
+        stored_resources = dict(record.storage_resource_fingerprints)
+        current_resources = dict(resources)
+        changed_sections = sorted(
+            section
+            for section in set(stored_resources) | set(current_resources)
+            if stored_resources.get(section) != current_resources.get(section)
+        )
+        if stored_resources and changed_sections:
+            raise StorageProfileError(
+                f"Storage profile {record.storage_profile_id!r} changed physical "
+                f"resources for knowledge base {record.id!r}: "
+                + ", ".join(changed_sections)
+            )
+        if not allow_unbound and (
+            record.storage_profile_fingerprint is None or not stored_resources
+        ):
+            raise StorageProfileError(
+                f"Knowledge base {record.id!r} has no durable physical profile "
+                "binding; startup migration must bind it before data access"
+            )
+        return profile, binding, resources
+
     def _profile_for(self, record: KnowledgeBaseRecord) -> Mapping[str, Any] | None:
         if record.isolation_level == "logical":
             if record.id != DEFAULT_KNOWLEDGE_BASE_ID:
@@ -1288,44 +1421,54 @@ class KnowledgeBaseManager:
                         "workspace overrides are set: " + ", ".join(forced)
                     )
             return None
-        profile_id = record.storage_profile_id
-        profile = self._storage_profiles.get(profile_id or "")
-        if profile is None:
-            raise StorageProfileError(
-                f"Storage profile {profile_id!r} is not configured"
-            )
-        try:
-            validate_storage_profile(
-                profile_id or "", profile, self._required_profile_sections
-            )
-        except ValueError as exc:
-            raise StorageProfileError(str(exc)) from exc
+        profile, _binding, _resources = self._physical_profile_for_record(record)
         return profile
 
-    def _assert_profile_available(self, profile_id: str | None) -> None:
-        if not profile_id:
-            raise StorageProfileError("Physical isolation requires storage_profile_id")
-        candidate = KnowledgeBaseRecord(
-            id="candidate",
-            name="candidate",
-            effective_workspace="candidate",
-            isolation_level="physical",
-            storage_profile_id=profile_id,
-            created_at=_utc_now(),
-            updated_at=_utc_now(),
-            workspace_kind="named",
-            canonical_workspace_key="candidate",
-            namespace_codec_version=NAMED_NAMESPACE_CODEC,
+    def _transition_profile_snapshot(
+        self, record: KnowledgeBaseRecord
+    ) -> tuple[str | None, Mapping[str, str] | None]:
+        """Resolve the immutable resource snapshot attached by a fenced transition."""
+
+        if record.isolation_level == "logical":
+            return None, None
+        _profile, binding, resources = self._physical_profile_for_record(
+            record, allow_unbound=True
         )
-        self._profile_for(candidate)
+        return binding, dict(resources)
+
+    async def _checkpoint_physical_resource(
+        self,
+        *,
+        claim: CatalogOperation,
+        record: KnowledgeBaseRecord,
+        state: str,
+    ) -> None:
+        if record.isolation_level != "physical":
+            return
+        await self.catalog_provider.update_operation_metadata(
+            claim.operation_id,
+            owner_id=self._lifecycle_owner_id,
+            fencing_token=claim.fencing_token,
+            metadata={
+                "physical_resource_state": state,
+                "storage_profile_fingerprint": record.storage_profile_fingerprint,
+                "physical_resource_lifecycle": physical_profile_lifecycle(
+                    record.storage_profile_id or "",
+                    self._storage_profiles[record.storage_profile_id or ""],
+                ).public_dict(),
+            },
+        )
+
+    def _assert_profile_available(self, profile_id: str | None) -> None:
+        _profile, _binding, candidate_resources = self._configured_profile_snapshot(
+            profile_id
+        )
         for record in self._catalog_list_cached():
             if record.storage_profile_id == profile_id:
                 raise StorageProfileError(
                     f"Storage profile {profile_id!r} is already assigned to {record.id!r}"
                 )
-        candidate_fingerprints = profile_resource_fingerprints(
-            self._storage_profiles[profile_id], self._required_profile_sections
-        )
+        candidate_fingerprints = dict(candidate_resources)
         default_reuse = sorted(
             section
             for section, fingerprint in candidate_fingerprints.items()
@@ -1339,12 +1482,14 @@ class KnowledgeBaseManager:
         for record in self._catalog_list_cached():
             if not record.storage_profile_id:
                 continue
-            assigned_profile = self._storage_profiles.get(record.storage_profile_id)
-            if assigned_profile is None:
-                continue
-            assigned_fingerprints = profile_resource_fingerprints(
-                assigned_profile, self._required_profile_sections
-            )
+            assigned_fingerprints = dict(record.storage_resource_fingerprints)
+            if not assigned_fingerprints:
+                assigned_profile = self._storage_profiles.get(record.storage_profile_id)
+                if assigned_profile is None:
+                    continue
+                assigned_fingerprints = profile_resource_fingerprints(
+                    assigned_profile, self._required_profile_sections
+                )
             reused_sections = sorted(
                 section
                 for section, fingerprint in candidate_fingerprints.items()
@@ -1857,8 +2002,15 @@ class KnowledgeBaseManager:
             raise KnowledgeBaseConflictError("Multi-workspace mode is disabled")
         if isolation_level == "logical" and storage_profile_id:
             raise ValueError("storage_profile_id is only valid for physical isolation")
+        profile_fingerprint: str | None = None
+        resource_fingerprints: tuple[tuple[str, str], ...] = ()
         if isolation_level == "physical":
             self._assert_profile_available(storage_profile_id)
+            (
+                _profile,
+                profile_fingerprint,
+                resource_fingerprints,
+            ) = self._configured_profile_snapshot(storage_profile_id)
         else:
             candidate = KnowledgeBaseRecord(
                 id="candidate",
@@ -1877,6 +2029,8 @@ class KnowledgeBaseManager:
             name=name,
             isolation_level=isolation_level,
             storage_profile_id=storage_profile_id,
+            storage_profile_fingerprint=profile_fingerprint,
+            storage_resource_fingerprints=resource_fingerprints,
         )
 
     async def create_lifecycle(
@@ -1900,11 +2054,18 @@ class KnowledgeBaseManager:
                 raise ValueError("Idempotency-Key must contain 1-128 characters")
         if isolation_level == "logical" and storage_profile_id:
             raise ValueError("storage_profile_id is only valid for physical isolation")
+        profile_fingerprint: str | None = None
+        resource_fingerprints: tuple[tuple[str, str], ...] = ()
         if isolation_level == "physical":
             # A shared provider cache may contain only recently accessed rows.
             # Refresh it before enforcing profile ownership/fingerprint reuse.
             await self.alist_records()
             self._assert_profile_available(storage_profile_id)
+            (
+                _profile,
+                profile_fingerprint,
+                resource_fingerprints,
+            ) = self._configured_profile_snapshot(storage_profile_id)
         else:
             candidate = KnowledgeBaseRecord(
                 id="candidate",
@@ -1933,13 +2094,21 @@ class KnowledgeBaseManager:
             workspace_kind="named",
             canonical_workspace_key=knowledge_base_id,
             namespace_codec_version=NAMED_NAMESPACE_CODEC,
+            storage_profile_fingerprint=profile_fingerprint,
+            storage_resource_fingerprints=resource_fingerprints,
             lifecycle_state=WorkspaceLifecycleState.CREATING.value,
         )
         payload = {
             "name": name,
             "isolation_level": isolation_level,
             "storage_profile_id": storage_profile_id,
+            "storage_profile_fingerprint": profile_fingerprint,
         }
+        if isolation_level == "physical":
+            payload["physical_resource_lifecycle"] = physical_profile_lifecycle(
+                storage_profile_id or "",
+                self._storage_profiles[storage_profile_id or ""],
+            ).public_dict()
         (
             record,
             operation,
@@ -2003,6 +2172,9 @@ class KnowledgeBaseManager:
             record = await self.catalog_provider.get_record(
                 claim.workspace_id, include_tombstoned=True
             )
+            profile_fingerprint, resource_fingerprints = (
+                self._transition_profile_snapshot(record)
+            )
             migrating = await self.catalog_provider.transition_record(
                 record.id,
                 expected_revision=record.revision,
@@ -2015,8 +2187,15 @@ class KnowledgeBaseManager:
                 operation_id=operation_id,
                 owner_id=self._lifecycle_owner_id,
                 fencing_token=claim.fencing_token,
+                storage_profile_fingerprint=profile_fingerprint,
+                storage_resource_fingerprints=resource_fingerprints,
             )
             profile = self._profile_for(migrating)
+            await self._checkpoint_physical_resource(
+                claim=claim,
+                record=migrating,
+                state="INITIALIZING_NAMESPACES",
+            )
             async with self._manager_lock:
                 context = self._contexts.get(migrating.id)
                 if context is None:
@@ -2035,6 +2214,11 @@ class KnowledgeBaseManager:
                     )
                     self._contexts[migrating.id] = context
             await self._initialize_context(context)
+            await self._checkpoint_physical_resource(
+                claim=claim,
+                record=migrating,
+                state="READY",
+            )
             # The control-plane migration instance is bound to the MIGRATING
             # catalog revision.  Never publish/reuse it as an ACTIVE data-plane
             # instance; finalize it first and let the pool construct from the
@@ -2126,6 +2310,9 @@ class KnowledgeBaseManager:
             record = await self.catalog_provider.get_record(
                 claim.workspace_id, include_tombstoned=True
             )
+            profile_fingerprint, resource_fingerprints = (
+                self._transition_profile_snapshot(record)
+            )
             migrating = await self.catalog_provider.transition_record(
                 record.id,
                 expected_revision=record.revision,
@@ -2137,8 +2324,15 @@ class KnowledgeBaseManager:
                 operation_id=operation_id,
                 owner_id=self._lifecycle_owner_id,
                 fencing_token=claim.fencing_token,
+                storage_profile_fingerprint=profile_fingerprint,
+                storage_resource_fingerprints=resource_fingerprints,
             )
             profile = self._profile_for(migrating)
+            await self._checkpoint_physical_resource(
+                claim=claim,
+                record=migrating,
+                state="MIGRATING_NAMESPACES",
+            )
             async with self._manager_lock:
                 context = self._contexts.get(migrating.id)
                 if context is None:
@@ -2159,6 +2353,11 @@ class KnowledgeBaseManager:
             )
             if callable(recover_pipeline):
                 await recover_pipeline()
+            await self._checkpoint_physical_resource(
+                claim=claim,
+                record=migrating,
+                state="READY",
+            )
             await context.rag.finalize_storages()
             self._initialized_ids.discard(migrating.id)
             if migrating.id != DEFAULT_KNOWLEDGE_BASE_ID:
@@ -2387,6 +2586,9 @@ class KnowledgeBaseManager:
                 claim.workspace_id, include_tombstoned=True
             )
             workspace_id = record.id
+            profile_fingerprint, resource_fingerprints = (
+                self._transition_profile_snapshot(record)
+            )
             record = await self.catalog_provider.transition_record(
                 record.id,
                 expected_revision=record.revision,
@@ -2398,6 +2600,13 @@ class KnowledgeBaseManager:
                 operation_id=operation_id,
                 owner_id=self._lifecycle_owner_id,
                 fencing_token=claim.fencing_token,
+                storage_profile_fingerprint=profile_fingerprint,
+                storage_resource_fingerprints=resource_fingerprints,
+            )
+            await self._checkpoint_physical_resource(
+                claim=claim,
+                record=record,
+                state="DELETING_NAMESPACES",
             )
             async with self._manager_lock:
                 context = self._contexts.get(record.id)
@@ -2465,6 +2674,12 @@ class KnowledgeBaseManager:
                 raise KnowledgeBaseError(
                     "Failed to drop all knowledge-base storages: " + "; ".join(errors)
                 )
+
+            await self._checkpoint_physical_resource(
+                claim=claim,
+                record=record,
+                state="NAMESPACES_DELETED",
+            )
 
             await context.rag.finalize_storages()
             self._initialized_ids.discard(record.id)

@@ -35,6 +35,12 @@ export type StorageProfileSummary = {
   id: string
   available: boolean
   dedicated: boolean
+  lifecycle?: {
+    resource_ownership: 'operator'
+    provisioning: 'preprovisioned'
+    deletion: 'drop_workspace_namespaces'
+    backup: 'operator_managed'
+  } | null
 }
 
 export type KnowledgeBaseListResponse = {

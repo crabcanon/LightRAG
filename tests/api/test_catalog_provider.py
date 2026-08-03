@@ -46,6 +46,7 @@ class _ScriptedConnection:
     def __init__(self, fetchrow_results) -> None:
         self.fetchrow_results = list(fetchrow_results)
         self.statements: list[str] = []
+        self.fetchrow_calls: list[tuple[str, tuple[object, ...]]] = []
 
     def transaction(self):
         return _FakeTransaction()
@@ -56,6 +57,7 @@ class _ScriptedConnection:
 
     async def fetchrow(self, statement, *args):
         self.statements.append(statement)
+        self.fetchrow_calls.append((statement, args))
         return self.fetchrow_results.pop(0)
 
     async def fetchval(self, statement, *args):
@@ -397,6 +399,14 @@ async def test_postgres_provider_bootstrap_and_mutations_emit_cas_guards() -> No
     assert await provider.initialize(default) == default
     assert any("CREATE TABLE IF NOT EXISTS" in sql for sql in connection.statements)
     assert any("storage_profile_id" in sql for sql in connection.statements)
+    assert any(
+        "ADD COLUMN IF NOT EXISTS storage_profile_fingerprint" in sql
+        for sql in connection.statements
+    )
+    assert any(
+        "ADD COLUMN IF NOT EXISTS storage_resource_fingerprints" in sql
+        for sql in connection.statements
+    )
 
     assert (
         await provider.update_name(default.id, expected_revision=1, name="Renamed")
@@ -411,6 +421,8 @@ async def test_postgres_provider_bootstrap_and_mutations_emit_cas_guards() -> No
         owner_id="owner",
         fencing_token=7,
         error_code="test",
+        storage_profile_fingerprint="a" * 64,
+        storage_resource_fingerprints={"kv_storage": "b" * 64},
     )
     assert transitioned == renamed
     mutation_sql = "\n".join(connection.statements)
@@ -418,6 +430,11 @@ async def test_postgres_provider_bootstrap_and_mutations_emit_cas_guards() -> No
     assert "o.owner_id = $6" in mutation_sql
     assert "o.fencing_token = $7" in mutation_sql
     assert "o.state = 'RUNNING'" in mutation_sql
+    assert "c.storage_profile_fingerprint = $10" in mutation_sql
+    assert "c.storage_resource_fingerprints = $11::jsonb" in mutation_sql
+    _statement, transition_args = connection.fetchrow_calls[-1]
+    assert transition_args[9] == "a" * 64
+    assert transition_args[10] == '{"kv_storage": "' + "b" * 64 + '"}'
 
     await provider.finalize()
     assert pool.closed is True

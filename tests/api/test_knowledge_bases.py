@@ -21,6 +21,7 @@ from lightrag.api.knowledge_bases import (
     KnowledgeBaseConflictError,
     KnowledgeBaseError,
     KnowledgeBaseManager,
+    KnowledgeBaseRecord,
     OllamaSelectorError,
     StorageProfileError,
     resolve_ollama_model_alias,
@@ -202,6 +203,29 @@ def test_catalog_preserves_default_workspace_and_survives_reload(tmp_path: Path)
 
     with pytest.raises(KnowledgeBaseError, match="refusing to remap"):
         KnowledgeBaseCatalog(path, "different_workspace")
+
+
+def test_physical_resource_fingerprints_accept_postgres_json_text() -> None:
+    record = KnowledgeBaseRecord(
+        id="kb_profile_json",
+        name="Physical",
+        effective_workspace="kb_profile_json",
+        isolation_level="physical",
+        storage_profile_id="profile-a",
+        created_at="2026-08-03T00:00:00+00:00",
+        updated_at="2026-08-03T00:00:00+00:00",
+        workspace_kind="named",
+        canonical_workspace_key="kb_profile_json",
+        namespace_codec_version=NAMED_NAMESPACE_CODEC,
+        storage_profile_fingerprint="a" * 64,
+        storage_resource_fingerprints=(("mongo", "b" * 64),),
+    )
+    payload = record.public_dict()
+    payload["storage_resource_fingerprints"] = json.dumps(
+        payload["storage_resource_fingerprints"]
+    )
+
+    assert KnowledgeBaseRecord.from_dict(payload) == record
 
 
 def test_catalog_bootstraps_binding_tags_from_pre_phase_one_file(tmp_path: Path):
@@ -793,6 +817,197 @@ async def test_create_lifecycle_failure_never_enters_data_plane(
         await manager.get_context(record.id)
 
 
+@pytest.mark.asyncio
+async def test_physical_lifecycle_persists_binding_and_resource_progress(
+    tmp_path: Path,
+) -> None:
+    profile = {
+        "dedicated": True,
+        "working_dir": str(tmp_path / "physical-rag"),
+        "input_dir": str(tmp_path / "physical-inputs"),
+    }
+    manager = _manager(
+        tmp_path,
+        profiles={"files-a": profile},
+        active_storage_implementations=(
+            "JsonKVStorage",
+            "NanoVectorDBStorage",
+            "NetworkXStorage",
+            "JsonDocStatusStorage",
+        ),
+    )
+
+    record, operation, created = await manager.create_lifecycle(
+        name="Physical files",
+        isolation_level="physical",
+        storage_profile_id="files-a",
+        idempotency_key="physical-create",
+    )
+    assert created is True
+    terminal = await manager.wait_for_operation(operation.operation_id, timeout=2)
+    durable = await manager.catalog_provider.get_record(record.id)
+
+    assert terminal.state is CatalogOperationState.SUCCEEDED
+    assert terminal.metadata["physical_resource_state"] == "READY"
+    assert terminal.metadata["physical_resource_lifecycle"] == {
+        "resource_ownership": "operator",
+        "provisioning": "preprovisioned",
+        "deletion": "drop_workspace_namespaces",
+        "backup": "operator_managed",
+    }
+    assert durable.storage_profile_fingerprint
+    assert set(dict(durable.storage_resource_fingerprints)) == {
+        "working_dir",
+        "input_dir",
+    }
+
+
+@pytest.mark.asyncio
+async def test_startup_migration_binds_legacy_physical_profile_snapshot(
+    tmp_path: Path,
+) -> None:
+    profile = {
+        "dedicated": True,
+        "working_dir": str(tmp_path / "physical-rag"),
+        "input_dir": str(tmp_path / "physical-inputs"),
+    }
+    manager = _manager(
+        tmp_path,
+        profiles={"legacy-physical": profile},
+        active_storage_implementations=(
+            "JsonKVStorage",
+            "NanoVectorDBStorage",
+            "NetworkXStorage",
+            "JsonDocStatusStorage",
+        ),
+    )
+    old_record = manager.catalog.create(
+        name="Pre-hardening physical",
+        isolation_level="physical",
+        storage_profile_id="legacy-physical",
+    )
+    assert old_record.storage_profile_fingerprint is None
+
+    await manager.initialize()
+    durable = await manager.catalog_provider.get_record(old_record.id)
+
+    assert durable.lifecycle_state == "ACTIVE"
+    assert durable.storage_profile_fingerprint
+    assert set(dict(durable.storage_resource_fingerprints)) == {
+        "working_dir",
+        "input_dir",
+    }
+
+
+@pytest.mark.asyncio
+async def test_physical_delete_refuses_retargeted_profile_before_drop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def no_pipeline_status(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "lightrag.api.knowledge_bases.get_namespace_data", no_pipeline_status
+    )
+    profile = {
+        "dedicated": True,
+        "working_dir": str(tmp_path / "physical-rag"),
+        "input_dir": str(tmp_path / "physical-inputs"),
+    }
+    constructed: list[_FakeRag] = []
+
+    def rag_factory(record, _profile):
+        rag = _FakeRag(record.effective_workspace)
+        constructed.append(rag)
+        return rag
+
+    manager = _manager(
+        tmp_path,
+        profiles={"files-a": profile},
+        active_storage_implementations=(
+            "JsonKVStorage",
+            "NanoVectorDBStorage",
+            "NetworkXStorage",
+            "JsonDocStatusStorage",
+        ),
+        rag_factory=rag_factory,
+    )
+    record = manager.create(
+        name="Physical files",
+        isolation_level="physical",
+        storage_profile_id="files-a",
+    )
+    profile["working_dir"] = str(tmp_path / "unrelated-target")
+
+    _record, operation, _created = await manager.delete_lifecycle(
+        record.id, idempotency_key="physical-delete"
+    )
+    terminal = await manager.wait_for_operation(operation.operation_id, timeout=2)
+    failed = await manager.catalog_provider.get_record(
+        record.id, include_tombstoned=True
+    )
+
+    assert terminal.state is CatalogOperationState.FAILED
+    assert failed.lifecycle_state == "ERROR"
+    assert constructed == []
+
+
+@pytest.mark.asyncio
+async def test_physical_delete_journals_namespace_cleanup_without_endpoint_delete(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def no_pipeline_status(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "lightrag.api.knowledge_bases.get_namespace_data", no_pipeline_status
+    )
+    profile = {
+        "dedicated": True,
+        "working_dir": str(tmp_path / "physical-rag"),
+        "input_dir": str(tmp_path / "physical-inputs"),
+        "lifecycle": {
+            "resource_ownership": "operator",
+            "provisioning": "preprovisioned",
+            "deletion": "drop_workspace_namespaces",
+            "backup": "operator_managed",
+        },
+    }
+    manager = _manager(
+        tmp_path,
+        profiles={"files-a": profile},
+        active_storage_implementations=(
+            "JsonKVStorage",
+            "NanoVectorDBStorage",
+            "NetworkXStorage",
+            "JsonDocStatusStorage",
+        ),
+    )
+    record = manager.create(
+        name="Physical files",
+        isolation_level="physical",
+        storage_profile_id="files-a",
+    )
+
+    _record, operation, _created = await manager.delete_lifecycle(
+        record.id, idempotency_key="physical-delete-success"
+    )
+    terminal = await manager.wait_for_operation(operation.operation_id, timeout=2)
+    tombstone = await manager.catalog_provider.get_record(
+        record.id, include_tombstoned=True
+    )
+
+    assert terminal.state is CatalogOperationState.SUCCEEDED
+    assert terminal.metadata["physical_resource_state"] == "NAMESPACES_DELETED"
+    assert terminal.metadata["cleanup_complete"] is True
+    assert terminal.metadata["physical_resource_lifecycle"]["backup"] == (
+        "operator_managed"
+    )
+    assert tombstone.lifecycle_state == "TOMBSTONED"
+
+
 def test_legacy_mode_exposes_only_default_and_rejects_management_create(
     tmp_path: Path,
 ):
@@ -1322,6 +1537,14 @@ def test_physical_profile_is_strict_and_single_use(tmp_path: Path):
         storage_profile_id="dedicated-a",
     )
     assert record.storage_profile_id == "dedicated-a"
+    assert record.storage_profile_fingerprint is not None
+    assert set(dict(record.storage_resource_fingerprints)) == {
+        "working_dir",
+        "input_dir",
+        "postgres",
+        "neo4j",
+        "redis",
+    }
 
     with pytest.raises(StorageProfileError, match="already assigned"):
         manager.create(
@@ -1329,6 +1552,36 @@ def test_physical_profile_is_strict_and_single_use(tmp_path: Path):
             isolation_level="physical",
             storage_profile_id="dedicated-a",
         )
+
+
+def test_bound_physical_profile_rejects_resource_retargeting(tmp_path: Path):
+    profile = {
+        "dedicated": True,
+        "working_dir": str(tmp_path / "physical-rag"),
+        "input_dir": str(tmp_path / "physical-inputs"),
+        "mongo": {"uri": "mongodb://mongo-a:27017", "database": "rag_a"},
+    }
+    manager = _manager(
+        tmp_path,
+        profiles={"physical-a": profile},
+        active_storage_implementations=("MongoKVStorage",) * 4,
+    )
+    record = manager.create(
+        name="Physical",
+        isolation_level="physical",
+        storage_profile_id="physical-a",
+    )
+
+    # Credential rotation is intentionally allowed because it does not change
+    # the physical resource identity.
+    profile["mongo"]["uri"] = "mongodb://new:secret@mongo-a:27017"
+    assert manager._profile_for(record) is profile
+
+    # Retargeting the same profile ID to a different endpoint must fail before
+    # a client is constructed or a destructive drop can run.
+    profile["mongo"]["uri"] = "mongodb://mongo-b:27017"
+    with pytest.raises(StorageProfileError, match="changed after it was bound"):
+        manager._profile_for(record)
 
 
 @pytest.mark.parametrize(
@@ -1434,7 +1687,17 @@ def test_physical_profile_cannot_reuse_a_default_resource(tmp_path: Path):
     )
 
     assert manager.list_storage_profiles() == [
-        {"id": "candidate", "available": False, "dedicated": True}
+        {
+            "id": "candidate",
+            "available": False,
+            "dedicated": True,
+            "lifecycle": {
+                "resource_ownership": "operator",
+                "provisioning": "preprovisioned",
+                "deletion": "drop_workspace_namespaces",
+                "backup": "operator_managed",
+            },
+        }
     ]
 
     with pytest.raises(StorageProfileError, match="default resources: mongo"):

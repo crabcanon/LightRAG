@@ -227,6 +227,8 @@ class CatalogProvider(ABC):
         fencing_token: int,
         error_code: str | None = None,
         error_message: str | None = None,
+        storage_profile_fingerprint: str | None = None,
+        storage_resource_fingerprints: Mapping[str, str] | None = None,
     ) -> Any:
         """Fenced record revision CAS."""
 
@@ -405,6 +407,8 @@ class LocalCatalogProvider(CatalogProvider):
         fencing_token: int,
         error_code: str | None = None,
         error_message: str | None = None,
+        storage_profile_fingerprint: str | None = None,
+        storage_resource_fingerprints: Mapping[str, str] | None = None,
     ) -> Any:
         return self.catalog.transition_record(
             workspace_id,
@@ -416,6 +420,8 @@ class LocalCatalogProvider(CatalogProvider):
             fencing_token=fencing_token,
             error_code=error_code,
             error_message=error_message,
+            storage_profile_fingerprint=storage_profile_fingerprint,
+            storage_resource_fingerprints=storage_resource_fingerprints,
         )
 
     async def finish_operation(
@@ -471,6 +477,8 @@ _SCHEMA_STATEMENTS = (
         effective_workspace VARCHAR(64) NOT NULL UNIQUE,
         isolation_level VARCHAR(16) NOT NULL,
         storage_profile_id VARCHAR(128),
+        storage_profile_fingerprint CHAR(64),
+        storage_resource_fingerprints JSONB NOT NULL DEFAULT '{{}}'::jsonb,
         workspace_kind VARCHAR(32) NOT NULL,
         canonical_workspace_key VARCHAR(128) NOT NULL UNIQUE,
         namespace_codec_version VARCHAR(32) NOT NULL,
@@ -485,6 +493,10 @@ _SCHEMA_STATEMENTS = (
         tombstoned_at TIMESTAMPTZ
     )
     """,
+    f"ALTER TABLE {_CATALOG_TABLE} ADD COLUMN IF NOT EXISTS "
+    "storage_profile_fingerprint CHAR(64)",
+    f"ALTER TABLE {_CATALOG_TABLE} ADD COLUMN IF NOT EXISTS "
+    "storage_resource_fingerprints JSONB NOT NULL DEFAULT '{}'::jsonb",
     f"""
     CREATE TABLE IF NOT EXISTS {_OPERATION_TABLE} (
         operation_id VARCHAR(64) PRIMARY KEY,
@@ -602,13 +614,14 @@ class PostgresCatalogProvider(CatalogProvider):
                     f"""
                     INSERT INTO {_CATALOG_TABLE} (
                         id, name, effective_workspace, isolation_level,
-                        storage_profile_id, workspace_kind,
+                        storage_profile_id, storage_profile_fingerprint,
+                        storage_resource_fingerprints, workspace_kind,
                         canonical_workspace_key, namespace_codec_version,
                         lifecycle_state, revision, schema_version,
                         current_operation_id, created_at, updated_at
                     ) VALUES (
-                        $1, $2, $3, $4, $5, $6, $7, $8,
-                        $9, $10, $11, $12, $13::timestamptz, $14::timestamptz
+                        $1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10,
+                        $11, $12, $13, $14, $15::timestamptz, $16::timestamptz
                     ) ON CONFLICT (id) DO NOTHING
                     """,
                     *_record_parameters(default_record),
@@ -780,14 +793,15 @@ class PostgresCatalogProvider(CatalogProvider):
                     f"""
                     INSERT INTO {_CATALOG_TABLE} (
                         id, name, effective_workspace, isolation_level,
-                        storage_profile_id, workspace_kind,
+                        storage_profile_id, storage_profile_fingerprint,
+                        storage_resource_fingerprints, workspace_kind,
                         canonical_workspace_key, namespace_codec_version,
                         lifecycle_state, revision, schema_version,
                         current_operation_id, created_at, updated_at
                     ) VALUES (
-                        $1, $2, $3, $4, $5, $6, $7, $8,
-                        'CREATING', 1, $9, $10,
-                        $11::timestamptz, $12::timestamptz
+                        $1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10,
+                        'CREATING', 1, $11, $12,
+                        $13::timestamptz, $14::timestamptz
                     )
                     """,
                     record.id,
@@ -795,6 +809,8 @@ class PostgresCatalogProvider(CatalogProvider):
                     record.effective_workspace,
                     record.isolation_level,
                     record.storage_profile_id,
+                    record.storage_profile_fingerprint,
+                    json.dumps(dict(record.storage_resource_fingerprints)),
                     record.workspace_kind,
                     record.canonical_workspace_key,
                     record.namespace_codec_version,
@@ -1032,13 +1048,28 @@ class PostgresCatalogProvider(CatalogProvider):
         fencing_token: int,
         error_code: str | None = None,
         error_message: str | None = None,
+        storage_profile_fingerprint: str | None = None,
+        storage_resource_fingerprints: Mapping[str, str] | None = None,
     ) -> Any:
+        resource_fingerprints_json = (
+            json.dumps(dict(storage_resource_fingerprints))
+            if storage_resource_fingerprints
+            else None
+        )
         async with self._connection() as connection:
             row = await connection.fetchrow(
                 f"""
                 UPDATE {_CATALOG_TABLE} AS c
                 SET lifecycle_state = $4, revision = revision + 1,
                     error_code = $8, error_message = $9, updated_at = NOW(),
+                    storage_profile_fingerprint = COALESCE(
+                        c.storage_profile_fingerprint, $10
+                    ),
+                    storage_resource_fingerprints = CASE
+                        WHEN c.storage_resource_fingerprints = '{{}}'::jsonb
+                        THEN COALESCE($11::jsonb, '{{}}'::jsonb)
+                        ELSE c.storage_resource_fingerprints
+                    END,
                     tombstoned_at = CASE WHEN $4 = 'TOMBSTONED' THEN NOW() ELSE tombstoned_at END
                 WHERE c.id = $1 AND c.revision = $2
                   AND c.lifecycle_state = ANY($3::text[])
@@ -1047,6 +1078,16 @@ class PostgresCatalogProvider(CatalogProvider):
                       SELECT 1 FROM {_OPERATION_TABLE} AS o
                       WHERE o.operation_id = $5 AND o.owner_id = $6
                         AND o.fencing_token = $7 AND o.state = 'RUNNING'
+                  )
+                  AND (
+                      $10::char(64) IS NULL
+                      OR c.storage_profile_fingerprint IS NULL
+                      OR c.storage_profile_fingerprint = $10
+                  )
+                  AND (
+                      $11::jsonb IS NULL
+                      OR c.storage_resource_fingerprints = '{{}}'::jsonb
+                      OR c.storage_resource_fingerprints = $11::jsonb
                   )
                 RETURNING c.*
                 """,
@@ -1059,6 +1100,8 @@ class PostgresCatalogProvider(CatalogProvider):
                 fencing_token,
                 error_code,
                 error_message,
+                storage_profile_fingerprint,
+                resource_fingerprints_json,
             )
         if row is None:
             raise CatalogCASConflict(
@@ -1159,6 +1202,8 @@ def _record_parameters(record: Any) -> tuple[Any, ...]:
         record.effective_workspace,
         record.isolation_level,
         record.storage_profile_id,
+        record.storage_profile_fingerprint,
+        json.dumps(dict(record.storage_resource_fingerprints)),
         record.workspace_kind,
         record.canonical_workspace_key,
         record.namespace_codec_version,
