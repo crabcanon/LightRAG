@@ -270,6 +270,36 @@ def _log_physical_feature_summary(
     )
 
 
+def _center_pad_events(
+    records: Sequence[Any], body_indices: Sequence[int]
+) -> list[dict]:
+    """Audit rows for paragraphs whose ``w:jc=center`` a leading space pad
+    defeated (``guardrails.is_visually_centered``).
+
+    Emitted from ``run_smart_heading`` — a per-document terminal point — and
+    NOT from ``gate_candidates``, whose first pass may be discarded by a CB1
+    re-estimation (a counter incremented there would drift or double). The
+    property is purely physical, so one scan of the records is equivalent to
+    what every gate pass sees.
+
+    This is the only trace such a paragraph leaves: it matches no rule
+    afterwards and so takes ``gate_candidates``' silent ``continue`` without
+    producing a decision, leaving a later "why did my centered heading vanish"
+    with nothing to read. Values are ints/floats/strs in scan order —
+    deterministic and replayable.
+    """
+    return [
+        {
+            "rule": "center_pad_offset",
+            "index": i,
+            "pad_em": round(records[i].leading_pad_em, 2),
+        }
+        for i in body_indices
+        if records[i].alignment == "center"
+        and not guardrails.is_visually_centered(records[i])
+    ]
+
+
 # ---------------------------------------------------------------------------
 # step 1 — candidate gate
 # ---------------------------------------------------------------------------
@@ -488,9 +518,12 @@ def gate_candidates(
     # own — no companion needed (a two-line centered title has none). The
     # shape gate carries the exclusions that make solo admission safe: strong
     # body, genuine numbering, captions (图*/表*), a bare 成文日期 (a centered
-    # 落款 date), and letter-free decoration lines (page numbers ``- 1 -``,
-    # separators ``***``). Known residue (documented, not coded around):
-    # a centered issuer/signature line or slogan is shape-identical to a real
+    # 落款 date), letter-free decoration lines (page numbers ``- 1 -``,
+    # separators ``***``), and — via is_visually_centered — a line whose
+    # w:jc=center is defeated by a wide leading space pad (the 落款/署名 an
+    # author positions bottom-right by padding a centered paragraph).
+    # Known residue (documented, not coded around): a centered issuer/signature
+    # line or slogan that is NOT space-padded is shape-identical to a real
     # title — strong-body / LLM-veto / imprint-preceding cover most, and the
     # CB1 density breaker backstops centered-heavy documents.
     # Lines still group into runs (consecutive without an intervening body
@@ -504,7 +537,7 @@ def gate_candidates(
     for i in para_indices:
         rec = records[i]
         centered_shape[i] = (
-            rec.alignment == "center"
+            guardrails.is_visually_centered(rec)
             # A zero-visible-char placeholder is not a centered "line": it
             # neither takes the channel nor joins a centered run (a decorative
             # image between title lines must not push the run over the
@@ -753,7 +786,7 @@ def gate_candidates(
             font_size_pt=size,
             outline_level=rec.outline_level,
             numbering=cls,
-            centered=rec.alignment == "center",
+            centered=guardrails.is_visually_centered(rec),
             all_bold=rec.all_bold,
         )
         decision.note(rule)
@@ -1793,11 +1826,52 @@ def anchor_outline_levels(
 
 _MERGE_MAX_LINES = 4
 
+#: How much heavier than the merge owner its members must COLLECTIVELY be for
+#: the owner's own physical outline to arm the joined-text gate. Both sides of
+#: the comparison are fixed points — the owner's ORIGINAL weight and the running
+#: total of everything absorbed — never the accumulated join: comparing each
+#: member against a window that already swallowed the previous ones makes the
+#: criterion path-dependent and monotonically harder to meet, so members that
+#: individually stay under the ratio can still swamp the owner together (14 +
+#: 20 + 60 + 100 clears a 180 cap while every successive 2x check passes).
+#: Calibrated against the two measured shapes (weighted en-equivalent chars,
+#: cap 180):
+#:   - 【政策内容】 (14) absorbing a 312-char citation — ratio 22: the join reads
+#:     as body entirely because of the NEIGHBOUR, and committing it costs a real
+#:     baseline heading its identity;
+#:   - _Medical Graph RAG.docx's author line (96) absorbing its affiliation line
+#:     (103) — ratio 1.07: two comparably meaty lines that only cross the body
+#:     threshold TOGETHER, exactly the merge-then-demote-together case the gate
+#:     must not break (that .docx marks the author list as outlineLvl=1, so the
+#:     outline evidence itself is dirty and cannot be trusted on its own).
+#: 2.0 sits in the wide gap between them. Raising it toward 22 or lowering it
+#: toward 1.07 narrows one of those margins — do not tune without re-running the
+#: corpus A/B.
+_MERGE_OUTLINE_OWNER_OUTWEIGH_RATIO = 2.0
+
+
+def _members_outweigh_owner(owner_weight: int, absorbed_weight: int) -> bool:
+    """Have the absorbed members collectively swamped the merge owner?
+
+    ``owner_weight`` is the owner's ORIGINAL weighted length and
+    ``absorbed_weight`` the running total of every member taken so far,
+    including the one under consideration. True means whatever makes the joined
+    text read as body comes from the MEMBERS, not from the owner — so a merge
+    that the sweep would then demote trades a real heading for a body paragraph.
+
+    Monotonic in ``absorbed_weight``, hence sticky by construction: once the
+    members outweigh the owner they cannot un-outweigh it later in the window.
+    """
+    if owner_weight <= 0:
+        return False
+    return absorbed_weight >= _MERGE_OUTLINE_OWNER_OUTWEIGH_RATIO * owner_weight
+
 
 def merge_split_headings(
     decisions: list[HeadingDecision],
     records: Sequence[Any],
     *,
+    strong_body: Callable[[str], str | None] | None = None,
     warnings: dict | None = None,
 ) -> list[HeadingDecision]:
     """Re-join headings the author split for line-spacing looks.
@@ -1807,7 +1881,48 @@ def merge_split_headings(
     numbered heading may only START a merge (never be absorbed); the merged
     text (soft-break lines + paragraph splits) is capped at 4 lines.
     Returns the compacted decision list (absorbed members removed).
+
+    Two strong-body gates keep a merge from destroying a real heading. They
+    exist because this pass sits BETWEEN candidate admission and
+    :func:`demote_strong_body_headings`, and admission DEFERS the strong-body
+    check for clause-class numbered candidates (see ``EARLY_STRONG_BODY_KEYS``)
+    — so a candidate whose body verdict is still pending can reach this pass:
+
+    - a ``cur`` that already reads as body may not absorb anything: re-joining
+      "a heading the author split for looks" is meaningless for a line that is
+      a full sentence, and absorbing a neighbour would hide that neighbour's
+      text inside a paragraph the sweep is about to demote;
+    - once the window holds (or is about to take) a member carrying a physical
+      outline level, every further join is rejected when the JOINED text reads
+      as body. The flag is STICKY on purpose: the window grows up to
+      ``_MERGE_MAX_LINES`` members, so an outline member absorbed early must
+      keep protecting the window when a later, outline-free member is what
+      finally pushes the join over the body threshold. Committing such a merge
+      would let the sweep undo it and strand the outline member without a
+      decision — an invariant-I2 violation that costs the WHOLE document its
+      smart output (see :func:`_register_merge_members`);
+    - the same gate arms when the OWNER is the one carrying the outline and the
+      members COLLECTIVELY outweigh it (:func:`_members_outweigh_owner`, fed the
+      owner's original weight and the running member total — never the
+      accumulated join, which would let members that each stay under the ratio
+      swamp the owner together). This mirror image
+      fails differently and more quietly: the owner is what the sweep demotes,
+      and ``strong_body_demoted`` IS whitelisted by
+      :func:`guardrails.verify_baseline_heading_retention`, so I2 does NOT trip
+      and no fallback rescues the document — a real baseline heading just
+      becomes body. Owner outline alone is NOT enough to arm it: a .docx that
+      marks a 96-char author list as ``outlineLvl=1`` is dirty evidence, and the
+      merge-then-demote-together outcome is right there. The weight ratio is
+      what separates the two.
+
+    The joined-text gate is verdict-identical to the sweep's own test: same
+    predicate, same ``(text, outline_level)`` arguments, and nothing mutates
+    either between the two calls. It is scoped to outline-carrying windows
+    deliberately — an unconditional version would break the useful case where
+    two body-ish lines are only long enough to be demoted TOGETHER (each would
+    then survive alone as a spurious heading).
     """
+    strong_body = strong_body or guardrails.strong_body_reason
     out: list[HeadingDecision] = []
     pos = 0
     while pos < len(decisions):
@@ -1816,8 +1931,18 @@ def merge_split_headings(
             out.append(cur)
             pos += 1
             continue
+        owner_reason, _owner_spared = _strong_body_with_outline_context(
+            cur.text, cur.outline_level, strong_body
+        )
+        if owner_reason is not None:
+            out.append(cur)  # a body line absorbs nothing
+            pos += 1
+            continue
         lines = cur.text.count("\n") + 1
         merged_members = [cur.record_index]
+        absorbed_outline = False  # sticky: a baseline heading is in the window
+        owner_weight = guardrails.weighted_char_length(cur.text.strip())
+        absorbed_weight = 0  # running total of the members taken so far
         k = pos + 1
         while k < len(decisions):
             nxt = decisions[k]
@@ -1835,7 +1960,26 @@ def merge_split_headings(
             nxt_lines = nxt.text.count("\n") + 1
             if lines + nxt_lines > _MERGE_MAX_LINES:
                 break
-            cur.text = _join_heading_texts(cur.text, nxt.text)
+            joined = _join_heading_texts(cur.text, nxt.text)
+            absorbed_weight += guardrails.weighted_char_length(nxt.text.strip())
+            # Outer guard: a window with no outline at stake never pays for this
+            # extra NLP judgment.
+            if (
+                absorbed_outline
+                or nxt.outline_level is not None
+                or (
+                    cur.outline_level is not None
+                    and _members_outweigh_owner(owner_weight, absorbed_weight)
+                )
+            ):
+                joined_reason, _joined_spared = _strong_body_with_outline_context(
+                    joined, cur.outline_level, strong_body
+                )
+                if joined_reason is not None:
+                    break
+            cur.text = joined
+            if nxt.outline_level is not None:
+                absorbed_outline = True
             lines += nxt_lines
             merged_members.append(nxt.record_index)
             cur.note("heading_merge")
@@ -1849,6 +1993,89 @@ def merge_split_headings(
         out.append(cur)
         pos = k if k > pos + 1 else pos + 1
     return out
+
+
+def _register_merge_members(
+    decisions: dict[int, HeadingDecision],
+    d: HeadingDecision,
+    records: Sequence[Any],
+    warnings: dict,
+) -> None:
+    """Register the absorbed members of a merged heading — three cases.
+
+    - the merged heading SURVIVED → an ``absorbed`` sentinel per member, so the
+      assembler skips its standalone row (its text is already inside the
+      heading);
+    - the merge was UNDONE by a later stage (the post-merge strong-body sweep or
+      clamping) and the member carries NO physical outline → the joined text is
+      never rendered, so the member emits its own paragraph text. Record that
+      with an AUDIT-ONLY ``merge_unwound`` decision: ``absorbed`` and
+      ``use_raw_text`` both stay off, which is the same assembler path an
+      absent decision takes, so the output is byte-identical — the row only
+      replaces an anonymous gap with a traceable one. Invariant I2 never
+      inspects a non-outline record, so retention semantics are untouched;
+    - the merge was UNDONE and the member IS a baseline (outlineLvl) heading →
+      write NOTHING, deliberately. The member must not be silently
+      re-classified as body: leaving the gap is what makes I2 trip and hand the
+      document to the baseline assembler, which still emits that paragraph AS a
+      heading. Whitelisting a demotion rule here would suppress the fallback
+      and genuinely lose the heading boundary.
+
+    The strong-body gates in :func:`merge_split_headings` close the direct
+    sweep route into the third case. What remains is the sweep's
+    ``subtree_demoted`` cascade (a NUMBERED merge owner inside a demoted
+    parent's subtree) and :func:`clamp_deep_levels` (level > 9); both are
+    warned about so the event is diagnosable instead of mysterious.
+
+    Separately, an undone merge whose OWNER carries a physical outline is
+    counted as ``smart_merge_outline_owner_demoted``. That case does not violate
+    I2 — the owner holds a whitelisted ``strong_body_demoted`` /
+    ``clamp_gt9_demoted`` tag, so nothing trips and no fallback runs — which is
+    exactly why it needs its own counter: the heading is gone and the only other
+    trace is an aggregate ``smart_strong_body_demotions`` that cannot be
+    attributed to a merge. The weight-ratio gate in
+    :func:`merge_split_headings` closes the direct route here too; the residual
+    routes are the same cascade and clamp.
+
+    A member's own decision is NOT restored as a heading: its level is the
+    product of the whole per-sub-document pipeline (series alignment,
+    anchoring, gap closing, nesting, clamping — all cross-paragraph set
+    operations), so re-inserting one after the fact cannot be shown coherent.
+    Likewise the surviving owner keeps the JOINED text in ``d.text`` after an
+    undone merge; that value only feeds the audit summary (output reads
+    ``rec.text``), and restoring it would mean teaching the merge about
+    downstream demotion.
+    """
+    if not d.is_heading and records[d.record_index].outline_level is not None:
+        warnings["smart_merge_outline_owner_demoted"] = (
+            warnings.get("smart_merge_outline_owner_demoted", 0) + 1
+        )
+        logger.warning(
+            "[smart_heading] outline paragraph %d lost its heading identity as "
+            "the owner of an undone heading merge; I2 does not cover this case "
+            "(the demotion rule is whitelisted), so nothing else reports it",
+            d.record_index,
+        )
+    for m in d.member_indices[1:]:
+        if d.is_heading:
+            member = HeadingDecision(record_index=m, text="", absorbed=True)
+            member.note("merged_absorbed")
+            decisions[m] = member
+            continue
+        if records[m].outline_level is not None:
+            warnings["smart_merge_outline_stranded"] = (
+                warnings.get("smart_merge_outline_stranded", 0) + 1
+            )
+            logger.warning(
+                "[smart_heading] I2: outline paragraph %d stranded by an undone "
+                "heading merge — deferring to the baseline fallback",
+                m,
+            )
+            continue  # no decision on purpose: the I2 fallback keeps the heading
+        member = HeadingDecision(record_index=m, text=records[m].text)
+        member.note("merge_unwound")
+        warnings["smart_merge_unwound"] = warnings.get("smart_merge_unwound", 0) + 1
+        decisions[m] = member
 
 
 def demote_strong_body_headings(
@@ -2801,6 +3028,22 @@ def run_smart_heading(
     if _estimate_record_tokens(records, body_indices) < min_tokens:
         return None  # CB4 whole-document gate — smart never ran
 
+    # Counted AFTER the CB4 gate: a skipped short document ran no smart rules,
+    # so it must not report smart warnings.
+    center_pad_events = _center_pad_events(records, body_indices)
+    if center_pad_events:
+        audit["rule_events"].extend(center_pad_events)
+        warnings["smart_center_pad_offset"] = warnings.get(
+            "smart_center_pad_offset", 0
+        ) + len(center_pad_events)
+        logger.info(
+            "[smart_heading] %d centered paragraph(s) lost the centered channel "
+            "to a leading space pad (>= %.1f em): %s",
+            len(center_pad_events),
+            g.CENTER_MAX_LEADING_PAD_EM,
+            [(e["index"], e["pad_em"]) for e in center_pad_events],
+        )
+
     # --- title blocks -------------------------------------------------------
     # The title-block gate baseline is the GLOBAL FS_base initial
     # value — the char-weighted dominant size, not a weighted mean.
@@ -3048,7 +3291,9 @@ def run_smart_heading(
         backfill_top_level(ds, warnings=warnings)
         align_numbering_series(ds)
         anchor_outline_levels(ds, warnings=warnings)
-        ds = merge_split_headings(ds, records, warnings=warnings)
+        ds = merge_split_headings(
+            ds, records, strong_body=strong_body, warnings=warnings
+        )
         demote_strong_body_headings(ds, strong_body=strong_body, warnings=warnings)
         skeleton_audit = correct_numbering_skeleton(ds, warnings=warnings)
         if skeleton_audit:
@@ -3073,17 +3318,8 @@ def run_smart_heading(
         sub_audit["headings"] = sum(1 for d in ds if d.is_heading)
         for d in ds:
             decisions[d.record_index] = d
-            # Absorbed merge members: mark trailing member records so the
-            # assembler skips their standalone output — but ONLY while the
-            # merged heading survives. If the post-merge sweep or clamping
-            # demoted it, the joined text is never rendered, so the members
-            # must fall back to emitting their own paragraph text; otherwise
-            # their content vanishes and I1 trips a whole-document fallback.
-            if d.member_indices and not d.is_title_block and d.is_heading:
-                for m in d.member_indices[1:]:
-                    absorbed = HeadingDecision(record_index=m, text="", absorbed=True)
-                    absorbed.note("merged_absorbed")
-                    decisions[m] = absorbed
+            if d.member_indices and not d.is_title_block:
+                _register_merge_members(decisions, d, records, warnings)
         # I2 audit trail for recognition-time outline demotions:
         # merged in AFTER the candidate loop so they never reach leveling /
         # anchoring, yet appear in the final decision map + audit ledger.

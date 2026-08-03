@@ -39,6 +39,13 @@ def _hermetic_mineru_env(monkeypatch):
     ``test_invalid_when_local_parser_options_change`` toggles each option
     and expects the change to invalidate a bundle recorded with defaults).
 
+    ``DOCLING_ADDITIONAL_SUFFIXES`` / ``MINERU_ADDITIONAL_SUFFIXES`` are cleared
+    because they are live engine *capability* knobs
+    (``ParserSpec.extra_suffixes_env``): a developer ``.env`` that opts in e.g.
+    ``doc,ppt,xls`` widens ``suffix_capabilities()`` for that engine and the
+    upload allowlist derived from it, so baseline suffix assertions would
+    silently pass or fail depending on the developer's own deployment.
+
     ``DOCX_SMART_HEADING`` is pinned to ``"false"`` (not merely deleted):
     it is a live-env parser-routing knob (``routing.smart_heading_default_enabled``),
     so a developer ``.env`` that sets ``DOCX_SMART_HEADING=true`` seeds
@@ -66,9 +73,33 @@ def _hermetic_mineru_env(monkeypatch):
     monkeypatch.delenv("MINERU_LOCAL_PARSE_METHOD", raising=False)
     monkeypatch.delenv("MINERU_LOCAL_IMAGE_ANALYSIS", raising=False)
     monkeypatch.delenv("MINERU_LOCAL_START_PAGE_ID", raising=False)
+    monkeypatch.delenv("MINERU_ADDITIONAL_SUFFIXES", raising=False)
     monkeypatch.delenv("LIGHTRAG_PARSER", raising=False)
     monkeypatch.delenv("DOCLING_ENDPOINT", raising=False)
+    monkeypatch.delenv("DOCLING_ADDITIONAL_SUFFIXES", raising=False)
     monkeypatch.setenv("DOCX_SMART_HEADING", "false")
+
+
+@pytest.fixture(autouse=True)
+def _reset_r_separator_caches():
+    """Drop the process-wide ``CHUNK_R_SEPARATORS`` caches between tests.
+
+    Both caches are keyed on the *raw* environment string and hold for the life
+    of the process, including the one-time correction WARNING each of them
+    emits. Without this reset, the second test in a session that happens to use
+    the same ``CHUNK_R_SEPARATORS`` value sees zero warnings and fails an
+    assertion that has nothing to do with what it is testing — or, worse, passes
+    for the wrong reason. Tests must not have to invent globally-unique
+    separator strings to stay independent.
+    """
+    from lightrag.multimodal_context import _cached_surrounding_chunk_separators
+    from lightrag.parser.routing import _cached_env_r_separators
+
+    _cached_env_r_separators.cache_clear()
+    _cached_surrounding_chunk_separators.cache_clear()
+    yield
+    _cached_env_r_separators.cache_clear()
+    _cached_surrounding_chunk_separators.cache_clear()
 
 
 #: Populated in ``pytest_configure`` and read by ``requires_spacy_models`` /
