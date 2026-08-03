@@ -1491,7 +1491,7 @@ Prompt 依据：OpenAI 官方 [GPT-5.6 model guidance](https://developers.openai
 | RFC-I16 | Phase 5 | 将 same-host Manager 能力封装为 coordinator provider，完成 Gunicorn support matrix | RFC-I06、RFC-I11、RFC-I15 | 代码完成，外部 Gate 待验证 | 任意 worker 路由、catalog revision、worker kill、provider cap 和 pipeline owner 测试通过；无 sticky session |
 | RFC-I17 | Phase 6 | 实现 Ollama model alias、header/model conflict 和 metadata side-effect-free | RFC-I08、RFC-I10 | 已完成 | 标准 client 仅用 model 可选非默认库；unknown 不创建；conflict 400；tags/ps 不 load instance |
 | RFC-I18 | Phase 7 | 基于新 contract 重接 WebUI 与 API selector，修正 stale `LIGHTRAG-WORKSPACE` 文案/header | RFC-I08、RFC-I10、RFC-I17 | 已完成 | UI 创建项置顶、全库 name+ID 可选；Bun 全测/build；API Vary/header 一致 |
-| RFC-I19 | Phase 7+ | 按 backend 分拆 strict physical profile 的 provision/migration/delete/backup 硬化 | RFC-I04、RFC-I07、RFC-I13 | 未开始 | 每个 backend 独立 PR、真实服务 integration、resource ownership 与恢复文档，不混入 core PR |
+| RFC-I19 | Phase 7+ | 按 backend 分拆 strict physical profile 的 provision/migration/delete/backup 硬化 | RFC-I04、RFC-I07、RFC-I13 | 代码完成，外部 Gate 待验证 | 每个 backend 独立 PR、真实服务 integration、resource ownership 与恢复文档，不混入 core PR |
 | RFC-I20 | Later | 实现 external coordinator 并验证多节点 | RFC-I16 | 未开始 | TTL/heartbeat/fencing、网络故障、node kill、global admission 和无 sticky session 全部通过后才更新支持声明 |
 
 ### 13.3 每项任务的统一交付模板
@@ -1617,3 +1617,13 @@ Prompt 依据：OpenAI 官方 [GPT-5.6 model guidance](https://developers.openai
 - 严格验证：新增 catalog 全分页、重复 cursor fail-fast、lifecycle unwrap/failure、data/control-plane URL 分类和创建项顺序/legacy 隐藏测试。前端全量为 `99 passed, 0 failed`，ESLint 通过，Vite production build 成功；后端聚焦为 `73 passed`，API 绿门禁为 `767 passed, 17 deselected`；全仓 pre-commit 全部通过。
 - 可视验收边界：尝试连接已打开的 `http://127.0.0.1:9621/webui/#/` 做只读 DOM 验证时，被浏览器 URL 安全策略明确阻止；未使用其他浏览器或底层协议绕过。因此“真实页面打开上传对话框并目视确认”保留为人工 Gate，不宣称自动浏览器验收通过。
 - 兼容、回滚与下一项：legacy mode/default header 省略规则不变；旧的直接 KnowledgeBase create response 仍可解包。回滚不迁移数据，只需撤销 WebUI lifecycle/catalog adapter。RFC-I18 完成；下一项 RFC-I19 必须按 backend 独立审计和实现 strict physical provision/migration/delete/backup，并对真实服务逐项 Gate，不能以现有 mock/offline logical isolation 代替。
+
+### 2026-08-03T22:41:00+08:00 — RFC-I19 Phase 7+ physical resource lifecycle hardening
+
+- 代码基线与提交：基于 `dev@684ef677` 实施，形成 `c18ed959 feat(workspace): freeze physical resource bindings`；未跟踪的 `.codex/` 与历史/本轮测试临时目录均未暂存、未提交。
+- 资源所有权与最小权限：为 storage profile 固定 `operator / preprovisioned / drop_workspace_namespaces / operator_managed` lifecycle。数据库、服务、cluster 与 volume 的创建、备份、恢复和退役属于 operator；LightRAG lifecycle 只初始化、迁移和删除 12 个 storage role 与 input directory 的 workspace namespace，不会删除整个 endpoint/database。省略 lifecycle 使用同一安全默认值；未知字段或更强的销毁策略在创建前失败。
+- 不可变物理绑定：physical create 在 catalog 同时持久化整体 profile 与逐 section 的 credential-free SHA-256 指纹；PostgreSQL catalog 使用 additive JSONB/CHAR columns，fenced revision CAS 只能首次绑定或写入完全相同 snapshot。密码/token 不参与指纹，可安全轮换；host、endpoint、database、prefix 资源或专属目录变化会在 client 构造、migration 或任何 `drop()` 前 fail closed。旧 physical record 的空 snapshot 只能由 startup-owned fenced migration 首次绑定，不能由普通 query 偷偷迁移。
+- Lifecycle journal 与删除边界：CREATE/MIGRATE/DELETE operation metadata 记录 `INITIALIZING_NAMESPACES`、`MIGRATING_NAMESPACES`、`DELETING_NAMESPACES`、`NAMESPACES_DELETED` 和 `READY`，同时保留既有逐 storage `cleanup_completed` journal。profile retarget 后删除会进入 ERROR/FAILED 且不构造 RAG、不调用 drop；正常删除只 tombstone catalog record 并保留 operator-owned 服务。部署文档补充了文件、PostgreSQL、Redis、Neo4j/Memgraph、MongoDB、Milvus、Qdrant、OpenSearch 的 backup boundary 和四族一致恢复要求。
+- 确定性验证：profile/catalog/lifecycle 聚焦 suite `113 passed`；12 个已注册存储实现目录与统一 profile/override 契约 `1189 passed, 1 skipped, 12 deselected`；API 绿门禁 `773 passed, 17 deselected`；WebUI `99 passed, 0 failed`，ESLint 与 Vite production build 成功；全仓 pre-commit 所有 hook 通过。新增用例覆盖凭据轮换不漂移、资源重指向拒绝、PostgreSQL schema/CAS、旧 record 启动绑定、create/delete checkpoint、retarget 删除零 drop 和正常 namespace cleanup。
+- 外部验证边界：`docker ps` 无法连接本机 Docker Desktop Linux Engine，故没有执行 PostgreSQL、Redis、Neo4j、MongoDB、Milvus、Qdrant、Memgraph、OpenSearch 的真实服务 create/migrate/delete/backup-restore。离线 mock/contract 结果不能替代该 Gate；RFC-I19 标为“代码完成，外部 Gate 待验证”，不能据此把各 physical backend 升级为 production-verified。
+- 兼容、迁移与回滚：catalog 变更为 additive；logical 与 legacy default 记录不携带 physical binding，数据布局不变。升级前必须核对并备份旧 physical profile；不得在首次绑定升级中把同一 profile ID 指向新资源。代码回滚不会搬迁或删除数据，但新字段应保留，避免未来版本失去资源归属证据。下一项 RFC-I20 仍是 external coordinator/multi-node，必须通过真实 TTL、网络分区、node kill、global admission 与 no-sticky-session Gate 后才能更新支持矩阵。

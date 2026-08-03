@@ -1,6 +1,6 @@
 # LightRAG 多知识库 RFC 实现差距与新一轮优化方案
 
-- 状态：架构决策已确认；Phase 0～7 的 core/WebUI Gate 已完成；physical backend hardening 与同机 Gunicorn 外部集成 Gate 待验证
+- 状态：架构决策已确认；Phase 0～7+ 的 core/WebUI/physical 离线 Gate 已完成；physical 真实服务与同机 Gunicorn 外部集成 Gate 待验证
 - RFC 基线：`docs/lightrag-rfc-en.md`（2026-07-29）
 - 代码基线：`dev@64713519`，已包含 `upstream/main@301e715c`
 - 审计日期：2026-08-03（Asia/Shanghai）
@@ -28,7 +28,10 @@
 > `79679fb3` 已完成 Phase 6 的 Ollama model alias 与 fail-closed selector；
 > `d6959b99` 已完成 Phase 7 的 WebUI lifecycle/catalog 接入、全分页 ACTIVE
 > selector、name+ID 显示、创建项置顶、临时 Admin Key 以及 control/data-plane
-> header 分流。RFC-I18 已完成；逐 backend 的 strict physical lifecycle 属于 RFC-I19。
+> header 分流。`c18ed959` 已完成 RFC-I19 的 strict physical lifecycle 共享安全
+> 契约、catalog resource binding 与 fail-closed retarget 防护；全后端离线契约已
+> 通过，真实外部服务 integration 尚未执行，因此 RFC-I19 保持“代码完成，外部
+> Gate 待验证”。
 
 ## 1. 结论
 
@@ -568,9 +571,38 @@ localhost 自动化，因此真实页面的可视交互保留为人工验收项�
 physical backend 的 provision/migration/delete/backup 未混入本提交，继续由
 RFC-I19 按 backend 独立完成并以真实服务 integration 作为 Gate。
 
+RFC-I19 的代码实施由 `c18ed959` 完成。它冻结以下跨后端不变量：physical endpoint、
+database、专属目录和 collection/index resource 由 operator 预创建、备份和退役；
+LightRAG 只初始化、迁移和删除自己拥有的 workspace namespaces，不删除整个服务。
+catalog 在 create 或旧 record 的 fenced startup migration 中持久化逐资源及整体的
+credential-free SHA-256 binding。密码/token 轮换不改变 binding；profile ID 若被
+静默重指向不同 host、database、endpoint 或目录，会在构造 client、migration 或
+任何 `drop()` 前失败。PostgreSQL provider 通过 additive columns、revision CAS 和
+operation fencing 原子绑定该 snapshot；create/migrate/delete operation journal
+另外记录 `INITIALIZING_NAMESPACES`、`MIGRATING_NAMESPACES`、
+`DELETING_NAMESPACES`、`NAMESPACES_DELETED` 与 `READY`。
+
+验证方面，profile/catalog/lifecycle 聚焦回归为 `113 passed`；12 个存储后端目录与
+统一 profile/override 契约为 `1189 passed, 1 skipped, 12 deselected`；API 绿门禁为
+`773 passed, 17 deselected`；WebUI 为 `99 passed`，ESLint 与 production build
+成功，全仓 pre-commit 通过。跳过/排除项为既有 integration/POSIX 环境边界。本机
+Docker Desktop Linux Engine 不可用，因此尚未对 PostgreSQL、Redis、Neo4j、
+MongoDB、Milvus、Qdrant、Memgraph、OpenSearch 执行真实 endpoint 的 create/
+migrate/drop/backup-restore；这些结果不得从 mock/offline test 推断，生产支持声明
+保持不变。
+
 ### Later：external coordinator 与多节点
 
 只有在 external lease/admission provider、网络分区、TTL/fencing、node kill 和 no-sticky-session 测试完成后，才更新支持矩阵为 multi-node。
+
+RFC-I19 后的再次审计确认，当前 `WorkspaceCoordinator` 只抽象了 startup recovery，
+`ResourceAdmissionController` 只把 deployment-total slot 交给共享 adapter；
+`pipeline_status`、keyed lock、pipeline ingress、scan job store、跨节点 request lease
+drain 与 destructive exclusive lease 仍由本地状态或同一 Gunicorn master 的
+`SyncManager` 提供。因此 `external` provider 继续在启动时 fail closed。RFC-I20
+必须把这些 authority 一并外部化，并证明 ACTIVE→DELETING 与 request/background/
+pipeline lease 原子互斥、同 workspace pipeline 单写、全局 admission/fairness、
+TTL 接管和 stale fence 拒绝；只新增 Redis startup lock 不构成多节点支持。
 
 ## 11. 验证计划
 

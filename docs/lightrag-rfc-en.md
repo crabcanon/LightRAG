@@ -694,6 +694,25 @@ Scope: management UI and explicit upload/query selection. “Create independent 
 
 Scope: small backend-focused PRs with explicit resource ownership, creation/deletion, migration, and integration tests. Logical workspace identity remains centrally supplied.
 
+The physical-resource lifecycle is intentionally least-privilege: endpoints,
+databases, clusters, and volumes are operator-owned, pre-provisioned,
+operator-backed-up resources. LightRAG may initialize, migrate, and drop only
+the workspace namespaces it owns; it never interprets namespace deletion as
+permission to destroy an endpoint or database service. The catalog stores an
+immutable, credential-free fingerprint for the complete profile binding and
+each active resource section. Credential rotation is allowed, but changing a
+bound profile ID to a different host, endpoint, database, or directory fails
+before client construction, migration, or any destructive storage call.
+Pre-existing physical records without this snapshot are bound only by a fenced
+startup migration after the operator has verified and backed up the configured
+profile.
+
+Offline contract/mock coverage is not sufficient to advertise a physical
+backend as production-verified. Each backend support statement requires a real
+service create/migrate/delete test, proof that an unrelated profile is
+unaffected, and an operator backup/restore exercise covering the catalog and
+all four storage families at one consistent recovery point.
+
 ### Later: external coordinator and multi-node support
 
 Scope: implement the existing lease/fencing/admission contract through external shared infrastructure, then publish a tested multi-node support matrix.

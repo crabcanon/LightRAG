@@ -697,6 +697,20 @@ metric 必须控制 workspace label cardinality；详细 ID 应留在 structured
 
 范围：小粒度、面向具体后端的 PR；明确资源所有权、创建/删除、迁移与 integration test。逻辑 workspace identity 仍由中心提供。
 
+物理资源生命周期遵循最小权限原则：endpoint、database、cluster 与 volume 由
+operator 拥有、预创建并负责备份。LightRAG 只能初始化、迁移和删除自己拥有的
+workspace namespace；namespace 删除绝不代表可以销毁整个 endpoint 或 database
+服务。catalog 为完整 profile binding 及每个活动资源 section 持久化不可变且不含
+凭据的指纹。允许轮换凭据，但若把已经绑定的 profile ID 改指向另一 host、endpoint、
+database 或目录，系统必须在构造 client、执行 migration 或任何破坏性 storage
+调用前失败。旧版本中没有该 snapshot 的 physical record，只能在 operator 核对并
+备份当前 profile 后，由 fenced startup migration 完成首次绑定。
+
+离线 contract/mock 覆盖不足以把 physical backend 宣称为 production-verified。
+每个后端的支持声明都必须有真实服务 create/migrate/delete 测试，证明无关 profile
+不受影响，并完成覆盖 catalog 与四类 storage family 同一一致恢复点的 operator
+backup/restore 演练。
+
 ### 后续：外部 coordinator 与多节点支持
 
 范围：用外部共享基础设施实现已有 lease/fencing/admission contract，再发布经过测试的多节点支持矩阵。
