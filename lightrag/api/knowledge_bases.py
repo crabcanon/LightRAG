@@ -19,6 +19,7 @@ import re
 import shutil
 import socket
 import threading
+from types import SimpleNamespace
 from typing import Annotated, Any, AsyncIterator, Callable, Literal, Mapping, Sequence
 from uuid import uuid4
 
@@ -37,6 +38,16 @@ from lightrag.api.catalog import (
     WorkspaceLifecycleState,
     canonical_payload_hash,
 )
+from lightrag.api.endpoint_policy import ENDPOINT_POLICIES, EndpointPolicy
+from lightrag.api.workspace_pool import (
+    WorkspaceContextMissingError,
+    WorkspaceExecutionContext,
+    WorkspaceInstancePool,
+    WorkspacePoolBusyError,
+    WorkspacePoolCapacityError,
+    WorkspacePoolInitializationError,
+)
+from lightrag.exceptions import PipelineNotInitializedError
 from lightrag.file_atomic import atomic_write
 from lightrag.kg.shared_storage import get_namespace_data
 from lightrag.kg.storage_profiles import (
@@ -108,6 +119,14 @@ class KnowledgeBaseNotFoundError(KnowledgeBaseError):
 
 class KnowledgeBaseConflictError(KnowledgeBaseError):
     """Raised when a requested lifecycle operation is unsafe or ambiguous."""
+
+
+class KnowledgeBaseUnavailableError(KnowledgeBaseError):
+    """Raised when a known workspace is not currently data-plane ACTIVE."""
+
+    def __init__(self, message: str, *, retryable: bool = True) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class StorageProfileError(KnowledgeBaseError):
@@ -746,9 +765,11 @@ class KnowledgeBaseCatalog:
 
 
 def validate_knowledge_base_id(value: str | None) -> str:
-    normalized = (value or DEFAULT_KNOWLEDGE_BASE_ID).strip()
-    if not normalized:
+    if value is None:
         return DEFAULT_KNOWLEDGE_BASE_ID
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("Knowledge-base selector cannot be empty")
     if not _ID_PATTERN.fullmatch(normalized):
         raise ValueError("Knowledge-base ID must match [A-Za-z0-9][A-Za-z0-9_-]{0,63}")
     return normalized
@@ -774,7 +795,7 @@ class KnowledgeBaseSideEffectCounters:
         return asdict(self)
 
 
-_current_context: ContextVar[KnowledgeBaseContext | None] = ContextVar(
+_current_context: ContextVar[WorkspaceExecutionContext | None] = ContextVar(
     "lightrag_knowledge_base_context", default=None
 )
 
@@ -782,15 +803,35 @@ _current_context: ContextVar[KnowledgeBaseContext | None] = ContextVar(
 class RequestScopedProxy:
     """Forward attribute access to the active request's RAG or doc manager."""
 
-    def __init__(self, manager: "KnowledgeBaseManager", attribute: str) -> None:
+    def __init__(
+        self,
+        manager: "KnowledgeBaseManager",
+        attribute: str,
+        *,
+        bootstrap_attributes: frozenset[str] = frozenset(),
+    ) -> None:
         object.__setattr__(self, "_manager", manager)
         object.__setattr__(self, "_attribute", attribute)
+        object.__setattr__(self, "_bootstrap_attributes", bootstrap_attributes)
 
     def _target(self) -> Any:
-        context = _current_context.get() or self._manager.default_context
+        context = _current_context.get()
+        if context is None:
+            if self._manager.multi_workspace_enabled:
+                raise WorkspaceContextMissingError(
+                    "Multi-workspace proxy access requires an explicit leased context"
+                )
+            context = self._manager.default_execution_context
         return getattr(context, self._attribute)
 
     def __getattr__(self, name: str) -> Any:
+        if _current_context.get() is None and name in object.__getattribute__(
+            self, "_bootstrap_attributes"
+        ):
+            default_target = getattr(
+                self._manager.default_execution_context, self._attribute
+            )
+            return getattr(default_target, name)
         return getattr(self._target(), name)
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -817,7 +858,9 @@ class KnowledgeBaseManager:
             str
         ] = _DEFAULT_STORAGE_IMPLEMENTATIONS,
         max_loaded_instances: int = 32,
+        max_loaded_resource_weight: int | None = None,
         multi_workspace_enabled: bool = True,
+        allow_non_default_writes: bool = True,
     ) -> None:
         if max_loaded_instances < 1:
             raise ValueError("max_loaded_instances must be at least 1")
@@ -846,6 +889,7 @@ class KnowledgeBaseManager:
         )
         self._max_loaded_instances = max_loaded_instances
         self.multi_workspace_enabled = multi_workspace_enabled
+        self.allow_non_default_writes = allow_non_default_writes
         default_record = default_record or self._catalog_get_cached(
             DEFAULT_KNOWLEDGE_BASE_ID
         )
@@ -867,7 +911,32 @@ class KnowledgeBaseManager:
         )
         self._started = False
         self.side_effect_counters = KnowledgeBaseSideEffectCounters()
-        self.rag_proxy = RequestScopedProxy(self, "rag")
+        self.default_execution_context = self._execution_context(self.default_context)
+        self.instance_pool = WorkspaceInstancePool(
+            construct=self._construct_execution_context,
+            initialize=self._initialize_execution_context,
+            finalize=self._finalize_execution_context,
+            can_evict=self._can_evict_execution_context,
+            weight_for=self._resource_weight_for,
+            max_entries=max_loaded_instances,
+            max_weight=(
+                max_loaded_resource_weight
+                if max_loaded_resource_weight is not None
+                else max_loaded_instances
+            ),
+            failure_backoff_seconds=float(
+                os.getenv("LIGHTRAG_WORKSPACE_POOL_FAILURE_BACKOFF_SECONDS", "1") or "1"
+            ),
+            failure_backoff_max_seconds=float(
+                os.getenv("LIGHTRAG_WORKSPACE_POOL_FAILURE_BACKOFF_MAX_SECONDS", "30")
+                or "30"
+            ),
+        )
+        self.rag_proxy = RequestScopedProxy(
+            self,
+            "rag",
+            bootstrap_attributes=frozenset({"ollama_server_infos"}),
+        )
         self.document_manager_proxy = RequestScopedProxy(self, "document_manager")
 
     def _catalog_get_cached(self, knowledge_base_id: str) -> KnowledgeBaseRecord:
@@ -1081,9 +1150,102 @@ class KnowledgeBaseManager:
             )
             self.default_context.metadata = durable_default
             await self._initialize_context(self.default_context)
+            self.default_execution_context = self._execution_context(
+                self.default_context
+            )
+            self.instance_pool.add_ready(
+                self.default_execution_context,
+                pinned=True,
+            )
         except BaseException:
             self._started = False
             raise
+
+    @staticmethod
+    def _execution_context(
+        context: KnowledgeBaseContext,
+    ) -> WorkspaceExecutionContext:
+        return WorkspaceExecutionContext(
+            metadata=context.metadata,
+            binding=context.metadata.to_workspace_binding(),
+            rag=context.rag,
+            document_manager=context.document_manager,
+        )
+
+    def _resource_weight_for(self, record: KnowledgeBaseRecord) -> int:
+        return 2 if record.isolation_level == "physical" else 1
+
+    async def _construct_execution_context(
+        self, record: KnowledgeBaseRecord
+    ) -> WorkspaceExecutionContext:
+        profile = self._profile_for(record)
+        async with self._manager_lock:
+            context = self._contexts.get(record.id)
+            if context is None:
+                self.side_effect_counters.instance_constructions += 1
+                context = KnowledgeBaseContext(
+                    metadata=record,
+                    rag=self._rag_factory(record, profile),
+                    document_manager=self._document_manager_factory(record, profile),
+                )
+                self._contexts[record.id] = context
+            else:
+                context.metadata = record
+        return self._execution_context(context)
+
+    async def _initialize_execution_context(
+        self, context: WorkspaceExecutionContext
+    ) -> None:
+        # Test/library callers may assemble routers without entering the ASGI
+        # lifespan. Production serving always calls ``initialize`` first; do
+        # not manufacture a partial server startup from a request.
+        if not self._started:
+            return
+        knowledge_base_id = context.metadata.id
+        if knowledge_base_id in self._initialized_ids:
+            return
+        lock = self._instance_locks.setdefault(knowledge_base_id, asyncio.Lock())
+        async with lock:
+            if knowledge_base_id in self._initialized_ids:
+                return
+            self.side_effect_counters.storage_initializations += 1
+            await context.rag.initialize_storages()
+            self._initialized_ids.add(knowledge_base_id)
+
+    async def _finalize_execution_context(
+        self, context: WorkspaceExecutionContext
+    ) -> None:
+        knowledge_base_id = context.metadata.id
+        if knowledge_base_id in self._initialized_ids:
+            await context.rag.finalize_storages()
+            self._initialized_ids.discard(knowledge_base_id)
+        if knowledge_base_id != DEFAULT_KNOWLEDGE_BASE_ID:
+            self._contexts.pop(knowledge_base_id, None)
+
+    async def _can_evict_execution_context(
+        self, context: WorkspaceExecutionContext
+    ) -> bool:
+        if context.metadata.id in self._deleting_ids:
+            return False
+        try:
+            pipeline_status = await get_namespace_data(
+                "pipeline_status", workspace=context.metadata.effective_workspace
+            )
+        except PipelineNotInitializedError:
+            # No namespace means the pipeline was never admitted for this
+            # context, so there is no non-lease work to protect from eviction.
+            return True
+        except (RuntimeError, ValueError) as exc:
+            # Direct library/unit-test managers may not initialize shared state.
+            if "not initialized" in str(exc).lower():
+                return True
+            raise
+        return not bool(
+            pipeline_status.get("busy")
+            or pipeline_status.get("scanning")
+            or pipeline_status.get("destructive_busy")
+            or int(pipeline_status.get("pending_enqueues", 0) or 0) > 0
+        )
 
     async def _initialize_context(self, context: KnowledgeBaseContext) -> None:
         knowledge_base_id = context.metadata.id
@@ -1161,22 +1323,84 @@ class KnowledgeBaseManager:
 
     @asynccontextmanager
     async def bind_request(
-        self, knowledge_base_id: str | None
-    ) -> AsyncIterator[KnowledgeBaseContext]:
-        context = await self.get_context(knowledge_base_id)
-        async with self._manager_lock:
-            if context.metadata.id in self._deleting_ids:
-                raise KnowledgeBaseConflictError(
-                    f"Knowledge base {context.metadata.id!r} is being deleted"
-                )
-            context.active_requests += 1
+        self,
+        knowledge_base_id: str | None,
+        *,
+        lease_kind: Literal["foreground", "stream", "background"] = "foreground",
+    ) -> AsyncIterator[WorkspaceExecutionContext]:
+        normalized = validate_knowledge_base_id(knowledge_base_id)
+        if not self.multi_workspace_enabled and normalized != DEFAULT_KNOWLEDGE_BASE_ID:
+            await self.catalog_provider.get_record(normalized)
+            raise KnowledgeBaseNotFoundError(
+                "Multi-workspace mode is disabled; only the default knowledge "
+                "base is available"
+            )
+        if normalized in self._deleting_ids:
+            raise KnowledgeBaseConflictError(
+                f"Knowledge base {normalized!r} is being deleted"
+            )
+        record = await self.catalog_provider.get_record(
+            normalized, include_tombstoned=True
+        )
+        state = WorkspaceLifecycleState(record.lifecycle_state)
+        if state is WorkspaceLifecycleState.TOMBSTONED:
+            raise KnowledgeBaseNotFoundError(
+                f"Knowledge base {normalized!r} has been deleted"
+            )
+        if state is WorkspaceLifecycleState.DELETING:
+            raise KnowledgeBaseConflictError(
+                f"Knowledge base {normalized!r} is being deleted"
+            )
+        if state is not WorkspaceLifecycleState.ACTIVE:
+            raise KnowledgeBaseUnavailableError(
+                f"Knowledge base {normalized!r} is {state.value}"
+            )
+        lease = await self.instance_pool.acquire(record, kind=lease_kind)
+        context = lease.context
         token = _current_context.set(context)
         try:
             yield context
         finally:
             _current_context.reset(token)
-            async with self._manager_lock:
-                context.active_requests = max(0, context.active_requests - 1)
+            await lease.release()
+
+    @asynccontextmanager
+    async def bind_observation(
+        self, knowledge_base_id: str | None
+    ) -> AsyncIterator[WorkspaceExecutionContext]:
+        """Bind catalog/shared-state observation without loading an instance."""
+
+        normalized = validate_knowledge_base_id(knowledge_base_id)
+        if not self.multi_workspace_enabled and normalized != DEFAULT_KNOWLEDGE_BASE_ID:
+            await self.catalog_provider.get_record(normalized)
+            raise KnowledgeBaseNotFoundError(
+                "Multi-workspace mode is disabled; only the default knowledge "
+                "base is available"
+            )
+        record = await self.catalog_provider.get_record(
+            normalized, include_tombstoned=True
+        )
+        state = WorkspaceLifecycleState(record.lifecycle_state)
+        if state is WorkspaceLifecycleState.TOMBSTONED:
+            raise KnowledgeBaseNotFoundError(
+                f"Knowledge base {normalized!r} has been deleted"
+            )
+        pool_entries = self.instance_pool.peek(normalized)["entries"]
+        runtime_state = pool_entries[0]["state"] if pool_entries else "UNLOADED"
+        context = WorkspaceExecutionContext(
+            metadata=record,
+            binding=record.to_workspace_binding(),
+            rag=SimpleNamespace(
+                workspace=record.effective_workspace,
+                runtime_state=runtime_state,
+            ),
+            document_manager=None,
+        )
+        token = _current_context.set(context)
+        try:
+            yield context
+        finally:
+            _current_context.reset(token)
 
     async def request_dependency(
         self,
@@ -1184,7 +1408,46 @@ class KnowledgeBaseManager:
         knowledge_base_id: KnowledgeBaseHeader = None,
     ) -> AsyncIterator[None]:
         try:
-            async with self.bind_request(knowledge_base_id) as context:
+            route = request.scope.get("route")
+            route_name = getattr(route, "name", None)
+            normalized = validate_knowledge_base_id(knowledge_base_id)
+            if (
+                ENDPOINT_POLICIES.get(route_name) is EndpointPolicy.DATA_WRITE
+                and normalized != DEFAULT_KNOWLEDGE_BASE_ID
+                and not self.allow_non_default_writes
+            ):
+                record = await self.catalog_provider.get_record(
+                    normalized, include_tombstoned=True
+                )
+                state = WorkspaceLifecycleState(record.lifecycle_state)
+                if state is WorkspaceLifecycleState.TOMBSTONED:
+                    raise KnowledgeBaseNotFoundError(
+                        f"Knowledge base {normalized!r} has been deleted"
+                    )
+                if state is not WorkspaceLifecycleState.ACTIVE:
+                    raise KnowledgeBaseUnavailableError(
+                        f"Knowledge base {normalized!r} is {state.value}"
+                    )
+                raise KnowledgeBaseUnavailableError(
+                    "Non-default knowledge-base writes are disabled until "
+                    "pipeline recovery and shared admission are enabled",
+                    retryable=False,
+                )
+            if route_name == "get_pipeline_status":
+                async with self.bind_observation(knowledge_base_id) as context:
+                    request.state.knowledge_base = context.metadata.public_dict()
+                    yield
+                return
+            lease_kind = (
+                "stream"
+                if request.url.path.endswith("/query/stream")
+                or request.url.path.endswith("/api/chat")
+                or request.url.path.endswith("/api/generate")
+                else "foreground"
+            )
+            async with self.bind_request(
+                knowledge_base_id, lease_kind=lease_kind
+            ) as context:
                 request.state.knowledge_base = context.metadata.public_dict()
                 yield
         except ValueError as exc:
@@ -1193,6 +1456,27 @@ class KnowledgeBaseManager:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except KnowledgeBaseConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KnowledgeBaseUnavailableError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=str(exc),
+                headers={"Retry-After": "1"} if exc.retryable else None,
+            ) from exc
+        except WorkspacePoolCapacityError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "workspace_capacity_exhausted",
+                    "message": str(exc),
+                },
+                headers={"Retry-After": "1"},
+            ) from exc
+        except (WorkspacePoolBusyError, WorkspacePoolInitializationError) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=str(exc),
+                headers={"Retry-After": "1"},
+            ) from exc
         except StorageProfileError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
@@ -1480,30 +1764,33 @@ class KnowledgeBaseManager:
                 raise ValueError("Idempotency-Key must contain 1-128 characters")
 
         reserved = False
+        pool_reserved = False
         async with self._manager_lock:
-            if normalized not in self._deleting_ids:
-                context = self._contexts.get(normalized)
-                if context is not None and context.active_requests:
-                    raise KnowledgeBaseConflictError(
-                        f"Knowledge base {normalized!r} has active requests"
-                    )
-                record = await self.catalog_provider.get_record(
-                    normalized, include_tombstoned=True
-                )
-                pipeline_status = await get_namespace_data(
-                    "pipeline_status", workspace=record.effective_workspace
-                )
-                if pipeline_status and (
-                    pipeline_status.get("busy")
-                    or pipeline_status.get("scanning")
-                    or int(pipeline_status.get("pending_enqueues", 0) or 0) > 0
-                ):
-                    raise KnowledgeBaseConflictError(
-                        f"Knowledge base {normalized!r} has an active pipeline"
-                    )
-                self._deleting_ids.add(normalized)
-                reserved = True
             try:
+                if normalized not in self._deleting_ids:
+                    try:
+                        await self.instance_pool.reserve_delete(normalized)
+                        pool_reserved = True
+                    except WorkspacePoolBusyError as exc:
+                        raise KnowledgeBaseConflictError(
+                            f"Knowledge base {normalized!r} has active leases"
+                        ) from exc
+                    record = await self.catalog_provider.get_record(
+                        normalized, include_tombstoned=True
+                    )
+                    pipeline_status = await get_namespace_data(
+                        "pipeline_status", workspace=record.effective_workspace
+                    )
+                    if pipeline_status and (
+                        pipeline_status.get("busy")
+                        or pipeline_status.get("scanning")
+                        or int(pipeline_status.get("pending_enqueues", 0) or 0) > 0
+                    ):
+                        raise KnowledgeBaseConflictError(
+                            f"Knowledge base {normalized!r} has an active pipeline"
+                        )
+                    self._deleting_ids.add(normalized)
+                    reserved = True
                 (
                     record,
                     operation,
@@ -1516,6 +1803,8 @@ class KnowledgeBaseManager:
             except BaseException:
                 if reserved:
                     self._deleting_ids.discard(normalized)
+                if pool_reserved:
+                    await self.instance_pool.cancel_delete(normalized)
                 raise
 
         if operation.state in {
@@ -1523,8 +1812,10 @@ class KnowledgeBaseManager:
             CatalogOperationState.FAILED,
         }:
             self._schedule_delete_lifecycle(operation.operation_id)
-        else:
+        elif operation.state is CatalogOperationState.SUCCEEDED:
             self._deleting_ids.discard(normalized)
+            if pool_reserved:
+                await self.instance_pool.cancel_delete(normalized)
         return record, operation, created
 
     def _schedule_delete_lifecycle(self, operation_id: str) -> asyncio.Task[None]:
@@ -1557,7 +1848,10 @@ class KnowledgeBaseManager:
         claim: CatalogOperation | None = None
         context: KnowledgeBaseContext | None = None
         record: KnowledgeBaseRecord | None = None
+        workspace_id: str | None = None
         try:
+            pending_operation = await self.catalog_provider.get_operation(operation_id)
+            workspace_id = pending_operation.workspace_id
             claim = await self.catalog_provider.claim_operation(
                 operation_id, owner_id=self._lifecycle_owner_id
             )
@@ -1568,6 +1862,7 @@ class KnowledgeBaseManager:
             record = await self.catalog_provider.get_record(
                 claim.workspace_id, include_tombstoned=True
             )
+            workspace_id = record.id
             record = await self.catalog_provider.transition_record(
                 record.id,
                 expected_revision=record.revision,
@@ -1582,10 +1877,6 @@ class KnowledgeBaseManager:
             )
             async with self._manager_lock:
                 context = self._contexts.get(record.id)
-                if context is not None and context.active_requests:
-                    raise KnowledgeBaseConflictError(
-                        f"Knowledge base {record.id!r} has active requests"
-                    )
                 if context is None:
                     profile = self._profile_for(record)
                     self.side_effect_counters.instance_constructions += 1
@@ -1704,7 +1995,19 @@ class KnowledgeBaseManager:
                         )
                     self._initialized_ids.discard(record.id)
                     self._contexts.pop(record.id, None)
-                self._deleting_ids.discard(record.id)
+            if workspace_id is not None:
+                self._deleting_ids.discard(workspace_id)
+                try:
+                    if context is None:
+                        await self.instance_pool.cancel_delete(workspace_id)
+                    else:
+                        await self.instance_pool.forget(workspace_id)
+                except WorkspacePoolBusyError as pool_error:
+                    logger.error(
+                        "Failed to forget deleted workspace %s pool entry: %s",
+                        workspace_id,
+                        pool_error,
+                    )
 
     async def delete(self, knowledge_base_id: str) -> KnowledgeBaseRecord:
         if not self.multi_workspace_enabled:
@@ -1784,6 +2087,7 @@ class KnowledgeBaseManager:
         if lifecycle_tasks:
             await asyncio.gather(*lifecycle_tasks, return_exceptions=True)
         self._lifecycle_tasks.clear()
+        errors.extend(await self.instance_pool.finalize_all())
         for knowledge_base_id, context in list(self._contexts.items()):
             if knowledge_base_id not in self._initialized_ids:
                 continue

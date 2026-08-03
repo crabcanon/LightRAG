@@ -74,7 +74,7 @@ from lightrag.api.routers.knowledge_base_routes import (
 )
 from lightrag.api.knowledge_bases import (
     DEFAULT_KNOWLEDGE_BASE_ID,
-    KnowledgeBaseHeader,
+    KNOWLEDGE_BASE_HEADER,
     KnowledgeBaseCatalog,
     KnowledgeBaseConflictError,
     KnowledgeBaseManager,
@@ -2383,12 +2383,44 @@ def create_app(args):
         max_loaded_instances=int(
             os.getenv("LIGHTRAG_MAX_LOADED_KNOWLEDGE_BASES", "32")
         ),
+        max_loaded_resource_weight=int(
+            os.getenv(
+                "LIGHTRAG_WORKSPACE_POOL_MAX_WEIGHT",
+                os.getenv("LIGHTRAG_MAX_LOADED_KNOWLEDGE_BASES", "32"),
+            )
+        ),
         multi_workspace_enabled=workspace_deployment.multi_workspace_enabled,
+        allow_non_default_writes=os.getenv(
+            "LIGHTRAG_ENABLE_NON_DEFAULT_WRITES", "false"
+        )
+        .strip()
+        .lower()
+        == "true",
     )
     app.state.knowledge_base_manager = knowledge_base_manager
     app.state.catalog_provider = knowledge_base_catalog
     app.state.workspace_deployment = workspace_deployment
     app.state.workspace_override_audit = workspace_override_audit
+
+    @app.middleware("http")
+    async def publish_resolved_knowledge_base(request: Request, call_next):
+        response = await call_next(request)
+        selected = getattr(request.state, "knowledge_base", None)
+        if (
+            200 <= response.status_code < 400
+            and isinstance(selected, dict)
+            and selected.get("id")
+        ):
+            response.headers[KNOWLEDGE_BASE_HEADER] = str(selected["id"])
+            vary = [
+                item.strip()
+                for item in response.headers.get("Vary", "").split(",")
+                if item.strip()
+            ]
+            if not any(item.lower() == KNOWLEDGE_BASE_HEADER.lower() for item in vary):
+                vary.append(KNOWLEDGE_BASE_HEADER)
+            response.headers["Vary"] = ", ".join(vary)
+        return response
 
     # Add routes
     # root_path is set on the app for reverse proxy support;
@@ -2588,6 +2620,38 @@ def create_app(args):
         }
 
     @app.get(
+        "/ready",
+        dependencies=[Depends(combined_auth)],
+        summary="Check control-plane readiness without loading a workspace",
+    )
+    async def get_readiness():
+        """Read catalog and pool snapshots without instance lifecycle effects."""
+
+        before = knowledge_base_manager.side_effect_counters.snapshot()
+        try:
+            default_record = await knowledge_base_catalog.get_record(
+                DEFAULT_KNOWLEDGE_BASE_ID, include_tombstoned=True
+            )
+        except Exception as exc:
+            logger.warning("Readiness catalog probe failed: %s", type(exc).__name__)
+            raise HTTPException(
+                status_code=503,
+                detail={"status": "not_ready", "catalog": "unavailable"},
+                headers={"Retry-After": "1"},
+            ) from exc
+        after = knowledge_base_manager.side_effect_counters.snapshot()
+        if after != before:
+            raise RuntimeError("Readiness probe caused a workspace lifecycle effect")
+        return {
+            "status": "ready",
+            "catalog": "available",
+            "default_lifecycle_state": default_record.lifecycle_state,
+            "workspace_deployment": workspace_deployment.public_dict(),
+            "pool": knowledge_base_manager.instance_pool.peek(),
+            "side_effect_counters": after,
+        }
+
+    @app.get(
         "/health",
         dependencies=[Depends(combined_auth)],
         summary="Get system health and configuration status",
@@ -2651,7 +2715,6 @@ def create_app(args):
     async def get_status(
         request: Request,
         authenticated: bool = Depends(auth_status),
-        knowledge_base_id: KnowledgeBaseHeader = None,
     ):
         """Get current system status including WebUI availability.
 
@@ -2660,9 +2723,10 @@ def create_app(args):
         caller is authenticated (see get_auth_status_dependency).
         """
         try:
-            selected_context = await knowledge_base_manager.get_context(
-                knowledge_base_id
-            )
+            # Liveness never interprets a workspace selector and never acquires
+            # or constructs a pooled instance. The startup-pinned default is a
+            # read-only diagnostic snapshot here.
+            selected_context = knowledge_base_manager.default_context
             selected_rag = selected_context.rag
             selected_record = selected_context.metadata
             workspace = selected_record.effective_workspace

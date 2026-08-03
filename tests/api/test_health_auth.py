@@ -20,7 +20,7 @@ import sys
 from unittest.mock import AsyncMock
 
 import pytest
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.testclient import TestClient
 
 # Fields that must NEVER appear in an unauthenticated response.
@@ -65,8 +65,18 @@ def _isolate_env(monkeypatch):
 class _FakeLightRAG:
     """Minimal stand-in implementing the async surface /health touches."""
 
-    def __init__(self, *_args, **_kwargs):
-        pass
+    def __init__(self, *_args, **kwargs):
+        self.workspace = kwargs.get("workspace", "")
+        self.initialized = False
+
+    async def initialize_storages(self):
+        self.initialized = True
+
+    async def check_and_migrate_data(self):
+        return None
+
+    async def finalize_storages(self):
+        self.initialized = False
 
     def register_role_llm_builder(self, _builder):
         return None
@@ -208,17 +218,20 @@ def test_health_reads_pipeline_status_with_one_snapshot(monkeypatch):
     assert status.copy_calls == 1
 
 
-def test_health_rejects_unknown_knowledge_base_with_404(monkeypatch):
+def test_health_ignores_workspace_selector_without_side_effects(monkeypatch):
     client = _build_client(monkeypatch)
     _set_auth_mode(monkeypatch, auth_configured=False)
+    manager = client.app.state.knowledge_base_manager
+    before = manager.side_effect_counters.snapshot()
 
     response = client.get("/health", headers={"LIGHTRAG-KNOWLEDGE-BASE": "kb_missing"})
 
-    assert response.status_code == 404
-    assert "does not exist" in response.json()["detail"]
+    assert response.status_code == 200
+    assert response.json()["knowledge_base_id"] == "default"
+    assert manager.side_effect_counters.snapshot() == before
 
 
-def test_health_openapi_publishes_knowledge_base_header(monkeypatch):
+def test_health_openapi_does_not_publish_workspace_selector(monkeypatch):
     client = _build_client(monkeypatch)
     operation = client.get("/openapi.json").json()["paths"]["/health"]["get"]
     parameters = [
@@ -228,9 +241,37 @@ def test_health_openapi_publishes_knowledge_base_header(monkeypatch):
         and parameter.get("name") == "LIGHTRAG-KNOWLEDGE-BASE"
     ]
 
-    assert len(parameters) == 1
-    assert parameters[0]["required"] is False
-    assert "GET /knowledge-bases" in parameters[0]["description"]
+    assert parameters == []
+
+
+def test_ready_reads_catalog_and_pool_without_lifecycle_side_effects(monkeypatch):
+    client = _build_client(monkeypatch)
+    manager = client.app.state.knowledge_base_manager
+    before = manager.side_effect_counters.snapshot()
+
+    response = client.get("/ready")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ready"
+    assert response.json()["pool"]["loaded_entries"] == 0
+    assert manager.side_effect_counters.snapshot() == before
+
+
+def test_data_response_publishes_resolved_workspace_and_vary(monkeypatch):
+    client = _build_client(monkeypatch)
+    manager = client.app.state.knowledge_base_manager
+
+    @client.app.get(
+        "/resolved-probe", dependencies=[Depends(manager.request_dependency)]
+    )
+    async def resolved_probe():
+        return {"workspace": manager.rag_proxy.workspace}
+
+    response = client.get("/resolved-probe")
+
+    assert response.status_code == 200
+    assert response.headers["LIGHTRAG-KNOWLEDGE-BASE"] == "default"
+    assert "LIGHTRAG-KNOWLEDGE-BASE" in response.headers["Vary"]
 
 
 # --------------------------------------------------------------------------- #

@@ -5817,10 +5817,21 @@ def create_document_routes(
                 get_namespace_lock,
                 get_all_update_flags_status,
             )
+            from lightrag.exceptions import PipelineNotInitializedError
 
-            pipeline_status = await get_namespace_data(
-                "pipeline_status", workspace=rag.workspace
-            )
+            try:
+                pipeline_status = await get_namespace_data(
+                    "pipeline_status", workspace=rag.workspace
+                )
+            except PipelineNotInitializedError:
+                if getattr(rag, "runtime_state", None) != "UNLOADED":
+                    raise
+                return PipelineStatusResponse(
+                    runtime_state="UNLOADED",
+                    latest_message="Workspace runtime is not loaded",
+                    history_messages=[],
+                    update_status={},
+                )
             pipeline_status_lock = get_namespace_lock(
                 "pipeline_status", workspace=rag.workspace
             )
@@ -5865,6 +5876,7 @@ def create_document_routes(
                 status_dict.pop(_internal_field, None)
 
             status_dict.update(fence_view)
+            status_dict["runtime_state"] = getattr(rag, "runtime_state", "READY")
 
             # Add processed update_status to the status dictionary
             status_dict["update_status"] = processed_update_status

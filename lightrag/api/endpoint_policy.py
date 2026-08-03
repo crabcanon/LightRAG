@@ -62,7 +62,7 @@ def _policies() -> dict[str, EndpointPolicy]:
         "webui_redirect_to_docs",
     }
     liveness = {"get_status", "get_version"}
-    control_observation = {"get_tags", "get_running_models"}
+    control_observation = {"get_tags", "get_running_models", "get_readiness"}
     management_read = {
         "list_knowledge_bases",
         "get_knowledge_base",

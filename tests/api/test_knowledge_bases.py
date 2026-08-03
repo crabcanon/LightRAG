@@ -1,14 +1,16 @@
 """Regression tests for request-scoped knowledge-base isolation."""
 
 import asyncio
+from dataclasses import replace
 import importlib
 import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
+from starlette.responses import StreamingResponse
 import pytest
 
 from lightrag.api.knowledge_bases import (
@@ -111,6 +113,8 @@ def _manager(
     active_storage_implementations=None,
     multi_workspace_enabled: bool = True,
     rag_factory=None,
+    max_loaded_instances: int = 32,
+    allow_non_default_writes: bool = True,
 ) -> KnowledgeBaseManager:
     catalog = KnowledgeBaseCatalog(
         tmp_path / "rag" / "knowledge_bases.json", default_workspace
@@ -142,6 +146,8 @@ def _manager(
             )
         ),
         multi_workspace_enabled=multi_workspace_enabled,
+        max_loaded_instances=max_loaded_instances,
+        allow_non_default_writes=allow_non_default_writes,
     )
 
 
@@ -284,6 +290,105 @@ def test_graph_route_uses_header_and_defaults_without_header(tmp_path: Path):
         ).status_code
         == 404
     )
+
+
+def test_selector_matrix_is_fail_closed_and_never_falls_back(
+    tmp_path: Path,
+):
+    manager = _manager(tmp_path)
+    app = FastAPI()
+    app.include_router(
+        create_graph_routes(
+            manager.rag_proxy,
+            context_dependency=manager.request_dependency,
+        )
+    )
+    client = TestClient(app)
+
+    assert client.get("/graph/label/list").status_code == 200
+    for selector in ("", "   ", "bad/value", "@legacy-default"):
+        response = client.get(
+            "/graph/label/list", headers={KNOWLEDGE_BASE_HEADER: selector}
+        )
+        assert response.status_code == 400, (selector, response.text)
+    assert (
+        client.get(
+            "/graph/label/list",
+            headers={KNOWLEDGE_BASE_HEADER: "kb_unknown"},
+        ).status_code
+        == 404
+    )
+
+    expected_status = {
+        "CREATING": 503,
+        "MIGRATING": 503,
+        "ERROR": 503,
+        "DELETING": 409,
+        "TOMBSTONED": 404,
+    }
+    for state, status_code in expected_status.items():
+        record = manager.create(
+            name=state, isolation_level="logical", storage_profile_id=None
+        )
+        manager.catalog._records[record.id] = replace(record, lifecycle_state=state)
+        response = client.get(
+            "/graph/label/list",
+            headers={KNOWLEDGE_BASE_HEADER: record.id},
+        )
+        assert response.status_code == status_code, (state, response.text)
+        if status_code == 503:
+            assert response.headers["retry-after"] == "1"
+
+
+def test_non_default_write_is_feature_gated_before_instance_load(tmp_path: Path):
+    manager = _manager(tmp_path, allow_non_default_writes=False)
+    isolated = manager.create(
+        name="Write gated", isolation_level="logical", storage_profile_id=None
+    )
+    app = FastAPI()
+
+    @app.post("/test-write", name="clear_cache")
+    async def gated_write(_: None = Depends(manager.request_dependency)):
+        return {"ok": True}
+
+    client = TestClient(app)
+    assert client.post("/test-write").status_code == 200
+    before = manager.side_effect_counters.snapshot()
+    response = client.post("/test-write", headers={KNOWLEDGE_BASE_HEADER: isolated.id})
+
+    assert response.status_code == 503
+    assert "disabled" in response.json()["detail"]
+    assert "retry-after" not in response.headers
+    assert manager.side_effect_counters.snapshot() == before
+
+
+def test_request_proxy_does_not_fallback_without_a_multi_workspace_context(
+    tmp_path: Path,
+):
+    manager = _manager(tmp_path)
+    with pytest.raises(Exception, match="explicit leased context"):
+        _ = manager.rag_proxy.workspace
+
+
+def test_stream_lease_is_held_until_response_body_finishes(tmp_path: Path):
+    manager = _manager(tmp_path)
+    observed_stream_leases: list[int] = []
+    app = FastAPI()
+
+    @app.get("/query/stream", dependencies=[Depends(manager.request_dependency)])
+    async def stream_probe():
+        async def body():
+            entry = manager.instance_pool.peek("default")["entries"][0]
+            observed_stream_leases.append(entry["stream_leases"])
+            yield b"ok\n"
+
+        return StreamingResponse(body(), media_type="application/x-ndjson")
+
+    response = TestClient(app).get("/query/stream")
+
+    assert response.status_code == 200
+    assert observed_stream_leases == [1]
+    assert manager.instance_pool.peek("default")["entries"][0]["stream_leases"] == 0
 
 
 def test_openapi_publishes_header_on_every_data_plane_operation(tmp_path: Path):
@@ -561,6 +666,113 @@ async def test_side_effect_counters_expose_construction_init_and_migration(
         "storage_initializations": 2,
         "migrations": 2,
     }
+
+
+@pytest.mark.asyncio
+async def test_data_plane_pool_initialization_does_not_run_first_access_migration(
+    tmp_path: Path,
+):
+    manager = _manager(tmp_path)
+    await manager.initialize()
+    created = manager.create(
+        name="Read-only load", isolation_level="logical", storage_profile_id=None
+    )
+
+    async with manager.bind_request(created.id) as execution:
+        assert execution.binding.canonical_key == created.id
+        assert manager.rag_proxy.workspace == created.effective_workspace
+
+    assert manager.side_effect_counters.snapshot() == {
+        "instance_constructions": 1,
+        "storage_initializations": 2,
+        "migrations": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_manager_pool_evicts_only_idle_workspace_and_never_overcommits(
+    tmp_path: Path,
+):
+    manager = _manager(tmp_path, max_loaded_instances=2)
+    await manager.initialize()
+    first = manager.create(
+        name="First pooled", isolation_level="logical", storage_profile_id=None
+    )
+    second = manager.create(
+        name="Second pooled", isolation_level="logical", storage_profile_id=None
+    )
+
+    async with manager.bind_request(first.id) as first_context:
+        with pytest.raises(Exception, match="no idle victim"):
+            async with manager.bind_request(second.id):
+                pass
+        first_rag = first_context.rag
+
+    async with manager.bind_request(second.id):
+        pass
+    assert first_rag.finalized is True
+    pool = manager.instance_pool.peek()
+    assert pool["loaded_entries"] == 2
+    assert {entry["workspace_id"] for entry in pool["entries"]} == {
+        "default",
+        second.id,
+    }
+
+
+@pytest.mark.asyncio
+async def test_observation_context_reports_unloaded_without_side_effects(
+    tmp_path: Path,
+):
+    manager = _manager(tmp_path)
+    await manager.initialize()
+    record = manager.create(
+        name="Observe only", isolation_level="logical", storage_profile_id=None
+    )
+    before = manager.side_effect_counters.snapshot()
+
+    async with manager.bind_observation(record.id):
+        assert manager.rag_proxy.workspace == record.effective_workspace
+        assert manager.rag_proxy.runtime_state == "UNLOADED"
+
+    assert manager.side_effect_counters.snapshot() == before
+    assert manager.instance_pool.peek(record.id)["entries"] == []
+
+
+def test_pipeline_observation_returns_unloaded_without_constructing_instance(
+    monkeypatch, tmp_path: Path
+):
+    from lightrag.exceptions import PipelineNotInitializedError
+
+    manager = _manager(tmp_path)
+    record = manager.create(
+        name="Pipeline observation", isolation_level="logical", storage_profile_id=None
+    )
+
+    async def missing_pipeline_status(*_args, **_kwargs):
+        raise PipelineNotInitializedError("missing:pipeline_status")
+
+    monkeypatch.setattr(
+        "lightrag.kg.shared_storage.get_namespace_data", missing_pipeline_status
+    )
+    app = FastAPI()
+    app.include_router(
+        create_document_routes(
+            manager.rag_proxy,
+            manager.document_manager_proxy,
+            context_dependency=manager.request_dependency,
+        )
+    )
+    before = manager.side_effect_counters.snapshot()
+
+    response = TestClient(app).get(
+        "/documents/pipeline_status",
+        headers={KNOWLEDGE_BASE_HEADER: record.id},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["runtime_state"] == "UNLOADED"
+    assert manager.side_effect_counters.snapshot() == before
+    assert manager.instance_pool.peek(record.id)["entries"] == []
 
 
 @pytest.mark.asyncio
