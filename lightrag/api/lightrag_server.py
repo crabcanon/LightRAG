@@ -92,6 +92,7 @@ from lightrag.api.workspace_config import (
     CatalogProviderKind,
     CoordinatorProviderKind,
     WorkspaceDeploymentError,
+    resolve_non_default_writes,
     resolve_workspace_deployment,
 )
 from lightrag.api.workspace_coordinator import (
@@ -2424,12 +2425,7 @@ def create_app(args):
             )
         ),
         multi_workspace_enabled=workspace_deployment.multi_workspace_enabled,
-        allow_non_default_writes=os.getenv(
-            "LIGHTRAG_ENABLE_NON_DEFAULT_WRITES", "false"
-        )
-        .strip()
-        .lower()
-        == "true",
+        allow_non_default_writes=resolve_non_default_writes(workspace_deployment),
         workspace_coordinator=workspace_coordinator,
     )
     app.state.knowledge_base_manager = knowledge_base_manager

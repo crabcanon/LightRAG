@@ -146,3 +146,31 @@ def resolve_workspace_deployment(
             "Single-worker multi-workspace mode requires the local coordinator"
         )
     return config
+
+
+def resolve_non_default_writes(
+    config: WorkspaceDeploymentConfig,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> bool:
+    """Resolve the post-Phase-5 write gate without changing legacy mode.
+
+    The fully verified single-worker coordinator path is enabled by default.
+    Same-host multi-worker remains opt-in until its PostgreSQL/Gunicorn fault
+    suite has run in a supported POSIX deployment environment.
+    """
+
+    if not config.multi_workspace_enabled:
+        return False
+    environ = os.environ if environment is None else environment
+    raw = environ.get("LIGHTRAG_ENABLE_NON_DEFAULT_WRITES")
+    if raw is None:
+        return config.workers == 1
+    normalized = raw.strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off"}:
+        return False
+    raise WorkspaceDeploymentError(
+        "LIGHTRAG_ENABLE_NON_DEFAULT_WRITES must be a boolean value"
+    )

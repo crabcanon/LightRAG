@@ -10,6 +10,7 @@ from lightrag.api.workspace_config import (
     CoordinatorProviderKind,
     MultiWorkspaceMode,
     WorkspaceDeploymentError,
+    resolve_non_default_writes,
     resolve_workspace_deployment,
 )
 from lightrag.kg.storage_profiles import StorageWorkspaceConsistencyError
@@ -164,6 +165,51 @@ def test_legacy_mode_rejects_stray_shared_provider_configuration() -> None:
 def test_worker_count_must_be_positive() -> None:
     with pytest.raises(WorkspaceDeploymentError, match="workers must be at least 1"):
         resolve_workspace_deployment(workers=0, environment={})
+
+
+def test_verified_single_worker_multi_mode_opens_writes_by_default() -> None:
+    config = resolve_workspace_deployment(
+        workers=1,
+        environment={"LIGHTRAG_MULTI_WORKSPACE_MODE": "multi"},
+    )
+
+    assert resolve_non_default_writes(config, environment={}) is True
+    assert (
+        resolve_non_default_writes(
+            config, environment={"LIGHTRAG_ENABLE_NON_DEFAULT_WRITES": "false"}
+        )
+        is False
+    )
+
+
+def test_same_host_multi_worker_writes_remain_explicit_opt_in() -> None:
+    config = resolve_workspace_deployment(
+        workers=2,
+        environment={
+            "LIGHTRAG_MULTI_WORKSPACE_MODE": "multi",
+            "LIGHTRAG_KNOWLEDGE_BASE_CATALOG_PROVIDER": "postgres",
+            "LIGHTRAG_WORKSPACE_COORDINATOR_PROVIDER": "manager",
+        },
+    )
+
+    assert resolve_non_default_writes(config, environment={}) is False
+    assert (
+        resolve_non_default_writes(
+            config, environment={"LIGHTRAG_ENABLE_NON_DEFAULT_WRITES": "true"}
+        )
+        is True
+    )
+
+
+def test_invalid_non_default_write_gate_fails_closed() -> None:
+    config = resolve_workspace_deployment(
+        workers=1,
+        environment={"LIGHTRAG_MULTI_WORKSPACE_MODE": "multi"},
+    )
+    with pytest.raises(WorkspaceDeploymentError, match="must be a boolean"):
+        resolve_non_default_writes(
+            config, environment={"LIGHTRAG_ENABLE_NON_DEFAULT_WRITES": "maybe"}
+        )
 
 
 def test_server_rejects_override_before_creating_catalog_artifacts(
