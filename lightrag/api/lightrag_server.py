@@ -79,6 +79,7 @@ from lightrag.api.knowledge_bases import (
     KnowledgeBaseConflictError,
     KnowledgeBaseManager,
     KnowledgeBaseNotFoundError,
+    OllamaSelectorError,
     KnowledgeBaseRecord,
     StorageProfileError,
     storage_profiles_path_from_env,
@@ -1509,6 +1510,16 @@ def create_app(args):
 
     app = FastAPI(**app_kwargs)
 
+    @app.exception_handler(OllamaSelectorError)
+    async def ollama_selector_exception_handler(
+        _request: Request, exc: OllamaSelectorError
+    ):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": exc.message, "code": exc.code},
+            headers=exc.headers,
+        )
+
     # Add custom validation error handler for /query/data endpoint
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(
@@ -2427,6 +2438,7 @@ def create_app(args):
         multi_workspace_enabled=workspace_deployment.multi_workspace_enabled,
         allow_non_default_writes=resolve_non_default_writes(workspace_deployment),
         workspace_coordinator=workspace_coordinator,
+        ollama_model_name=ollama_server_infos.LIGHTRAG_MODEL,
     )
     app.state.knowledge_base_manager = knowledge_base_manager
     app.state.catalog_provider = knowledge_base_catalog
@@ -2495,6 +2507,7 @@ def create_app(args):
         top_k=args.top_k,
         api_key=api_key,
         context_dependency=knowledge_base_manager.request_dependency,
+        model_alias_provider=knowledge_base_manager.list_ollama_workspace_ids,
     )
     app.include_router(ollama_api.router, prefix="/api")
 

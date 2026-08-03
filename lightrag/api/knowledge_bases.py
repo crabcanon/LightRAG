@@ -55,6 +55,7 @@ from lightrag.api.workspace_recovery import (
     WorkspaceRecoveryCoordinator,
     WorkspaceRecoveryReport,
 )
+from lightrag.constants import MAX_MODEL_NAME_CHARS
 from lightrag.exceptions import PipelineNotInitializedError
 from lightrag.file_atomic import atomic_write
 from lightrag.kg.shared_storage import get_namespace_data
@@ -145,6 +146,41 @@ class KnowledgeBaseUnavailableError(KnowledgeBaseError):
 
 class StorageProfileError(KnowledgeBaseError):
     """Raised when strict physical isolation cannot be guaranteed."""
+
+
+class OllamaSelectorError(HTTPException):
+    """An Ollama model/header selector failed before instance loading."""
+
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(status_code=status_code, detail=message, headers=headers)
+
+
+def resolve_ollama_model_alias(model: str, configured_model: str) -> str:
+    """Map one Ollama model name to a public knowledge-base ID."""
+
+    if not isinstance(model, str) or not model.strip():
+        raise OllamaSelectorError(400, "invalid_model", "Model must be a string")
+    if len(model) > MAX_MODEL_NAME_CHARS:
+        raise OllamaSelectorError(400, "invalid_model", "Model name is too long")
+    model = model.strip()
+    if model in {configured_model, "lightrag:latest", "lightrag:default"}:
+        return DEFAULT_KNOWLEDGE_BASE_ID
+    if not model.startswith("lightrag:"):
+        raise OllamaSelectorError(404, "model_not_found", "Model not found")
+    workspace_id = model.removeprefix("lightrag:")
+    try:
+        return validate_knowledge_base_id(workspace_id)
+    except ValueError as exc:
+        raise OllamaSelectorError(404, "model_not_found", "Model not found") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -1015,9 +1051,22 @@ class KnowledgeBaseManager:
         multi_workspace_enabled: bool = True,
         allow_non_default_writes: bool = True,
         workspace_coordinator: WorkspaceCoordinator | None = None,
+        ollama_model_name: str = "lightrag:latest",
     ) -> None:
         if max_loaded_instances < 1:
             raise ValueError("max_loaded_instances must be at least 1")
+        ollama_model_name = ollama_model_name.strip()
+        if not ollama_model_name or len(ollama_model_name) > MAX_MODEL_NAME_CHARS:
+            raise ValueError("Ollama emulated model name is invalid")
+        if (
+            multi_workspace_enabled
+            and ollama_model_name.startswith("lightrag:")
+            and ollama_model_name not in {"lightrag:latest", "lightrag:default"}
+        ):
+            raise ValueError(
+                "Ollama emulated model name conflicts with the reserved "
+                "lightrag:<knowledge-base-id> alias namespace"
+            )
         if isinstance(catalog, CatalogProvider):
             self.catalog_provider = catalog
             self.catalog = getattr(catalog, "catalog", catalog)
@@ -1044,6 +1093,7 @@ class KnowledgeBaseManager:
         self._max_loaded_instances = max_loaded_instances
         self.multi_workspace_enabled = multi_workspace_enabled
         self.allow_non_default_writes = allow_non_default_writes
+        self.ollama_model_name = ollama_model_name
         self.workspace_coordinator = (
             workspace_coordinator or LocalWorkspaceCoordinator()
         )
@@ -1611,9 +1661,16 @@ class KnowledgeBaseManager:
         request: Request,
         knowledge_base_id: KnowledgeBaseHeader = None,
     ) -> AsyncIterator[None]:
+        route_name: str | None = None
+        is_ollama_data_route = False
         try:
             route = request.scope.get("route")
             route_name = getattr(route, "name", None)
+            is_ollama_data_route = route_name in {"chat", "generate"}
+            if is_ollama_data_route:
+                knowledge_base_id = await self._resolve_ollama_request_selector(
+                    request, knowledge_base_id
+                )
             endpoint_policy = ENDPOINT_POLICIES.get(route_name)
             normalized = validate_knowledge_base_id(knowledge_base_id)
             if (
@@ -1661,18 +1718,41 @@ class KnowledgeBaseManager:
                 request.state.knowledge_base = context.metadata.public_dict()
                 yield
         except ValueError as exc:
+            if is_ollama_data_route:
+                raise OllamaSelectorError(
+                    400, "invalid_selector", "Invalid knowledge-base selector"
+                ) from exc
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except KnowledgeBaseNotFoundError as exc:
+            if is_ollama_data_route:
+                raise OllamaSelectorError(
+                    404, "model_not_found", "Model not found"
+                ) from exc
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except KnowledgeBaseConflictError as exc:
+            if is_ollama_data_route:
+                raise OllamaSelectorError(
+                    409, "workspace_conflict", "Selected model is unavailable"
+                ) from exc
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except KnowledgeBaseUnavailableError as exc:
+            if is_ollama_data_route:
+                raise OllamaSelectorError(
+                    503, "workspace_unavailable", "Selected model is unavailable"
+                ) from exc
             raise HTTPException(
                 status_code=503,
                 detail=str(exc),
                 headers={"Retry-After": "1"} if exc.retryable else None,
             ) from exc
         except WorkspacePoolCapacityError as exc:
+            if is_ollama_data_route:
+                raise OllamaSelectorError(
+                    503,
+                    "workspace_capacity_exhausted",
+                    "Selected model is temporarily unavailable",
+                    headers={"Retry-After": "1"},
+                ) from exc
             raise HTTPException(
                 status_code=503,
                 detail={
@@ -1682,13 +1762,89 @@ class KnowledgeBaseManager:
                 headers={"Retry-After": "1"},
             ) from exc
         except (WorkspacePoolBusyError, WorkspacePoolInitializationError) as exc:
+            if is_ollama_data_route:
+                raise OllamaSelectorError(
+                    503,
+                    "workspace_unavailable",
+                    "Selected model is temporarily unavailable",
+                    headers={"Retry-After": "1"},
+                ) from exc
             raise HTTPException(
                 status_code=503,
                 detail=str(exc),
                 headers={"Retry-After": "1"},
             ) from exc
         except StorageProfileError as exc:
+            if is_ollama_data_route:
+                raise OllamaSelectorError(
+                    503,
+                    "workspace_unavailable",
+                    "Selected model is unavailable",
+                ) from exc
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    async def _resolve_ollama_request_selector(
+        self,
+        request: Request,
+        header_selector: str | None,
+    ) -> str:
+        try:
+            body = await request.json()
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise OllamaSelectorError(
+                400, "invalid_request", "Invalid JSON request body"
+            ) from exc
+        if not isinstance(body, Mapping):
+            raise OllamaSelectorError(
+                400, "invalid_request", "Request body must be a JSON object"
+            )
+        model = body.get("model")
+        if not isinstance(model, str):
+            raise OllamaSelectorError(
+                400, "invalid_model", "Request body must contain a model"
+            )
+        model_workspace_id = resolve_ollama_model_alias(model, self.ollama_model_name)
+        if header_selector is None:
+            return model_workspace_id
+        try:
+            header_workspace_id = validate_knowledge_base_id(header_selector)
+        except ValueError as exc:
+            raise OllamaSelectorError(
+                400, "invalid_selector", "Invalid knowledge-base selector"
+            ) from exc
+        if header_workspace_id != model_workspace_id:
+            raise OllamaSelectorError(
+                400,
+                "selector_conflict",
+                "Model and knowledge-base header select different workspaces",
+            )
+        return model_workspace_id
+
+    async def list_ollama_workspace_ids(
+        self, *, running_only: bool = False
+    ) -> list[str]:
+        """Observe ACTIVE model aliases without constructing an instance."""
+
+        limit = int(os.getenv("LIGHTRAG_OLLAMA_MAX_ALIASES", "1000") or "1000")
+        if not 1 <= limit <= 1000:
+            raise ValueError("LIGHTRAG_OLLAMA_MAX_ALIASES must be between 1 and 1000")
+        page = await self.catalog_provider.list_records(
+            limit=limit,
+            states=(WorkspaceLifecycleState.ACTIVE,),
+        )
+        workspace_ids = [record.id for record in page.records]
+        if not self.multi_workspace_enabled:
+            workspace_ids = [
+                item for item in workspace_ids if item == DEFAULT_KNOWLEDGE_BASE_ID
+            ]
+        if not running_only:
+            return workspace_ids
+        loaded_ids = {
+            entry["workspace_id"]
+            for entry in self.instance_pool.peek()["entries"]
+            if entry["catalog_revision"] is not None
+        }
+        return [item for item in workspace_ids if item in loaded_ids]
 
     def create(
         self,

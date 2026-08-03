@@ -8,9 +8,9 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
 from fastapi.testclient import TestClient
-from starlette.responses import StreamingResponse
+from starlette.responses import JSONResponse, StreamingResponse
 import pytest
 
 from lightrag.api.catalog import CatalogCASConflict, CatalogOperationState
@@ -21,8 +21,11 @@ from lightrag.api.knowledge_bases import (
     KnowledgeBaseConflictError,
     KnowledgeBaseError,
     KnowledgeBaseManager,
+    OllamaSelectorError,
     StorageProfileError,
+    resolve_ollama_model_alias,
 )
+from lightrag.base import OllamaServerInfos
 from lightrag.kg.shared_storage import start_reserved_background_task
 from lightrag.workspace import (
     LEGACY_DEFAULT_CANONICAL_KEY,
@@ -67,7 +70,14 @@ class _FakeRag:
         self.initialized = False
         self.finalized = False
         self.pipeline_recoveries = 0
-        self.ollama_server_infos = SimpleNamespace()
+        self.ollama_server_infos = OllamaServerInfos()
+        self.role_llm_kwargs = {"query": {}}
+        self.llm_model_kwargs = {}
+
+        async def query_llm(*_args, **_kwargs):
+            return self.workspace
+
+        self.role_llm_funcs = {"query": query_llm}
         for attribute in (
             "llm_response_cache",
             "text_chunks",
@@ -99,6 +109,9 @@ class _FakeRag:
     async def get_graph_labels(self) -> list[str]:
         return [self.workspace]
 
+    async def aquery(self, *_args, **_kwargs) -> str:
+        return self.workspace
+
 
 def _document_manager(root: Path, workspace: str):
     input_dir = root / workspace if workspace else root
@@ -121,6 +134,7 @@ def _manager(
     rag_factory=None,
     max_loaded_instances: int = 32,
     allow_non_default_writes: bool = True,
+    ollama_model_name: str = "lightrag:latest",
 ) -> KnowledgeBaseManager:
     catalog = KnowledgeBaseCatalog(
         tmp_path / "rag" / "knowledge_bases.json", default_workspace
@@ -154,6 +168,7 @@ def _manager(
         multi_workspace_enabled=multi_workspace_enabled,
         max_loaded_instances=max_loaded_instances,
         allow_non_default_writes=allow_non_default_writes,
+        ollama_model_name=ollama_model_name,
     )
 
 
@@ -458,6 +473,180 @@ def test_openapi_publishes_header_on_every_data_plane_operation(tmp_path: Path):
                 parameter.get("name") != KNOWLEDGE_BASE_HEADER
                 for parameter in operation.get("parameters", [])
             ), f"{path} must not publish a KB header"
+
+
+def _ollama_test_app(manager: KnowledgeBaseManager) -> FastAPI:
+    app = FastAPI()
+
+    @app.exception_handler(OllamaSelectorError)
+    async def ollama_selector_error(
+        _request: Request, exc: OllamaSelectorError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": exc.message, "code": exc.code},
+            headers=exc.headers,
+        )
+
+    ollama = OllamaAPI(
+        manager.rag_proxy,
+        context_dependency=manager.request_dependency,
+        model_alias_provider=manager.list_ollama_workspace_ids,
+    )
+    app.include_router(ollama.router, prefix="/api")
+    return app
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("lightrag:latest", DEFAULT_KNOWLEDGE_BASE_ID),
+        ("lightrag:default", DEFAULT_KNOWLEDGE_BASE_ID),
+        ("lightrag:project_1", "project_1"),
+    ],
+)
+def test_ollama_model_alias_resolution(model: str, expected: str):
+    assert resolve_ollama_model_alias(model, "lightrag:latest") == expected
+
+
+def test_multi_workspace_rejects_ambiguous_emulated_ollama_model(tmp_path: Path):
+    with pytest.raises(ValueError, match="reserved"):
+        _manager(tmp_path, ollama_model_name="lightrag:project_1")
+
+    legacy = _manager(
+        tmp_path / "legacy",
+        multi_workspace_enabled=False,
+        ollama_model_name="lightrag:project_1",
+    )
+    assert legacy.ollama_model_name == "lightrag:project_1"
+
+
+def test_ollama_model_only_routes_named_workspace_and_rejects_unsafe_selectors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    async def count_tokens(value: str) -> int:
+        return len(value)
+
+    monkeypatch.setattr(_ollama_routes, "aestimate_tokens", count_tokens)
+    manager = _manager(tmp_path)
+    record = manager.create(
+        name="Ollama project", isolation_level="logical", storage_profile_id=None
+    )
+    client = TestClient(_ollama_test_app(manager))
+    alias = f"lightrag:{record.id}"
+    initial_counters = manager.side_effect_counters.snapshot()
+    initial_pool = manager.instance_pool.peek()
+    initial_records = [item.id for item in manager.list_records()]
+
+    unknown = client.post(
+        "/api/chat",
+        json={
+            "model": "lightrag:missing",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": False,
+        },
+    )
+    assert unknown.status_code == 404
+    assert unknown.json() == {"error": "Model not found", "code": "model_not_found"}
+
+    conflict = client.post(
+        "/api/generate",
+        headers={KNOWLEDGE_BASE_HEADER: DEFAULT_KNOWLEDGE_BASE_ID},
+        json={"model": alias, "prompt": "hello", "stream": False},
+    )
+    assert conflict.status_code == 400
+    assert conflict.json() == {
+        "error": "Model and knowledge-base header select different workspaces",
+        "code": "selector_conflict",
+    }
+
+    malformed = client.post(
+        "/api/generate",
+        content=b"{",
+        headers={"Content-Type": "application/json"},
+    )
+    assert malformed.status_code == 400
+    assert malformed.json() == {
+        "error": "Invalid JSON request body",
+        "code": "invalid_request",
+    }
+    assert manager.side_effect_counters.snapshot() == initial_counters
+    assert manager.instance_pool.peek() == initial_pool
+    assert [item.id for item in manager.list_records()] == initial_records
+
+    generated = client.post(
+        "/api/generate",
+        headers={KNOWLEDGE_BASE_HEADER: record.id},
+        json={"model": alias, "prompt": "hello", "stream": False},
+    )
+    assert generated.status_code == 200
+    assert generated.json()["model"] == alias
+    assert generated.json()["response"] == record.effective_workspace
+
+    chatted = client.post(
+        "/api/chat",
+        json={
+            "model": alias,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": False,
+        },
+    )
+    assert chatted.status_code == 200
+    assert chatted.json()["model"] == alias
+    assert chatted.json()["message"]["content"] == record.effective_workspace
+    assert manager.side_effect_counters.instance_constructions == 1
+
+    generated_stream = client.post(
+        "/api/generate",
+        json={"model": alias, "prompt": "hello", "stream": True},
+    )
+    chat_stream = client.post(
+        "/api/chat",
+        json={
+            "model": alias,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+        },
+    )
+    assert generated_stream.status_code == 200
+    assert chat_stream.status_code == 200
+    for response in (generated_stream, chat_stream):
+        chunks = [json.loads(line) for line in response.text.splitlines()]
+        assert chunks
+        assert all(chunk["model"] == alias for chunk in chunks)
+
+    before_ps = manager.side_effect_counters.snapshot()
+    running_aliases = {
+        model["name"] for model in client.get("/api/ps").json()["models"]
+    }
+    assert alias in running_aliases
+    assert manager.side_effect_counters.snapshot() == before_ps
+
+
+def test_ollama_metadata_lists_catalog_aliases_without_loading_instances(
+    tmp_path: Path,
+):
+    manager = _manager(tmp_path)
+    record = manager.create(
+        name="Catalog only", isolation_level="logical", storage_profile_id=None
+    )
+    client = TestClient(_ollama_test_app(manager))
+    before_counters = manager.side_effect_counters.snapshot()
+    before_pool = manager.instance_pool.peek()
+
+    tags_response = client.get("/api/tags")
+    ps_response = client.get("/api/ps")
+
+    assert tags_response.status_code == 200
+    assert {model["name"] for model in tags_response.json()["models"]} >= {
+        "lightrag:latest",
+        "lightrag:default",
+        f"lightrag:{record.id}",
+    }
+    assert ps_response.status_code == 200
+    assert ps_response.json() == {"models": []}
+    assert manager.side_effect_counters.snapshot() == before_counters
+    assert manager.instance_pool.peek() == before_pool
 
 
 def test_management_api_crud_and_default_delete_guard(
