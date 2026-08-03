@@ -54,6 +54,22 @@ def internal_server_error(exc: Exception) -> HTTPException:
             logger.error(traceback.format_exc())
             raise internal_server_error(e)
     """
+    # Service admission is an expected bounded-overload outcome, even when it
+    # bubbles through a route's broad provider-error handler. Preserve its
+    # stable 429/503 contract instead of disguising it as an internal 500.
+    from lightrag.admission import AdmissionRejectedError
+
+    if isinstance(exc, AdmissionRejectedError):
+        return HTTPException(
+            status_code=exc.status_code,
+            detail={
+                "code": exc.code,
+                "resource_group": exc.resource_group,
+                "message": "Service capacity is temporarily unavailable",
+            },
+            headers={"Retry-After": str(exc.retry_after)},
+        )
+
     error_id = uuid.uuid4().hex[:12]
     logger.error(
         f"Returning HTTP 500 to client [error_id={error_id}] ({type(exc).__name__})"

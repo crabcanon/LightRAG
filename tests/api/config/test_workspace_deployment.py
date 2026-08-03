@@ -50,7 +50,7 @@ def test_single_worker_local_multi_workspace_is_supported() -> None:
 def test_local_multi_workspace_fails_closed_with_multiple_workers() -> None:
     with pytest.raises(
         WorkspaceDeploymentError,
-        match="workers > 1 requires the Phase 5 shared coordinator",
+        match="requires the shared PostgreSQL catalog provider",
     ):
         resolve_workspace_deployment(
             workers=2,
@@ -64,9 +64,9 @@ def test_local_multi_workspace_fails_closed_with_multiple_workers() -> None:
         (
             {
                 "LIGHTRAG_MULTI_WORKSPACE_MODE": "multi",
-                "LIGHTRAG_WORKSPACE_COORDINATOR_PROVIDER": "manager",
+                "LIGHTRAG_WORKSPACE_COORDINATOR_PROVIDER": "external",
             },
-            "coordinator provider 'manager' is planned",
+            "coordinator provider 'external' is planned",
         ),
         (
             {"LIGHTRAG_MULTI_WORKSPACE_MODE": "unexpected"},
@@ -92,6 +92,62 @@ def test_postgres_catalog_is_available_for_single_worker_multi_mode() -> None:
 
     assert config.catalog_provider is CatalogProviderKind.POSTGRES
     assert config.coordinator_provider is CoordinatorProviderKind.LOCAL
+
+
+def test_same_host_gunicorn_multi_workspace_combination_is_supported() -> None:
+    config = resolve_workspace_deployment(
+        workers=3,
+        environment={
+            "LIGHTRAG_MULTI_WORKSPACE_MODE": "multi",
+            "LIGHTRAG_KNOWLEDGE_BASE_CATALOG_PROVIDER": "postgres",
+            "LIGHTRAG_WORKSPACE_COORDINATOR_PROVIDER": "manager",
+        },
+    )
+
+    assert config.catalog_provider is CatalogProviderKind.POSTGRES
+    assert config.coordinator_provider is CoordinatorProviderKind.MANAGER
+    assert config.workers == 3
+
+
+@pytest.mark.parametrize(
+    ("environment", "message"),
+    [
+        (
+            {
+                "LIGHTRAG_MULTI_WORKSPACE_MODE": "multi",
+                "LIGHTRAG_KNOWLEDGE_BASE_CATALOG_PROVIDER": "postgres",
+            },
+            "requires the same-host manager coordinator",
+        ),
+        (
+            {
+                "LIGHTRAG_MULTI_WORKSPACE_MODE": "multi",
+                "LIGHTRAG_WORKSPACE_COORDINATOR_PROVIDER": "manager",
+            },
+            "requires the shared PostgreSQL catalog",
+        ),
+    ],
+)
+def test_multi_worker_requires_both_shared_control_plane_providers(
+    environment: dict[str, str], message: str
+) -> None:
+    with pytest.raises(WorkspaceDeploymentError, match=message):
+        resolve_workspace_deployment(workers=2, environment=environment)
+
+
+def test_single_worker_rejects_manager_coordinator() -> None:
+    with pytest.raises(
+        WorkspaceDeploymentError,
+        match="Single-worker multi-workspace mode requires the local coordinator",
+    ):
+        resolve_workspace_deployment(
+            workers=1,
+            environment={
+                "LIGHTRAG_MULTI_WORKSPACE_MODE": "multi",
+                "LIGHTRAG_KNOWLEDGE_BASE_CATALOG_PROVIDER": "postgres",
+                "LIGHTRAG_WORKSPACE_COORDINATOR_PROVIDER": "manager",
+            },
+        )
 
 
 def test_legacy_mode_rejects_stray_shared_provider_configuration() -> None:
@@ -131,7 +187,11 @@ def test_server_rejects_override_before_creating_catalog_artifacts(
     monkeypatch.setenv("LIGHTRAG_ADMIN_API_KEY", "test-admin-key")
     monkeypatch.setenv("REDIS_WORKSPACE", "collapsed")
 
-    from lightrag.api.lightrag_server import create_app
+    try:
+        sys.argv = ["lightrag-server"]
+        from lightrag.api.lightrag_server import create_app
+    finally:
+        sys.argv = original_argv
 
     with pytest.raises(StorageWorkspaceConsistencyError, match="REDIS_WORKSPACE"):
         create_app(args)

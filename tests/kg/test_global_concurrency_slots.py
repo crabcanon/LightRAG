@@ -286,22 +286,31 @@ async def test_longest_live_waiter_gets_priority():
     await ss.try_acquire_global_slot(GROUP)  # saturate
     ns = await _lease_ns()
     now = time.time()
-    # PID 1 (alive) has been waiting longer and is actively polling.
-    state = _gate(ns)
-    state["waiters"]["1"] = {"pid": 1, "wait_start": now - 10, "last_poll": now}
-    _put_gate(ns, state)
+    live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    pid_key = str(live.pid)
+    try:
+        # A confirmed-live process has been waiting longer and is polling.
+        state = _gate(ns)
+        state["waiters"][pid_key] = {
+            "pid": live.pid,
+            "wait_start": now - 10,
+            "last_poll": now,
+        }
+        _put_gate(ns, state)
 
-    _, is_priority = await ss.try_acquire_global_slot_tracked(GROUP)
-    assert is_priority is False  # pid 1 outranks us
+        _, is_priority = await ss.try_acquire_global_slot_tracked(GROUP)
+        assert is_priority is False
 
-    # When pid 1 stops polling (stale last_poll), it loses the favored seat:
-    # the rank ignores it and the reap pass removes its record entirely.
-    state = _gate(ns)
-    state["waiters"]["1"]["last_poll"] = now - ss._waiter_stale_ttl - 5
-    _put_gate(ns, state)
-    _, is_priority = await ss.try_acquire_global_slot_tracked(GROUP)
-    assert is_priority is True
-    assert "1" not in _gate(ns)["waiters"]
+        # A stale poll loses the favored seat and is reaped.
+        state = _gate(ns)
+        state["waiters"][pid_key]["last_poll"] = now - ss._waiter_stale_ttl - 5
+        _put_gate(ns, state)
+        _, is_priority = await ss.try_acquire_global_slot_tracked(GROUP)
+        assert is_priority is True
+        assert pid_key not in _gate(ns)["waiters"]
+    finally:
+        live.terminate()
+        live.wait(timeout=5)
 
 
 async def test_waiter_records_reaped_with_their_process(monkeypatch):
@@ -392,20 +401,25 @@ async def test_aggregate_sums_flat_fields_across_workers():
     _init()
     ns = await ss._get_queue_stats_namespace()
     await ss.publish_queue_stats("agg test", _snapshot(os.getpid()))
-    # PID 1 (init) exists and os.kill(1, 0) raises PermissionError — treated
-    # as alive, standing in for a second worker process.
-    ns[f"agg test{ss.KEY_SEP}1"] = _snapshot(1, queued=2, running=1, completed_total=7)
+    live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        ns[f"agg test{ss.KEY_SEP}{live.pid}"] = _snapshot(
+            live.pid, queued=2, running=1, completed_total=7
+        )
 
-    agg = await ss.aggregate_queue_stats("agg test")
-    assert agg["reporting_workers"] == 2
-    assert agg["queued"] == 3
-    assert agg["running"] == 3
-    assert agg["completed_total"] == 10
-    assert agg["global_slot_waits"] == 10
-    assert set(agg["per_worker"]) == {str(os.getpid()), "1"}
-    # Schema: every flat counter field is present.
-    for field in ss.QUEUE_STATS_SUM_FIELDS:
-        assert field in agg
+        agg = await ss.aggregate_queue_stats("agg test")
+        assert agg["reporting_workers"] == 2
+        assert agg["queued"] == 3
+        assert agg["running"] == 3
+        assert agg["completed_total"] == 10
+        assert agg["global_slot_waits"] == 10
+        assert set(agg["per_worker"]) == {str(os.getpid()), str(live.pid)}
+        # Schema: every flat counter field is present.
+        for field in ss.QUEUE_STATS_SUM_FIELDS:
+            assert field in agg
+    finally:
+        live.terminate()
+        live.wait(timeout=5)
 
 
 async def test_aggregate_reaps_dead_pid_and_stale_entries():

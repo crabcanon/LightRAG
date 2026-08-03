@@ -927,6 +927,8 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     """Placeholder text when file paths exceed max_file_paths limit."""
 
     addon_params: InitVar[dict[str, Any] | None] = None
+    resource_admission_controller: InitVar[Any | None] = None
+    resource_admission_workspace_id: InitVar[str | None] = None
     _addon_params: ObservableAddonParams = field(
         default_factory=ObservableAddonParams,
         init=False,
@@ -1226,7 +1228,12 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             "host": metadata.get("host"),
         }
 
-    def __post_init__(self, addon_params: dict[str, Any] | None):
+    def __post_init__(
+        self,
+        addon_params: dict[str, Any] | None,
+        resource_admission_controller: Any | None,
+        resource_admission_workspace_id: str | None,
+    ):
         from lightrag.kg.shared_storage import (
             initialize_share_data,
         )
@@ -1250,6 +1257,15 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 "A named LightRAG instance workspace must equal its immutable "
                 "binding's physical workspace"
             )
+
+        # InitVars deliberately keep the live controller (which owns asyncio
+        # synchronization state) out of dataclasses.asdict/deepcopy and storage
+        # global_config. API instances receive one shared controller; ordinary
+        # library instances keep the existing per-instance queues unchanged.
+        self._resource_admission_controller = resource_admission_controller
+        self._resource_admission_workspace_id = (
+            resource_admission_workspace_id or self.workspace_binding.public_id
+        )
 
         self._replace_addon_params(addon_params, mark_dirty=False)
         self._apply_chunk_size_overlay()
@@ -1344,12 +1360,24 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             )
 
         if self.rerank_model_func is not None:
+            rerank_func = self.rerank_model_func
+            if self._resource_admission_controller is not None:
+                rerank_func = self._resource_admission_controller.wrap(
+                    rerank_func,
+                    group="rerank",
+                    workspace_id=self._resource_admission_workspace_id,
+                    default_operation_kind="query",
+                )
             self.rerank_model_func = priority_limit_async_func_call(
                 self.rerank_model_max_async,
                 llm_timeout=self.default_rerank_timeout,
                 queue_name="Rerank func",
-                concurrency_group="rerank",
-            )(self.rerank_model_func)
+                concurrency_group=(
+                    None
+                    if self._resource_admission_controller is not None
+                    else "rerank"
+                ),
+            )(rerank_func)
 
         # Init Embedding
         # Step 1: Capture embedding_func and max_token_size before applying rate_limit decorator
@@ -1380,12 +1408,24 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         # This ensures _generate_collection_suffix can still access attributes (model_name, embedding_dim)
         # while preventing side effects when the same EmbeddingFunc is reused across multiple LightRAG instances
         if self.embedding_func is not None:
+            embedding_inner = self.embedding_func.func
+            if self._resource_admission_controller is not None:
+                embedding_inner = self._resource_admission_controller.wrap(
+                    embedding_inner,
+                    group="embedding",
+                    workspace_id=self._resource_admission_workspace_id,
+                    default_operation_kind="ingestion",
+                )
             wrapped_func = priority_limit_async_func_call(
                 self.embedding_func_max_async,
                 llm_timeout=self.default_embedding_timeout,
                 queue_name="Embedding func",
-                concurrency_group="embedding",
-            )(self.embedding_func.func)
+                concurrency_group=(
+                    None
+                    if self._resource_admission_controller is not None
+                    else "embedding"
+                ),
+            )(embedding_inner)
             # Use dataclasses.replace() to create a new instance, leaving the original unchanged
             self.embedding_func = replace(self.embedding_func, func=wrapped_func)
 

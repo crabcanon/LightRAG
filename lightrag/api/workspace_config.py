@@ -124,16 +124,25 @@ def resolve_workspace_deployment(
             )
         return config
 
-    if config.coordinator_provider is not CoordinatorProviderKind.LOCAL:
+    if config.coordinator_provider is CoordinatorProviderKind.EXTERNAL:
         raise WorkspaceDeploymentError(
             f"Workspace coordinator provider "
             f"{config.coordinator_provider.value!r} is planned but not available "
             "in this implementation phase"
         )
     if config.workers > 1:
+        if config.catalog_provider is not CatalogProviderKind.POSTGRES:
+            raise WorkspaceDeploymentError(
+                "Multi-workspace mode with workers > 1 requires the shared "
+                "PostgreSQL catalog provider"
+            )
+        if config.coordinator_provider is not CoordinatorProviderKind.MANAGER:
+            raise WorkspaceDeploymentError(
+                "Multi-workspace mode with workers > 1 requires the same-host "
+                "manager coordinator provider"
+            )
+    elif config.coordinator_provider is not CoordinatorProviderKind.LOCAL:
         raise WorkspaceDeploymentError(
-            "Multi-workspace mode with workers > 1 requires the Phase 5 shared "
-            "coordinator and fault-test gate; the current provider combinations "
-            "are supported only with workers=1"
+            "Single-worker multi-workspace mode requires the local coordinator"
         )
     return config

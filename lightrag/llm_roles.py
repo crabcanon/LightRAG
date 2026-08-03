@@ -186,18 +186,27 @@ class _RoleLLMMixin:
         model_kwargs: dict[str, Any],
     ) -> Callable[..., object]:
         spec = ROLES_BY_NAME[role_name]
+        provider_func = partial(
+            raw_func,
+            hashing_kv=self.llm_response_cache,
+            **model_kwargs,
+        )
+        controller = getattr(self, "_resource_admission_controller", None)
+        if controller is not None:
+            provider_func = controller.wrap(
+                provider_func,
+                group=f"llm:{role_name}",
+                workspace_id=self._resource_admission_workspace_id,
+                default_operation_kind=(
+                    "query" if role_name in {"query", "keyword"} else "ingestion"
+                ),
+            )
         return priority_limit_async_func_call(
             max_async,
             llm_timeout=timeout,
             queue_name=spec.queue_name,
-            concurrency_group=f"llm:{role_name}",
-        )(
-            partial(
-                raw_func,
-                hashing_kv=self.llm_response_cache,
-                **model_kwargs,
-            )
-        )
+            concurrency_group=None if controller is not None else f"llm:{role_name}",
+        )(provider_func)
 
     def _rebuild_role_llm_funcs(self) -> None:
         """Wrap each role's raw_func with its own priority queue.

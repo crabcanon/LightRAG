@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import AbstractAsyncContextManager
 from contextvars import ContextVar, Token
+from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 
@@ -12,6 +13,35 @@ BackgroundLeaseFactory = Callable[[], Awaitable[AbstractAsyncContextManager[obje
 _background_lease_factory: ContextVar[BackgroundLeaseFactory | None] = ContextVar(
     "lightrag_background_workspace_lease_factory", default=None
 )
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceExecutionScope:
+    workspace_id: str
+    operation_kind: str
+
+
+_workspace_execution_scope: ContextVar[WorkspaceExecutionScope | None] = ContextVar(
+    "lightrag_workspace_execution_scope", default=None
+)
+
+
+def bind_workspace_execution_scope(
+    workspace_id: str, operation_kind: str
+) -> Token[WorkspaceExecutionScope | None]:
+    return _workspace_execution_scope.set(
+        WorkspaceExecutionScope(workspace_id, operation_kind)
+    )
+
+
+def reset_workspace_execution_scope(
+    token: Token[WorkspaceExecutionScope | None],
+) -> None:
+    _workspace_execution_scope.reset(token)
+
+
+def current_workspace_execution_scope() -> WorkspaceExecutionScope | None:
+    return _workspace_execution_scope.get()
 
 
 def bind_background_lease_factory(

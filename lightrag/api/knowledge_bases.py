@@ -47,7 +47,14 @@ from lightrag.api.workspace_pool import (
     WorkspacePoolCapacityError,
     WorkspacePoolInitializationError,
 )
-from lightrag.api.workspace_recovery import WorkspaceRecoveryCoordinator
+from lightrag.api.workspace_coordinator import (
+    LocalWorkspaceCoordinator,
+    WorkspaceCoordinator,
+)
+from lightrag.api.workspace_recovery import (
+    WorkspaceRecoveryCoordinator,
+    WorkspaceRecoveryReport,
+)
 from lightrag.exceptions import PipelineNotInitializedError
 from lightrag.file_atomic import atomic_write
 from lightrag.kg.shared_storage import get_namespace_data
@@ -68,7 +75,9 @@ from lightrag.workspace import (
 )
 from lightrag.workspace_scope import (
     bind_background_lease_factory,
+    bind_workspace_execution_scope,
     reset_background_lease_factory,
+    reset_workspace_execution_scope,
 )
 
 
@@ -1005,6 +1014,7 @@ class KnowledgeBaseManager:
         max_loaded_resource_weight: int | None = None,
         multi_workspace_enabled: bool = True,
         allow_non_default_writes: bool = True,
+        workspace_coordinator: WorkspaceCoordinator | None = None,
     ) -> None:
         if max_loaded_instances < 1:
             raise ValueError("max_loaded_instances must be at least 1")
@@ -1034,6 +1044,9 @@ class KnowledgeBaseManager:
         self._max_loaded_instances = max_loaded_instances
         self.multi_workspace_enabled = multi_workspace_enabled
         self.allow_non_default_writes = allow_non_default_writes
+        self.workspace_coordinator = (
+            workspace_coordinator or LocalWorkspaceCoordinator()
+        )
         default_record = default_record or self._catalog_get_cached(
             DEFAULT_KNOWLEDGE_BASE_ID
         )
@@ -1295,12 +1308,22 @@ class KnowledgeBaseManager:
 
     async def initialize(self) -> None:
         self._started = True
+        # The manager may be constructed in Gunicorn's preloaded master. Never
+        # let forked workers inherit one lifecycle owner identity.
+        self._lifecycle_owner_id = (
+            f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:12]}"
+        )
         try:
             durable_default = await self.catalog_provider.initialize(
                 self.default_context.metadata
             )
             self.default_context.metadata = durable_default
-            await self.recovery_coordinator.recover()
+            recovery_payload = await self.workspace_coordinator.run_startup_once(
+                self._recover_startup_payload
+            )
+            self.recovery_coordinator.last_report = WorkspaceRecoveryReport(
+                **recovery_payload
+            )
             durable_default = await self.catalog_provider.get_record(
                 DEFAULT_KNOWLEDGE_BASE_ID, include_tombstoned=True
             )
@@ -1320,6 +1343,10 @@ class KnowledgeBaseManager:
         except BaseException:
             self._started = False
             raise
+
+    async def _recover_startup_payload(self) -> dict[str, Any]:
+        report = await self.recovery_coordinator.recover()
+        return report.public_dict()
 
     @staticmethod
     def _execution_context(
@@ -1489,6 +1516,7 @@ class KnowledgeBaseManager:
         knowledge_base_id: str | None,
         *,
         lease_kind: Literal["foreground", "stream", "background"] = "foreground",
+        operation_kind: str = "query",
     ) -> AsyncIterator[WorkspaceExecutionContext]:
         normalized = validate_knowledge_base_id(knowledge_base_id)
         if not self.multi_workspace_enabled and normalized != DEFAULT_KNOWLEDGE_BASE_ID:
@@ -1523,9 +1551,13 @@ class KnowledgeBaseManager:
         background_factory_token = bind_background_lease_factory(
             lambda: self._capture_background_lease(context)
         )
+        execution_scope_token = bind_workspace_execution_scope(
+            context.metadata.id, operation_kind
+        )
         try:
             yield context
         finally:
+            reset_workspace_execution_scope(execution_scope_token)
             reset_background_lease_factory(background_factory_token)
             _current_context.reset(token)
             await lease.release()
@@ -1582,9 +1614,10 @@ class KnowledgeBaseManager:
         try:
             route = request.scope.get("route")
             route_name = getattr(route, "name", None)
+            endpoint_policy = ENDPOINT_POLICIES.get(route_name)
             normalized = validate_knowledge_base_id(knowledge_base_id)
             if (
-                ENDPOINT_POLICIES.get(route_name) is EndpointPolicy.DATA_WRITE
+                endpoint_policy is EndpointPolicy.DATA_WRITE
                 and normalized != DEFAULT_KNOWLEDGE_BASE_ID
                 and not self.allow_non_default_writes
             ):
@@ -1617,8 +1650,13 @@ class KnowledgeBaseManager:
                 or request.url.path.endswith("/api/generate")
                 else "foreground"
             )
+            operation_kind = (
+                "ingestion" if endpoint_policy is EndpointPolicy.DATA_WRITE else "query"
+            )
             async with self.bind_request(
-                knowledge_base_id, lease_kind=lease_kind
+                knowledge_base_id,
+                lease_kind=lease_kind,
+                operation_kind=operation_kind,
             ) as context:
                 request.state.knowledge_base = context.metadata.public_dict()
                 yield
@@ -1791,6 +1829,7 @@ class KnowledgeBaseManager:
     ) -> None:
         claim: CatalogOperation | None = None
         context: KnowledgeBaseContext | None = None
+        execution_scope_token = None
         try:
             claim = await self.catalog_provider.claim_operation(
                 operation_id,
@@ -1801,6 +1840,10 @@ class KnowledgeBaseManager:
                 raise CatalogCASConflict(
                     f"Operation {operation_id!r} is not a workspace create"
                 )
+            execution_scope_token = bind_workspace_execution_scope(
+                claim.workspace_id,
+                "recovery" if reclaim_running else "management",
+            )
             record = await self.catalog_provider.get_record(
                 claim.workspace_id, include_tombstoned=True
             )
@@ -1898,6 +1941,9 @@ class KnowledgeBaseManager:
                         operation_id,
                         update_error,
                     )
+        finally:
+            if execution_scope_token is not None:
+                reset_workspace_execution_scope(execution_scope_token)
 
     async def _run_migration_lifecycle(
         self, operation_id: str, reclaim_running: bool = False
@@ -1907,6 +1953,7 @@ class KnowledgeBaseManager:
         claim: CatalogOperation | None = None
         context: KnowledgeBaseContext | None = None
         record: KnowledgeBaseRecord | None = None
+        execution_scope_token = None
         try:
             claim = await self.catalog_provider.claim_operation(
                 operation_id,
@@ -1917,6 +1964,9 @@ class KnowledgeBaseManager:
                 raise CatalogCASConflict(
                     f"Operation {operation_id!r} is not a workspace migration"
                 )
+            execution_scope_token = bind_workspace_execution_scope(
+                claim.workspace_id, "recovery"
+            )
             record = await self.catalog_provider.get_record(
                 claim.workspace_id, include_tombstoned=True
             )
@@ -2015,6 +2065,8 @@ class KnowledgeBaseManager:
                         update_error,
                     )
         finally:
+            if execution_scope_token is not None:
+                reset_workspace_execution_scope(execution_scope_token)
             if context is not None and record is not None:
                 if record.id in self._initialized_ids:
                     try:
@@ -2158,6 +2210,7 @@ class KnowledgeBaseManager:
         context: KnowledgeBaseContext | None = None
         record: KnowledgeBaseRecord | None = None
         workspace_id: str | None = None
+        execution_scope_token = None
         try:
             pending_operation = await self.catalog_provider.get_operation(operation_id)
             workspace_id = pending_operation.workspace_id
@@ -2170,6 +2223,10 @@ class KnowledgeBaseManager:
                 raise CatalogCASConflict(
                     f"Operation {operation_id!r} is not a workspace delete"
                 )
+            execution_scope_token = bind_workspace_execution_scope(
+                claim.workspace_id,
+                "recovery" if reclaim_running else "management",
+            )
             record = await self.catalog_provider.get_record(
                 claim.workspace_id, include_tombstoned=True
             )
@@ -2334,6 +2391,8 @@ class KnowledgeBaseManager:
                         update_error,
                     )
         finally:
+            if execution_scope_token is not None:
+                reset_workspace_execution_scope(execution_scope_token)
             if context is not None and record is not None:
                 if record.id in self._initialized_ids:
                     try:

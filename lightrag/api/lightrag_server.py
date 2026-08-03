@@ -84,10 +84,19 @@ from lightrag.api.knowledge_bases import (
     storage_profiles_path_from_env,
 )
 from lightrag.api.catalog import LocalCatalogProvider, PostgresCatalogProvider
+from lightrag.admission import (
+    ResourceAdmissionController,
+    build_service_admission_limits,
+)
 from lightrag.api.workspace_config import (
     CatalogProviderKind,
+    CoordinatorProviderKind,
     WorkspaceDeploymentError,
     resolve_workspace_deployment,
+)
+from lightrag.api.workspace_coordinator import (
+    LocalWorkspaceCoordinator,
+    SameHostManagerWorkspaceCoordinator,
 )
 from lightrag.kg.storage_profiles import (
     audit_workspace_overrides,
@@ -1349,12 +1358,32 @@ def create_app(args):
     workspace_deployment = resolve_workspace_deployment(
         workers=int(getattr(args, "workers", 1) or 1)
     )
+    resource_admission_controller = (
+        ResourceAdmissionController.from_environment(
+            build_service_admission_limits(args)
+        )
+        if workspace_deployment.multi_workspace_enabled
+        else None
+    )
     admin_api_key = os.getenv("LIGHTRAG_ADMIN_API_KEY")
     if workspace_deployment.multi_workspace_enabled and not admin_api_key:
         raise WorkspaceDeploymentError(
             "Multi-workspace mode requires LIGHTRAG_ADMIN_API_KEY for "
             "knowledge-base management mutations"
         )
+    if (
+        workspace_deployment.coordinator_provider is CoordinatorProviderKind.MANAGER
+        and "LIGHTRAG_GUNICORN_MODE" not in os.environ
+    ):
+        raise WorkspaceDeploymentError(
+            "The manager coordinator requires lightrag-gunicorn so shared "
+            "state is initialized in the preloaded master"
+        )
+    workspace_coordinator = (
+        SameHostManagerWorkspaceCoordinator.from_environment()
+        if workspace_deployment.coordinator_provider is CoordinatorProviderKind.MANAGER
+        else LocalWorkspaceCoordinator()
+    )
     active_storage_implementations = {
         "kv": args.kv_storage,
         "vector": args.vector_storage,
@@ -2243,6 +2272,7 @@ def create_app(args):
     def build_rag(
         workspace: str,
         *,
+        admission_workspace_id: str,
         working_dir: str,
         input_dir: str,
         workspace_binding: WorkspaceBinding,
@@ -2314,6 +2344,8 @@ def create_app(args):
                     )
                     for spec in ROLES
                 },
+                resource_admission_controller=resource_admission_controller,
+                resource_admission_workspace_id=admission_workspace_id,
             )
         except Exception as e:
             logger.error(f"Failed to initialize LightRAG: {e}")
@@ -2330,6 +2362,7 @@ def create_app(args):
 
     rag = build_rag(
         args.workspace,
+        admission_workspace_id=DEFAULT_KNOWLEDGE_BASE_ID,
         working_dir=args.working_dir,
         input_dir=args.input_dir,
         workspace_binding=default_knowledge_base_record.to_workspace_binding(
@@ -2347,6 +2380,7 @@ def create_app(args):
         input_dir = str(profile["input_dir"]) if profile else str(args.input_dir)
         return build_rag(
             record.effective_workspace,
+            admission_workspace_id=record.id,
             working_dir=working_dir,
             input_dir=input_dir,
             workspace_binding=record.to_workspace_binding(
@@ -2396,11 +2430,14 @@ def create_app(args):
         .strip()
         .lower()
         == "true",
+        workspace_coordinator=workspace_coordinator,
     )
     app.state.knowledge_base_manager = knowledge_base_manager
     app.state.catalog_provider = knowledge_base_catalog
     app.state.workspace_deployment = workspace_deployment
     app.state.workspace_override_audit = workspace_override_audit
+    app.state.resource_admission_controller = resource_admission_controller
+    app.state.workspace_coordinator = workspace_coordinator
 
     @app.middleware("http")
     async def publish_resolved_knowledge_base(request: Request, call_next):
@@ -2649,6 +2686,12 @@ def create_app(args):
             "workspace_deployment": workspace_deployment.public_dict(),
             "pool": knowledge_base_manager.instance_pool.peek(),
             "recovery": knowledge_base_manager.recovery_coordinator.last_report.public_dict(),
+            "service_admission": (
+                await resource_admission_controller.snapshot()
+                if resource_admission_controller is not None
+                else None
+            ),
+            "workspace_coordinator": await workspace_coordinator.snapshot(),
             "side_effect_counters": after,
         }
 
@@ -2883,6 +2926,12 @@ def create_app(args):
                     ),
                     "embedding_queue_status": await selected_rag.get_embedding_queue_status(),
                     "rerank_queue_status": await selected_rag.get_rerank_queue_status(),
+                    "service_admission": (
+                        await resource_admission_controller.snapshot()
+                        if resource_admission_controller is not None
+                        else None
+                    ),
+                    "workspace_coordinator": await workspace_coordinator.snapshot(),
                 }
             )
             return status_data
