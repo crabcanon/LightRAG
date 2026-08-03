@@ -1447,3 +1447,80 @@ Prompt 依据：OpenAI 官方 [GPT-5.6 model guidance](https://developers.openai
 - 关键补充：确认 `active_requests` 与 deleting reservation 非原子，managed background task 可在 HTTP request lease 结束后继续持有复制的 ContextVar；当前 32 实例上限没有 eviction，因此长期运行会出现“只能入住不能退房”的容量耗尽。
 - 测试边界：现有 fake-storage 测试证明 12 个对象收到初始 workspace，但没有执行真实 backend override 解析；现有 ContextVar 测试证明普通并发请求隔离，但没有证明 background/stream/delete/eviction 的完整生命周期安全。
 - 变更范围：仅新增/更新 Markdown 文档，没有修改业务代码、配置、存储数据或 `.codex/`，未发布 GitHub、commit 或 push。
+
+## 13. 2026-08-03 上游同步后的 RFC 实现优化任务
+
+### 13.1 本轮目标与执行约束
+
+本轮以 `docs/lightrag-rfc-en.md` 为规范基线，以 `dev@64713519`（包含 `upstream/main@301e715c`）为代码基线。完整差距、证据、目标架构、ADR、失败语义和验证策略见 `docs/lightrag-rfc-impl.md`。
+
+当前阶段只完成设计冻结和任务拆分，不修改多知识库业务代码。用户评审 `docs/lightrag-rfc-impl.md` 并确认关键决策后，才按下表顺序逐项实现。每项任务必须满足自己的验收标准并记录真实验证结果，不能用后续阶段的计划替代当前完成证据。
+
+共同约束：
+
+- default workspace 升级不搬迁、不重嵌入、不重命名现有数据；
+- 一个 `LightRAG` 实例终身绑定一个 immutable workspace binding；
+- data plane 不 auto-create，不在 first request 中迁移；
+- 只有 header 完全缺失才兼容选择 default；present-empty/invalid 不回退；
+- multi-workspace mode 禁止 active backend workspace override；
+- non-default ingestion/write 在 pipeline context、recovery 和 shared admission 完成前保持 feature-gated；
+- local JSON catalog 只可作为单 worker provider；未证明安全前不得宣称 Gunicorn/multi-node 支持；
+- isolation 不等于 authorization，management mutation 必须有明确 admin boundary；
+- 不修改或提交未跟踪的 `.codex/`。
+
+### 13.2 可逐项实施的任务清单
+
+| ID | 阶段 | 任务 | 依赖 | 状态 | 完成定义 |
+| --- | --- | --- | --- | --- | --- |
+| RFC-I00 | 设计 Gate | 评审 `lightrag-rfc-impl.md` 第 13 节八项决策，冻结 selector、catalog provider、lifecycle API、admin 和支持矩阵 | 无 | 待用户评审 | 决策写入 ADR；不再存在会改变 Phase 1～4 边界的未决项 |
+| RFC-I01 | Phase 0 | 增加 legacy/multi-workspace feature mode、deployment support matrix 与 fail-closed 启动校验 | RFC-I00 | 未开始 | 不支持的 workers/catalog/coordinator 组合启动失败；default 行为不变 |
+| RFC-I02 | Phase 0 | 建立 endpoint policy registry、OpenAPI route classification 和 side-effect counter 测试骨架 | RFC-I00 | 未开始 | 每个 route 唯一分类；新增未分类 route 测试失败；health/ready 的零构造断言可执行 |
+| RFC-I03 | Phase 1 | 实现 `WorkspaceBinding` tagged identity、`legacy-v1`/`namespace-v1` codec、reserved name 规则 | RFC-I01 | 未开始 | empty/default/_/named 不碰撞；default 原物理布局可读；binding 构造后不可变 |
+| RFC-I04 | Phase 1 | 为 KV/vector/graph/doc-status 建立统一 `StorageNamespaceDescriptor` 和四族一致性 preflight | RFC-I03 | 未开始 | 每个 active backend 报告 canonical key/codec/fingerprint；mismatch 在数据访问前失败 |
+| RFC-I05 | Phase 1 | 统一 workspace override 规则并覆盖全部 storage backend | RFC-I04 | 未开始 | multi-workspace 任一 override 启动失败；legacy consistent 可兼容、mixed family 失败；真实 backend 回归通过 |
+| RFC-I06 | Phase 2 | 抽象 `CatalogProvider`，保留 single-worker local provider，实现首个 PostgreSQL shared provider | RFC-I03、RFC-I00 catalog 决策 | 未开始 | revision/CAS、分页、唯一约束、cache invalidation；local+workers>1 fail startup |
+| RFC-I07 | Phase 2 | 实现 catalog lifecycle、幂等 management operation、fencing 与 tombstone | RFC-I06、RFC-I04 | 未开始 | CREATING/MIGRATING/ACTIVE/DELETING/TOMBSTONED/ERROR 可恢复；kill owner 与 stale commit 测试通过 |
+| RFC-I08 | Phase 3 | 重构为 explicit `WorkspaceExecutionContext` 与 fail-closed ContextVar adapter，修正 selector/response contract | RFC-I06、RFC-I07 | 未开始 | absent/empty/invalid/unknown/inactive 全矩阵通过；缺 context typed failure；成功响应暴露 resolved ID |
+| RFC-I09 | Phase 3 | 实现 per-worker lease pool：entry state、single-flight、resource weight、safe LRU、backoff、503 背压 | RFC-I08 | 未开始 | stream/background lease 阻止 eviction/delete；满池无安全 victim 返回 503；取消 exactly-once release |
+| RFC-I10 | Phase 3 | 拆分 side-effect-free `/health`、`/ready`、catalog/pool peek；移除 first-access migration | RFC-I07、RFC-I09、RFC-I02 | 未开始 | health/ready 产生零实例构造、零 storage init、零 migration；runtime observation 可返回 UNLOADED |
+| RFC-I11 | Phase 4 | 建立 control-plane migration/recovery coordinator，分页枚举全 catalog 并使用 lease/fencing | RFC-I07、RFC-I10 | 未开始 | full restart 无需用户访问即可恢复全部 ACTIVE workspace；一个坏库不阻塞其他库；migration 非 request-owned |
+| RFC-I12 | Phase 4 | 把 request/stream/background/pipeline/delete 全部绑定 explicit context 和 lease handoff，接入现有 ingress/fence | RFC-I08、RFC-I09、RFC-I11 | 未开始 | background handoff 原子；相同 doc hash 跨库状态全生命周期不串；worker kill 后旧 owner 不能提交 |
+| RFC-I13 | Phase 4 | 实现 fenced 两阶段删除和 durable cleanup journal | RFC-I04、RFC-I07、RFC-I09、RFC-I12 | 未开始 | ACTIVE→DELETING 拒绝新 lease；partial drop 可续跑；descriptor mismatch 禁止 destructive action；最终 tombstone |
+| RFC-I14 | Phase 5 | 将现有 Gunicorn global slot 提升为单进程/Gunicorn 共用的 service-level provider admission | RFC-I09、RFC-I12 | 未开始 | N workspace 的 LLM/embedding/rerank observed peak 不超过 deployment total C |
+| RFC-I15 | Phase 5 | 增加 global active-pipeline cap、workspace DRR/aging、公平和 bounded overload | RFC-I11、RFC-I14 | 未开始 | A 持续 bulk ingest 时 B 在约定上限内获得服务；queue 饱和返回 429/503 且内存有界 |
+| RFC-I16 | Phase 5 | 将 same-host Manager 能力封装为 coordinator provider，完成 Gunicorn support matrix | RFC-I06、RFC-I11、RFC-I15 | 未开始 | 任意 worker 路由、catalog revision、worker kill、provider cap 和 pipeline owner 测试通过；无 sticky session |
+| RFC-I17 | Phase 6 | 实现 Ollama model alias、header/model conflict 和 metadata side-effect-free | RFC-I08、RFC-I10 | 未开始 | 标准 client 仅用 model 可选非默认库；unknown 不创建；conflict 400；tags/ps 不 load instance |
+| RFC-I18 | Phase 7 | 基于新 contract 重接 WebUI 与 API selector，修正 stale `LIGHTRAG-WORKSPACE` 文案/header | RFC-I08、RFC-I10、RFC-I17 | 未开始 | UI 创建项置顶、全库 name+ID 可选；Bun 全测/build；API Vary/header 一致 |
+| RFC-I19 | Phase 7+ | 按 backend 分拆 strict physical profile 的 provision/migration/delete/backup 硬化 | RFC-I04、RFC-I07、RFC-I13 | 未开始 | 每个 backend 独立 PR、真实服务 integration、resource ownership 与恢复文档，不混入 core PR |
+| RFC-I20 | Later | 实现 external coordinator 并验证多节点 | RFC-I16 | 未开始 | TTL/heartbeat/fencing、网络故障、node kill、global admission 和无 sticky session 全部通过后才更新支持声明 |
+
+### 13.3 每项任务的统一交付模板
+
+每完成一个 RFC-I 任务，在本文件时间线追加：
+
+1. Asia/Shanghai ISO 8601 时间、任务 ID、代码基线与 commit；
+2. 实际修改文件和不变量变化；
+3. 执行的 unit/integration/multiprocess/fault-injection/UI 测试命令；
+4. 明确 pass/skip/fail 数量及环境限制；
+5. 兼容、迁移、回滚和 feature flag 状态；
+6. 新发现的 Gap 和后续任务依赖调整；
+7. 未运行的真实外部服务或多节点测试必须明确标为未验证。
+
+### 13.4 实施顺序 Gate
+
+- RFC-I00 未完成：不得开始业务实现；
+- RFC-I03～I05 未完成：不得发布动态 catalog/data routing；
+- RFC-I06～I10 未完成：不得宣称 Gunicorn catalog 一致或 side-effect-free health；
+- RFC-I11～I15 未完成：non-default ingestion/write 保持 feature-gated；
+- RFC-I16 未完成：同机 Gunicorn 不进入 supported matrix；
+- RFC-I20 未完成：不得宣称 multi-node production safety。
+
+### 2026-08-03T14:56:45+08:00 — 上游同步、合并验证与新一轮 RFC 实现设计完成
+
+- Git 整理：当前工作按类别形成 `b58b7edb test(workspace): cover standalone tenant isolation`、`6e4ad39c feat(docker): add multi-tenant deployment stacks`、`81606bed docs(rfc): organize multi-workspace design artifacts`，已推送 `origin/dev`。
+- 上游同步：将 `upstream/main@301e715c` 合并到 fork `main`，解决 server、MongoDB、OpenSearch、WebUI stream test 与 PostgreSQL manager test 冲突，形成 `b9ce4baa Merge upstream/main into main` 并推送 `origin/main`；再以 `64713519 Merge branch 'main' into dev` 合并并推送 `origin/dev`。
+- 冲突处理原则：保留多知识库 `build_rag` factory 和 selected-RAG health capability，同时吸收上游 pipeline scheduling、strict storage reads、pending admission、新 storage client 管理和测试 mock 改进；未修改 `.codex/`。
+- 已完成验证：冲突相关 backend/API/storage 聚焦回归 `355 passed`；多知识库/默认文件存储隔离回归 `58 passed`；WebUI targeted stream `21 passed`、全量 Bun `94 passed, 0 failed`，production build 成功；相关 ruff/pre-commit 通过。
+- API 全量环境边界：Windows 不提供 Gunicorn 所需 POSIX `fcntl`；一次排除 Gunicorn 的 API sweep 暴露 5 项，其中 tokenizer cache 配置后两项 Ollama input-limit 在对应 13-test 文件中通过。剩余观察项为一个 Windows-only Gunicorn import，以及两个既有 auth contract 断言期望 401、当前 API-key-only 路径实际返回 403；它们未被伪报为本轮全量通过，也未在本设计文档提交中修改无关业务语义。
+- 新审计产物：新增 `docs/lightrag-rfc-impl.md`。结论是最新上游的 workspace ingress、bounded scheduling、recovery fence、scan job store 和 Gunicorn provider global slot 可复用，但 shared catalog/lifecycle、canonical descriptor、lease pool、side-effect-free health、catalog-driven recovery、单进程 shared admission、workspace fairness、fenced deletion 与 Ollama alias 仍需按 Phase 1～7 实现。
+- 任务状态：RFC-I00 等待用户评审；RFC-I01～I20 均未开始。用户确认设计前，本轮停止在文档和任务边界，不实施业务重构。
