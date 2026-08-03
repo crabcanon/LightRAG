@@ -1,10 +1,17 @@
 # LightRAG 多知识库 RFC 实现差距与新一轮优化方案
 
-- 状态：架构决策已确认，按 Phase 0～7 分阶段实施
+- 状态：架构决策已确认；Phase 0～1 已完成，Phase 2 待实施
 - RFC 基线：`docs/lightrag-rfc-en.md`（2026-07-29）
 - 代码基线：`dev@64713519`，已包含 `upstream/main@301e715c`
 - 审计日期：2026-08-03（Asia/Shanghai）
 - 目标：把当前集成实现收敛为可分阶段提交、可证明安全、可回滚的社区方案
+
+> 实施进度（2026-08-03）：`3d79281c` 已完成 immutable tagged
+> `WorkspaceBinding`、`legacy-v1`/`namespace-v1`、全 23 个可选 backend 的
+> legacy codec 注册、12-storage descriptor construction/post-connect gate、
+> destructive pre-delete gate，以及 multi/legacy workspace override startup audit。
+> 本文第 5 节的 G-03/G-04 保留为基线审计记录；其 Phase 1 范围已由该提交关闭，
+> shared catalog、lifecycle 与 lease 等后续 Gap 仍未完成。
 
 ## 1. 结论
 

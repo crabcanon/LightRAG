@@ -1475,9 +1475,9 @@ Prompt 依据：OpenAI 官方 [GPT-5.6 model guidance](https://developers.openai
 | RFC-I00 | 设计 Gate | 评审 `lightrag-rfc-impl.md` 第 13 节八项决策，冻结 selector、catalog provider、lifecycle API、admin 和支持矩阵 | 无 | 已完成 | 决策写入 ADR；不再存在会改变 Phase 1～4 边界的未决项 |
 | RFC-I01 | Phase 0 | 增加 legacy/multi-workspace feature mode、deployment support matrix 与 fail-closed 启动校验 | RFC-I00 | 已完成 | 不支持的 workers/catalog/coordinator 组合启动失败；default 行为不变 |
 | RFC-I02 | Phase 0 | 建立 endpoint policy registry、OpenAPI route classification 和 side-effect counter 测试骨架 | RFC-I00 | 已完成 | 每个 route 唯一分类；新增未分类 route 测试失败；health/ready 的零构造断言可执行 |
-| RFC-I03 | Phase 1 | 实现 `WorkspaceBinding` tagged identity、`legacy-v1`/`namespace-v1` codec、reserved name 规则 | RFC-I01 | 未开始 | empty/default/_/named 不碰撞；default 原物理布局可读；binding 构造后不可变 |
-| RFC-I04 | Phase 1 | 为 KV/vector/graph/doc-status 建立统一 `StorageNamespaceDescriptor` 和四族一致性 preflight | RFC-I03 | 未开始 | 每个 active backend 报告 canonical key/codec/fingerprint；mismatch 在数据访问前失败 |
-| RFC-I05 | Phase 1 | 统一 workspace override 规则并覆盖全部 storage backend | RFC-I04 | 未开始 | multi-workspace 任一 override 启动失败；legacy consistent 可兼容、mixed family 失败；真实 backend 回归通过 |
+| RFC-I03 | Phase 1 | 实现 `WorkspaceBinding` tagged identity、`legacy-v1`/`namespace-v1` codec、reserved name 规则 | RFC-I01 | 已完成 | empty/default/_/named 不碰撞；default 原物理布局可读；binding 构造后不可变 |
+| RFC-I04 | Phase 1 | 为 KV/vector/graph/doc-status 建立统一 `StorageNamespaceDescriptor` 和四族一致性 preflight | RFC-I03 | 已完成 | 每个 active backend 报告 canonical key/codec/fingerprint；mismatch 在数据访问前失败 |
+| RFC-I05 | Phase 1 | 统一 workspace override 规则并覆盖全部 storage backend | RFC-I04 | 已完成 | multi-workspace 任一 override 启动失败；legacy consistent 可兼容、mixed family 失败；真实 backend 回归通过 |
 | RFC-I06 | Phase 2 | 抽象 `CatalogProvider`，保留 single-worker local provider，实现首个 PostgreSQL shared provider | RFC-I03、RFC-I00 catalog 决策 | 未开始 | revision/CAS、分页、唯一约束、cache invalidation；local+workers>1 fail startup |
 | RFC-I07 | Phase 2 | 实现 catalog lifecycle、幂等 management operation、fencing 与 tombstone | RFC-I06、RFC-I04 | 未开始 | CREATING/MIGRATING/ACTIVE/DELETING/TOMBSTONED/ERROR 可恢复；kill owner 与 stale commit 测试通过 |
 | RFC-I08 | Phase 3 | 重构为 explicit `WorkspaceExecutionContext` 与 fail-closed ContextVar adapter，修正 selector/response contract | RFC-I06、RFC-I07 | 未开始 | absent/empty/invalid/unknown/inactive 全矩阵通过；缺 context typed failure；成功响应暴露 resolved ID |
@@ -1536,3 +1536,15 @@ Prompt 依据：OpenAI 官方 [GPT-5.6 model guidance](https://developers.openai
 - 验证：新增 deployment matrix、endpoint fail-closed 和 legacy gate/counter 测试；聚焦 suite `48 passed`，包含 health 回归。与默认文件存储隔离组合后的 Phase 0 suite 为 `84 passed`。ruff check 通过。
 - 已知非本轮问题：额外 path-prefix sweep 的三个剩余失败仍是 Windows 无 POSIX `fcntl`，以及两个既有 API-key-only 401/403 断言差异；Phase 0 曾引入的一项 unknown-ID 文案回归已修复并由 health 测试覆盖。
 - 状态：RFC-I00、RFC-I01、RFC-I02 完成；下一项为 RFC-I03 canonical `WorkspaceBinding` 与 versioned codec。
+
+### 2026-08-03T20:12:25+08:00 — RFC-I03～I05 Phase 1 canonical binding 与四族一致性
+
+- 代码基线与提交：基于 `dev@2a73ee97` 实施，形成 `3d79281c feat(workspace): enforce canonical storage bindings`。未跟踪的 `.codex/` 未修改、未暂存、未提交。
+- Tagged identity：新增 `lightrag/workspace.py` 和 public `WorkspaceBinding` export。默认库固定为 `LegacyDefault + @legacy-default + legacy-v1`，named record 固定为 `Named + namespace-v1`；binding 为 frozen dataclass。空值、`default`、`_`、路径穿越及内部前缀不能成为 named key，display name 不参与物理命名。
+- 零拷贝兼容：catalog 在不提升 JSON version 的情况下为旧 record 补齐 binding tags；默认 record 的 `effective_workspace` 和既有目录/表/label/payload 不重命名、不复制、不重嵌入。23 个可选 backend 均在 legacy codec registry 中显式登记，PostgreSQL `default`、Qdrant `_`、Neo4j/Memgraph `base` 与无前缀/根目录被统一映射到同一个 canonical identity。
+- 四族 descriptor gate：`StorageNameSpace` 统一提供 secret-free `StorageNamespaceDescriptor`；`LightRAG` 对全部 12 个 storage object 在 construction 和 post-connect 两次验证 family/role/implementation/canonical key/codec/profile/fingerprint。named workspace 必须精确使用 canonical physical key；legacy family 解析不一致直接失败。删除前再次验证，mismatch 时在任何 `drop()` 前拒绝 destructive cleanup。
+- Override 启动审计：API 在创建 `DocumentManager`、catalog 文件和 RAG 实例前审计四个 active storage family。multi mode 下八类 `*_WORKSPACE` 环境变量及 PostgreSQL `config.ini` override 任一非空即失败；legacy mode 只有四族解析到同一逻辑 workspace 才兼容，mixed family fail-closed。storage profile 的 backend section 明确禁止 `workspace` 字段。Redis KV/doc-status 新增实际 key partition 报告，避免内部 lock fallback 掩盖真实 namespace。
+- 严格验证结论：Phase 1 聚焦与 workspace 扩展 suite `165 passed`；PostgreSQL、Redis、MongoDB、Neo4j、Milvus、Qdrant、Memgraph、OpenSearch 八类 backend 离线目录 `1023 passed, 12 deselected`；显式 named binding 的默认文件后端真实同 hash 插入/删除 E2E 通过，并验证 12 个 descriptor 一致；ruff 通过。
+- 扩大回归边界：排除一个会在线下载 tiktoken cache 的 batch 文件后，`tests/kg` 得到 `1470 passed, 8 skipped, 8 failed, 139 deselected`。8 项均为既有 Windows/POSIX 环境差异（PID 1、`SIGKILL`、Windows `os.kill` fallback）或测试源码使用系统 GBK 解码 UTF-8；包含 batch 文件的 fail-fast 运行在 `1147 passed, 1 skipped` 后因沙箱禁止下载 `o200k_base.tiktoken` 停止。API 扩展回归 `82 passed, 3 failed`，仍是 Windows 缺 `fcntl` 与既有 401/403 断言差异，和 Phase 0 记录一致。
+- 未验证边界：本机 Docker daemon 未运行，故本阶段没有把 PostgreSQL/Redis/Neo4j 等真实服务 integration 伪报为已通过；其 mock/offline backend 回归已全绿。多进程 shared catalog、lifecycle、lease/fencing、真实服务 mixed override 与 multi-node 仍属于 Phase 2+。
+- 兼容与回滚：`LIGHTRAG_MULTI_WORKSPACE_MODE` 默认仍为 `legacy`；直接 library 调用未提供 binding 时自动使用 `legacy-v1`。回滚代码不会搬迁数据；含新增 tag 的 version-1 catalog 仍保留原字段和物理 workspace。状态：RFC-I03、I04、I05 完成，下一项为 RFC-I06 PostgreSQL shared `CatalogProvider`。
