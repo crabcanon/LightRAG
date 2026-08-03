@@ -50,7 +50,7 @@ def test_single_worker_local_multi_workspace_is_supported() -> None:
 def test_local_multi_workspace_fails_closed_with_multiple_workers() -> None:
     with pytest.raises(
         WorkspaceDeploymentError,
-        match="workers > 1 requires a shared durable catalog",
+        match="workers > 1 requires the Phase 5 shared coordinator",
     ):
         resolve_workspace_deployment(
             workers=2,
@@ -61,13 +61,6 @@ def test_local_multi_workspace_fails_closed_with_multiple_workers() -> None:
 @pytest.mark.parametrize(
     ("environment", "message"),
     [
-        (
-            {
-                "LIGHTRAG_MULTI_WORKSPACE_MODE": "multi",
-                "LIGHTRAG_KNOWLEDGE_BASE_CATALOG_PROVIDER": "postgres",
-            },
-            "PostgreSQL knowledge-base catalog provider is planned",
-        ),
         (
             {
                 "LIGHTRAG_MULTI_WORKSPACE_MODE": "multi",
@@ -86,6 +79,19 @@ def test_unavailable_or_invalid_modes_fail_closed(
 ) -> None:
     with pytest.raises(WorkspaceDeploymentError, match=message):
         resolve_workspace_deployment(workers=1, environment=environment)
+
+
+def test_postgres_catalog_is_available_for_single_worker_multi_mode() -> None:
+    config = resolve_workspace_deployment(
+        workers=1,
+        environment={
+            "LIGHTRAG_MULTI_WORKSPACE_MODE": "multi",
+            "LIGHTRAG_KNOWLEDGE_BASE_CATALOG_PROVIDER": "postgres",
+        },
+    )
+
+    assert config.catalog_provider is CatalogProviderKind.POSTGRES
+    assert config.coordinator_provider is CoordinatorProviderKind.LOCAL
 
 
 def test_legacy_mode_rejects_stray_shared_provider_configuration() -> None:
@@ -122,6 +128,7 @@ def test_server_rejects_override_before_creating_catalog_artifacts(
     args.kv_storage = "RedisKVStorage"
     args.workers = 1
     monkeypatch.setenv("LIGHTRAG_MULTI_WORKSPACE_MODE", "multi")
+    monkeypatch.setenv("LIGHTRAG_ADMIN_API_KEY", "test-admin-key")
     monkeypatch.setenv("REDIS_WORKSPACE", "collapsed")
 
     from lightrag.api.lightrag_server import create_app

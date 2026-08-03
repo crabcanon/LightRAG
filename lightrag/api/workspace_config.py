@@ -124,11 +124,6 @@ def resolve_workspace_deployment(
             )
         return config
 
-    if config.catalog_provider is CatalogProviderKind.POSTGRES:
-        raise WorkspaceDeploymentError(
-            "The PostgreSQL knowledge-base catalog provider is planned but not "
-            "available in this implementation phase"
-        )
     if config.coordinator_provider is not CoordinatorProviderKind.LOCAL:
         raise WorkspaceDeploymentError(
             f"Workspace coordinator provider "
@@ -137,8 +132,8 @@ def resolve_workspace_deployment(
         )
     if config.workers > 1:
         raise WorkspaceDeploymentError(
-            "Multi-workspace mode with workers > 1 requires a shared durable "
-            "catalog and shared coordinator; the local providers are supported "
-            "only with workers=1"
+            "Multi-workspace mode with workers > 1 requires the Phase 5 shared "
+            "coordinator and fault-test gate; the current provider combinations "
+            "are supported only with workers=1"
         )
     return config

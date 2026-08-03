@@ -83,7 +83,12 @@ from lightrag.api.knowledge_bases import (
     StorageProfileError,
     storage_profiles_path_from_env,
 )
-from lightrag.api.workspace_config import resolve_workspace_deployment
+from lightrag.api.catalog import LocalCatalogProvider, PostgresCatalogProvider
+from lightrag.api.workspace_config import (
+    CatalogProviderKind,
+    WorkspaceDeploymentError,
+    resolve_workspace_deployment,
+)
 from lightrag.kg.storage_profiles import (
     audit_workspace_overrides,
     build_default_resource_profile,
@@ -1344,6 +1349,12 @@ def create_app(args):
     workspace_deployment = resolve_workspace_deployment(
         workers=int(getattr(args, "workers", 1) or 1)
     )
+    admin_api_key = os.getenv("LIGHTRAG_ADMIN_API_KEY")
+    if workspace_deployment.multi_workspace_enabled and not admin_api_key:
+        raise WorkspaceDeploymentError(
+            "Multi-workspace mode requires LIGHTRAG_ADMIN_API_KEY for "
+            "knowledge-base management mutations"
+        )
     active_storage_implementations = {
         "kv": args.kv_storage,
         "vector": args.vector_storage,
@@ -1359,11 +1370,17 @@ def create_app(args):
     # Only create local catalog/input artifacts after deployment preflight has
     # proved that backend workspace overrides cannot collapse or split tenants.
     doc_manager = DocumentManager(args.input_dir, workspace=args.workspace)
-    catalog_path = os.getenv(
-        "LIGHTRAG_KNOWLEDGE_BASE_CATALOG",
-        str(Path(args.working_dir) / "knowledge_bases.json"),
-    )
-    knowledge_base_catalog = KnowledgeBaseCatalog(catalog_path, args.workspace)
+    default_knowledge_base_record = KnowledgeBaseRecord.legacy_default(args.workspace)
+    if workspace_deployment.catalog_provider is CatalogProviderKind.LOCAL:
+        catalog_path = os.getenv(
+            "LIGHTRAG_KNOWLEDGE_BASE_CATALOG",
+            str(Path(args.working_dir) / "knowledge_bases.json"),
+        )
+        local_catalog = KnowledgeBaseCatalog(catalog_path, args.workspace)
+        knowledge_base_catalog = LocalCatalogProvider(local_catalog)
+        default_knowledge_base_record = local_catalog.get(DEFAULT_KNOWLEDGE_BASE_ID)
+    else:
+        knowledge_base_catalog = PostgresCatalogProvider.from_environment()
     storage_profiles = KnowledgeBaseManager.load_storage_profiles(
         storage_profiles_path_from_env()
     )
@@ -2315,9 +2332,9 @@ def create_app(args):
         args.workspace,
         working_dir=args.working_dir,
         input_dir=args.input_dir,
-        workspace_binding=knowledge_base_catalog.get(
-            DEFAULT_KNOWLEDGE_BASE_ID
-        ).to_workspace_binding(server_mode=workspace_deployment.mode.value),
+        workspace_binding=default_knowledge_base_record.to_workspace_binding(
+            server_mode=workspace_deployment.mode.value
+        ),
     )
 
     def build_knowledge_base_rag(
@@ -2355,6 +2372,7 @@ def create_app(args):
     )
     knowledge_base_manager = KnowledgeBaseManager(
         catalog=knowledge_base_catalog,
+        default_record=default_knowledge_base_record,
         default_rag=rag,
         default_document_manager=doc_manager,
         rag_factory=build_knowledge_base_rag,
@@ -2368,13 +2386,20 @@ def create_app(args):
         multi_workspace_enabled=workspace_deployment.multi_workspace_enabled,
     )
     app.state.knowledge_base_manager = knowledge_base_manager
+    app.state.catalog_provider = knowledge_base_catalog
     app.state.workspace_deployment = workspace_deployment
     app.state.workspace_override_audit = workspace_override_audit
 
     # Add routes
     # root_path is set on the app for reverse proxy support;
     # routes stay at their natural paths and are prefixed by the proxy or uvicorn --root-path
-    app.include_router(create_knowledge_base_routes(knowledge_base_manager, api_key))
+    app.include_router(
+        create_knowledge_base_routes(
+            knowledge_base_manager,
+            api_key,
+            admin_api_key=admin_api_key,
+        )
+    )
     app.include_router(
         create_document_routes(
             knowledge_base_manager.rag_proxy,

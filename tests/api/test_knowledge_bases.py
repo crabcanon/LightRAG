@@ -110,6 +110,7 @@ def _manager(
     default_storage_profile=None,
     active_storage_implementations=None,
     multi_workspace_enabled: bool = True,
+    rag_factory=None,
 ) -> KnowledgeBaseManager:
     catalog = KnowledgeBaseCatalog(
         tmp_path / "rag" / "knowledge_bases.json", default_workspace
@@ -120,7 +121,11 @@ def _manager(
         default_document_manager=_document_manager(
             tmp_path / "inputs", default_workspace
         ),
-        rag_factory=lambda record, _profile: _FakeRag(record.effective_workspace),
+        rag_factory=(
+            rag_factory
+            if rag_factory is not None
+            else lambda record, _profile: _FakeRag(record.effective_workspace)
+        ),
         document_manager_factory=lambda record, _profile: _document_manager(
             tmp_path / "inputs", record.effective_workspace
         ),
@@ -344,31 +349,145 @@ def test_openapi_publishes_header_on_every_data_plane_operation(tmp_path: Path):
             ), f"{path} must not publish a KB header"
 
 
-def test_management_api_crud_and_default_delete_guard(tmp_path: Path):
+def test_management_api_crud_and_default_delete_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    async def no_pipeline_status(*args, **kwargs):
+        return {}
+
+    monkeypatch.setattr(
+        "lightrag.api.knowledge_bases.get_namespace_data", no_pipeline_status
+    )
     manager = _manager(tmp_path)
     app = FastAPI()
-    app.include_router(create_knowledge_base_routes(manager))
+    app.include_router(
+        create_knowledge_base_routes(manager, admin_api_key="admin-secret")
+    )
     client = TestClient(app)
+    admin_headers = {
+        "X-LightRAG-Admin-Key": "admin-secret",
+        "Prefer": "wait=2",
+    }
 
     created_response = client.post(
         "/knowledge-bases",
         json={"name": "Project B", "isolation_level": "logical"},
+        headers=admin_headers,
     )
     assert created_response.status_code == 201
-    knowledge_base_id = created_response.json()["id"]
+    assert created_response.json()["operation"]["state"] == "SUCCEEDED"
+    knowledge_base_id = created_response.json()["knowledge_base"]["id"]
     assert (
         client.patch(
-            f"/knowledge-bases/{knowledge_base_id}", json={"name": "Renamed"}
+            f"/knowledge-bases/{knowledge_base_id}",
+            json={"name": "Renamed"},
+            headers=admin_headers,
         ).json()["name"]
         == "Renamed"
     )
     assert (
         client.delete(
-            f"/knowledge-bases/{DEFAULT_KNOWLEDGE_BASE_ID}?confirm=true"
+            f"/knowledge-bases/{DEFAULT_KNOWLEDGE_BASE_ID}?confirm=true",
+            headers=admin_headers,
         ).status_code
         == 409
     )
-    assert client.delete(f"/knowledge-bases/{knowledge_base_id}").status_code == 400
+    assert (
+        client.delete(
+            f"/knowledge-bases/{knowledge_base_id}", headers=admin_headers
+        ).status_code
+        == 400
+    )
+    deleted = client.delete(
+        f"/knowledge-bases/{knowledge_base_id}?confirm=true",
+        headers={**admin_headers, "Idempotency-Key": "delete-project-b"},
+    )
+    assert deleted.status_code == 200
+    assert deleted.json()["operation"]["state"] == "SUCCEEDED"
+    assert deleted.json()["knowledge_base"]["lifecycle_state"] == "TOMBSTONED"
+    assert client.get(f"/knowledge-bases/{knowledge_base_id}").status_code == 404
+
+
+def test_management_mutation_requires_dedicated_admin_key(tmp_path: Path):
+    manager = _manager(tmp_path)
+    app = FastAPI()
+    app.include_router(
+        create_knowledge_base_routes(manager, admin_api_key="admin-secret")
+    )
+    client = TestClient(app)
+
+    request = {"name": "Protected", "isolation_level": "logical"}
+    assert client.post("/knowledge-bases", json=request).status_code == 403
+    assert (
+        client.post(
+            "/knowledge-bases",
+            json=request,
+            headers={"X-LightRAG-Admin-Key": "wrong"},
+        ).status_code
+        == 403
+    )
+    accepted = client.post(
+        "/knowledge-bases",
+        json=request,
+        headers={
+            "X-LightRAG-Admin-Key": "admin-secret",
+            "Idempotency-Key": "protected-create",
+        },
+    )
+    assert accepted.status_code == 202
+    assert accepted.headers["location"].endswith(
+        accepted.json()["operation"]["operation_id"]
+    )
+
+
+def test_multi_mode_fails_closed_when_admin_key_is_unconfigured(tmp_path: Path):
+    manager = _manager(tmp_path)
+    app = FastAPI()
+    app.include_router(create_knowledge_base_routes(manager))
+    client = TestClient(app)
+
+    assert (
+        client.post(
+            "/knowledge-bases",
+            json={"name": "No admin boundary", "isolation_level": "logical"},
+        ).status_code
+        == 503
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_lifecycle_failure_never_enters_data_plane(
+    tmp_path: Path,
+) -> None:
+    class FailingMigrationRag(_FakeRag):
+        async def check_and_migrate_data(self) -> None:
+            raise RuntimeError("simulated migration failure with private details")
+
+    manager = _manager(
+        tmp_path,
+        rag_factory=lambda record, _profile: FailingMigrationRag(
+            record.effective_workspace
+        ),
+    )
+    record, operation, created = await manager.create_lifecycle(
+        name="Will fail",
+        isolation_level="logical",
+        storage_profile_id=None,
+        idempotency_key="failing-create",
+    )
+    assert created is True
+
+    terminal = await manager.wait_for_operation(operation.operation_id, timeout=2)
+    failed_record = await manager.catalog_provider.get_record(
+        record.id, include_tombstoned=True
+    )
+    assert terminal.state.value == "FAILED"
+    assert failed_record.lifecycle_state == "ERROR"
+    assert failed_record.error_code == "workspace_initialization_failed"
+    assert failed_record.error_message == "RuntimeError"
+    assert "private details" not in failed_record.public_dict().values()
+    with pytest.raises(KnowledgeBaseConflictError, match="ERROR"):
+        await manager.get_context(record.id)
 
 
 def test_legacy_mode_exposes_only_default_and_rejects_management_create(
@@ -381,7 +500,9 @@ def test_legacy_mode_exposes_only_default_and_rejects_management_create(
         storage_profile_id=None,
     )
     app = FastAPI()
-    app.include_router(create_knowledge_base_routes(manager))
+    app.include_router(
+        create_knowledge_base_routes(manager, admin_api_key="admin-secret")
+    )
     client = TestClient(app)
 
     listed = client.get("/knowledge-bases")
@@ -394,6 +515,7 @@ def test_legacy_mode_exposes_only_default_and_rejects_management_create(
         client.post(
             "/knowledge-bases",
             json={"name": "Rejected", "isolation_level": "logical"},
+            headers={"X-LightRAG-Admin-Key": "admin-secret"},
         ).status_code
         == 409
     )

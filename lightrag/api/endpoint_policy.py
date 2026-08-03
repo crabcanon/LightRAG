@@ -63,7 +63,11 @@ def _policies() -> dict[str, EndpointPolicy]:
     }
     liveness = {"get_status", "get_version"}
     control_observation = {"get_tags", "get_running_models"}
-    management_read = {"list_knowledge_bases", "get_knowledge_base"}
+    management_read = {
+        "list_knowledge_bases",
+        "get_knowledge_base",
+        "get_knowledge_base_operation",
+    }
     data_read = {
         "get_scan_job_status",
         "list_source_conflicts",

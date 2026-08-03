@@ -10,19 +10,33 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import threading
 from typing import Annotated, Any, AsyncIterator, Callable, Literal, Mapping, Sequence
 from uuid import uuid4
 
 from fastapi import Header, HTTPException, Request
 
+from lightrag.api.catalog import (
+    CATALOG_SCHEMA_VERSION,
+    CatalogCASConflict,
+    CatalogIdempotencyConflict,
+    CatalogOperation,
+    CatalogOperationNotFound,
+    CatalogOperationState,
+    CatalogOperationType,
+    CatalogProvider,
+    LocalCatalogProvider,
+    WorkspaceLifecycleState,
+    canonical_payload_hash,
+)
 from lightrag.file_atomic import atomic_write
 from lightrag.kg.shared_storage import get_namespace_data
 from lightrag.kg.storage_profiles import (
@@ -112,6 +126,29 @@ class KnowledgeBaseRecord:
     workspace_kind: Literal["legacy_default", "named"]
     canonical_workspace_key: str
     namespace_codec_version: Literal["legacy-v1", "namespace-v1"]
+    lifecycle_state: str = WorkspaceLifecycleState.ACTIVE.value
+    revision: int = 1
+    schema_version: int = CATALOG_SCHEMA_VERSION
+    current_operation_id: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    tombstoned_at: str | None = None
+
+    @classmethod
+    def legacy_default(cls, workspace: str) -> "KnowledgeBaseRecord":
+        now = _utc_now()
+        return cls(
+            id=DEFAULT_KNOWLEDGE_BASE_ID,
+            name="Default",
+            effective_workspace=workspace,
+            isolation_level="logical",
+            storage_profile_id=None,
+            created_at=now,
+            updated_at=now,
+            workspace_kind="legacy_default",
+            canonical_workspace_key=LEGACY_DEFAULT_CANONICAL_KEY,
+            namespace_codec_version=LEGACY_NAMESPACE_CODEC,
+        )
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "KnowledgeBaseRecord":
@@ -145,6 +182,23 @@ class KnowledgeBaseRecord:
                     LEGACY_NAMESPACE_CODEC if is_default else NAMED_NAMESPACE_CODEC,
                 )
             ),  # type: ignore[arg-type]
+            lifecycle_state=str(
+                value.get("lifecycle_state", WorkspaceLifecycleState.ACTIVE.value)
+            ),
+            revision=int(value.get("revision", 1)),
+            schema_version=int(value.get("schema_version", CATALOG_SCHEMA_VERSION)),
+            current_operation_id=(
+                str(value["current_operation_id"])
+                if value.get("current_operation_id")
+                else None
+            ),
+            error_code=str(value["error_code"]) if value.get("error_code") else None,
+            error_message=(
+                str(value["error_message"]) if value.get("error_message") else None
+            ),
+            tombstoned_at=(
+                str(value["tombstoned_at"]) if value.get("tombstoned_at") else None
+            ),
         )
         record.validate()
         return record
@@ -161,6 +215,11 @@ class KnowledgeBaseRecord:
             raise ValueError("Physical isolation requires a storage profile")
         if self.isolation_level == "logical" and self.storage_profile_id:
             raise ValueError("Logical isolation cannot reference a storage profile")
+        WorkspaceLifecycleState(self.lifecycle_state)
+        if self.revision < 1:
+            raise ValueError("Knowledge-base revision must be positive")
+        if self.schema_version < 1:
+            raise ValueError("Knowledge-base schema_version must be positive")
         self.to_workspace_binding().validate()
 
     def to_workspace_binding(self, *, server_mode: str = "multi") -> WorkspaceBinding:
@@ -171,7 +230,7 @@ class KnowledgeBaseRecord:
             codec_version=NamespaceCodec(self.namespace_codec_version),
             physical_workspace=self.effective_workspace,
             storage_profile_id=self.storage_profile_id,
-            catalog_revision=0,
+            catalog_revision=self.revision,
             server_mode=server_mode,
         )
 
@@ -189,22 +248,12 @@ class KnowledgeBaseCatalog:
         self.default_workspace = default_workspace
         self._lock = threading.RLock()
         self._records: dict[str, KnowledgeBaseRecord] = {}
+        self._operations: dict[str, CatalogOperation] = {}
+        self._fencing_token = 0
         self._load_or_create()
 
     def _default_record(self) -> KnowledgeBaseRecord:
-        now = _utc_now()
-        return KnowledgeBaseRecord(
-            id=DEFAULT_KNOWLEDGE_BASE_ID,
-            name="Default",
-            effective_workspace=self.default_workspace,
-            isolation_level="logical",
-            storage_profile_id=None,
-            created_at=now,
-            updated_at=now,
-            workspace_kind="legacy_default",
-            canonical_workspace_key=LEGACY_DEFAULT_CANONICAL_KEY,
-            namespace_codec_version=LEGACY_NAMESPACE_CODEC,
-        )
+        return KnowledgeBaseRecord.legacy_default(self.default_workspace)
 
     def _load_or_create(self) -> None:
         with self._lock:
@@ -263,6 +312,35 @@ class KnowledgeBaseCatalog:
                     "workspace; refusing to remap existing data"
                 )
             self._records = records
+            raw_operations = payload.get("operations", [])
+            if not isinstance(raw_operations, list):
+                raise KnowledgeBaseError(
+                    "Knowledge-base catalog field 'operations' must be a list"
+                )
+            operations = [CatalogOperation.from_dict(item) for item in raw_operations]
+            self._operations = {
+                operation.operation_id: operation for operation in operations
+            }
+            if len(self._operations) != len(operations):
+                raise KnowledgeBaseError(
+                    "Knowledge-base catalog contains duplicate operation IDs"
+                )
+            idempotency_keys = [
+                operation.idempotency_key
+                for operation in operations
+                if operation.idempotency_key is not None
+            ]
+            if len(set(idempotency_keys)) != len(idempotency_keys):
+                raise KnowledgeBaseError(
+                    "Knowledge-base catalog contains duplicate idempotency keys"
+                )
+            self._fencing_token = max(
+                int(payload.get("fencing_token", 0)),
+                max(
+                    (operation.fencing_token for operation in operations),
+                    default=0,
+                ),
+            )
 
     def _persist_locked(self) -> None:
         payload = {
@@ -271,6 +349,13 @@ class KnowledgeBaseCatalog:
                 record.public_dict()
                 for record in sorted(self._records.values(), key=lambda item: item.id)
             ],
+            "operations": [
+                operation.public_dict()
+                for operation in sorted(
+                    self._operations.values(), key=lambda item: item.operation_id
+                )
+            ],
+            "fencing_token": self._fencing_token,
         }
 
         def _write(temp_path: str) -> None:
@@ -348,6 +433,7 @@ class KnowledgeBaseCatalog:
                 **{
                     **current.public_dict(),
                     "name": name,
+                    "revision": current.revision + 1,
                     "updated_at": _utc_now(),
                 }
             )
@@ -374,6 +460,289 @@ class KnowledgeBaseCatalog:
                 self._records[normalized] = record
                 raise
             return record
+
+    def create_workspace_operation(
+        self,
+        *,
+        record: KnowledgeBaseRecord,
+        idempotency_key: str | None,
+        payload: Mapping[str, Any],
+    ) -> tuple[KnowledgeBaseRecord, CatalogOperation, bool]:
+        """Atomically persist CREATING + PENDING in the local provider."""
+
+        payload_hash = canonical_payload_hash(payload)
+        with self._lock:
+            if idempotency_key:
+                existing = next(
+                    (
+                        operation
+                        for operation in self._operations.values()
+                        if operation.idempotency_key == idempotency_key
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    if (
+                        existing.operation_type is not CatalogOperationType.CREATE
+                        or existing.payload_hash != payload_hash
+                    ):
+                        raise CatalogIdempotencyConflict(
+                            "Idempotency key is already used by a different request"
+                        )
+                    return self._records[existing.workspace_id], existing, False
+            if record.id in self._records:
+                raise KnowledgeBaseConflictError(
+                    f"Knowledge base {record.id!r} already exists"
+                )
+            if any(
+                item.canonical_workspace_key == record.canonical_workspace_key
+                for item in self._records.values()
+            ):
+                raise KnowledgeBaseConflictError(
+                    "Knowledge-base canonical workspace already exists"
+                )
+            now = _utc_now()
+            operation = CatalogOperation(
+                operation_id=f"op_{uuid4().hex}",
+                workspace_id=record.id,
+                operation_type=CatalogOperationType.CREATE,
+                state=CatalogOperationState.PENDING,
+                payload_hash=payload_hash,
+                idempotency_key=idempotency_key,
+                owner_id=None,
+                fencing_token=0,
+                revision=1,
+                created_at=now,
+                updated_at=now,
+                metadata=dict(payload),
+            )
+            pending_record = replace(
+                record,
+                lifecycle_state=WorkspaceLifecycleState.CREATING.value,
+                revision=1,
+                current_operation_id=operation.operation_id,
+                error_code=None,
+                error_message=None,
+                updated_at=now,
+            )
+            pending_record.validate()
+            self._records[pending_record.id] = pending_record
+            self._operations[operation.operation_id] = operation
+            try:
+                self._persist_locked()
+            except BaseException:
+                self._records.pop(pending_record.id, None)
+                self._operations.pop(operation.operation_id, None)
+                raise
+            return pending_record, operation, True
+
+    def get_operation(self, operation_id: str) -> CatalogOperation:
+        with self._lock:
+            try:
+                return self._operations[operation_id]
+            except KeyError as exc:
+                raise CatalogOperationNotFound(
+                    f"Catalog operation {operation_id!r} does not exist"
+                ) from exc
+
+    def create_delete_operation(
+        self,
+        *,
+        workspace_id: str,
+        idempotency_key: str | None,
+        payload: Mapping[str, Any],
+    ) -> tuple[KnowledgeBaseRecord, CatalogOperation, bool]:
+        """Atomically persist ACTIVE -> DELETING plus its operation."""
+
+        payload_hash = canonical_payload_hash(payload)
+        with self._lock:
+            if idempotency_key:
+                existing = next(
+                    (
+                        operation
+                        for operation in self._operations.values()
+                        if operation.idempotency_key == idempotency_key
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    if (
+                        existing.operation_type is not CatalogOperationType.DELETE
+                        or existing.payload_hash != payload_hash
+                    ):
+                        raise CatalogIdempotencyConflict(
+                            "Idempotency key is already used by a different request"
+                        )
+                    return self._records[existing.workspace_id], existing, False
+
+            record = self.get(workspace_id)
+            if record.lifecycle_state != WorkspaceLifecycleState.ACTIVE.value:
+                raise CatalogCASConflict(
+                    f"Workspace {workspace_id!r} is not ACTIVE and cannot be deleted"
+                )
+            now = _utc_now()
+            operation = CatalogOperation(
+                operation_id=f"op_{uuid4().hex}",
+                workspace_id=record.id,
+                operation_type=CatalogOperationType.DELETE,
+                state=CatalogOperationState.PENDING,
+                payload_hash=payload_hash,
+                idempotency_key=idempotency_key,
+                owner_id=None,
+                fencing_token=0,
+                revision=1,
+                created_at=now,
+                updated_at=now,
+                metadata=dict(payload),
+            )
+            deleting = replace(
+                record,
+                lifecycle_state=WorkspaceLifecycleState.DELETING.value,
+                revision=record.revision + 1,
+                current_operation_id=operation.operation_id,
+                error_code=None,
+                error_message=None,
+                updated_at=now,
+            )
+            self._records[record.id] = deleting
+            self._operations[operation.operation_id] = operation
+            try:
+                self._persist_locked()
+            except BaseException:
+                self._records[record.id] = record
+                self._operations.pop(operation.operation_id, None)
+                raise
+            return deleting, operation, True
+
+    def claim_operation(self, operation_id: str, *, owner_id: str) -> CatalogOperation:
+        with self._lock:
+            current = self.get_operation(operation_id)
+            if current.state not in {
+                CatalogOperationState.PENDING,
+                CatalogOperationState.FAILED,
+            }:
+                raise CatalogCASConflict(
+                    f"Catalog operation {operation_id!r} is not claimable"
+                )
+            self._fencing_token += 1
+            updated = replace(
+                current,
+                state=CatalogOperationState.RUNNING,
+                owner_id=owner_id,
+                fencing_token=self._fencing_token,
+                revision=current.revision + 1,
+                retry_count=current.retry_count
+                + (1 if current.state is CatalogOperationState.FAILED else 0),
+                error_code=None,
+                error_message=None,
+                updated_at=_utc_now(),
+            )
+            self._operations[operation_id] = updated
+            self._persist_locked()
+            return updated
+
+    def transition_record(
+        self,
+        workspace_id: str,
+        *,
+        expected_revision: int,
+        expected_states: Sequence[WorkspaceLifecycleState],
+        target_state: WorkspaceLifecycleState,
+        operation_id: str,
+        owner_id: str,
+        fencing_token: int,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> KnowledgeBaseRecord:
+        with self._lock:
+            record = self.get(workspace_id)
+            operation = self.get_operation(operation_id)
+            if (
+                record.revision != expected_revision
+                or WorkspaceLifecycleState(record.lifecycle_state)
+                not in set(expected_states)
+                or record.current_operation_id != operation_id
+                or operation.state is not CatalogOperationState.RUNNING
+                or operation.owner_id != owner_id
+                or operation.fencing_token != fencing_token
+            ):
+                raise CatalogCASConflict(
+                    f"Workspace {workspace_id!r} lifecycle CAS was rejected"
+                )
+            now = _utc_now()
+            updated = replace(
+                record,
+                lifecycle_state=target_state.value,
+                revision=record.revision + 1,
+                error_code=error_code,
+                error_message=error_message,
+                tombstoned_at=(
+                    now
+                    if target_state is WorkspaceLifecycleState.TOMBSTONED
+                    else record.tombstoned_at
+                ),
+                updated_at=now,
+            )
+            self._records[workspace_id] = updated
+            self._persist_locked()
+            return updated
+
+    def finish_operation(
+        self,
+        operation_id: str,
+        *,
+        owner_id: str,
+        fencing_token: int,
+        state: CatalogOperationState,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> CatalogOperation:
+        if state not in {CatalogOperationState.SUCCEEDED, CatalogOperationState.FAILED}:
+            raise ValueError("Operation can finish only as SUCCEEDED or FAILED")
+        with self._lock:
+            current = self.get_operation(operation_id)
+            if (
+                current.state is not CatalogOperationState.RUNNING
+                or current.owner_id != owner_id
+                or current.fencing_token != fencing_token
+            ):
+                raise CatalogCASConflict(
+                    f"Catalog operation {operation_id!r} finish was fenced out"
+                )
+            updated = replace(
+                current,
+                state=state,
+                revision=current.revision + 1,
+                error_code=error_code,
+                error_message=error_message,
+                updated_at=_utc_now(),
+            )
+            self._operations[operation_id] = updated
+            self._persist_locked()
+            return updated
+
+    def list_unfinished_operations(
+        self, *, limit: int = 100
+    ) -> tuple[CatalogOperation, ...]:
+        if not 1 <= limit <= 1000:
+            raise ValueError("Operation page limit must be between 1 and 1000")
+        with self._lock:
+            unfinished = [
+                operation
+                for operation in self._operations.values()
+                if operation.state
+                in {
+                    CatalogOperationState.PENDING,
+                    CatalogOperationState.RUNNING,
+                    CatalogOperationState.FAILED,
+                }
+            ]
+            return tuple(
+                sorted(
+                    unfinished,
+                    key=lambda item: (item.updated_at, item.operation_id),
+                )[:limit]
+            )
 
 
 def validate_knowledge_base_id(value: str | None) -> str:
@@ -434,7 +803,8 @@ class KnowledgeBaseManager:
     def __init__(
         self,
         *,
-        catalog: KnowledgeBaseCatalog,
+        catalog: KnowledgeBaseCatalog | CatalogProvider,
+        default_record: KnowledgeBaseRecord | None = None,
         default_rag: Any,
         default_document_manager: Any,
         rag_factory: Callable[[KnowledgeBaseRecord, Mapping[str, Any] | None], Any],
@@ -451,7 +821,12 @@ class KnowledgeBaseManager:
     ) -> None:
         if max_loaded_instances < 1:
             raise ValueError("max_loaded_instances must be at least 1")
-        self.catalog = catalog
+        if isinstance(catalog, CatalogProvider):
+            self.catalog_provider = catalog
+            self.catalog = getattr(catalog, "catalog", catalog)
+        else:
+            self.catalog = catalog
+            self.catalog_provider = LocalCatalogProvider(catalog)
         self._rag_factory = rag_factory
         self._document_manager_factory = document_manager_factory
         self._storage_profiles = dict(storage_profiles or {})
@@ -471,7 +846,9 @@ class KnowledgeBaseManager:
         )
         self._max_loaded_instances = max_loaded_instances
         self.multi_workspace_enabled = multi_workspace_enabled
-        default_record = catalog.get(DEFAULT_KNOWLEDGE_BASE_ID)
+        default_record = default_record or self._catalog_get_cached(
+            DEFAULT_KNOWLEDGE_BASE_ID
+        )
         self.default_context = KnowledgeBaseContext(
             metadata=default_record,
             rag=default_rag,
@@ -484,10 +861,30 @@ class KnowledgeBaseManager:
         self._manager_lock = asyncio.Lock()
         self._initialized_ids: set[str] = set()
         self._deleting_ids: set[str] = set()
+        self._lifecycle_tasks: dict[str, asyncio.Task[None]] = {}
+        self._lifecycle_owner_id = (
+            f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:12]}"
+        )
         self._started = False
         self.side_effect_counters = KnowledgeBaseSideEffectCounters()
         self.rag_proxy = RequestScopedProxy(self, "rag")
         self.document_manager_proxy = RequestScopedProxy(self, "document_manager")
+
+    def _catalog_get_cached(self, knowledge_base_id: str) -> KnowledgeBaseRecord:
+        get_cached = getattr(self.catalog_provider, "get_cached", None)
+        if not callable(get_cached):
+            raise KnowledgeBaseError(
+                "Catalog provider does not expose a local snapshot"
+            )
+        return get_cached(knowledge_base_id)
+
+    def _catalog_list_cached(self) -> list[KnowledgeBaseRecord]:
+        list_cached = getattr(self.catalog_provider, "list_cached", None)
+        if not callable(list_cached):
+            raise KnowledgeBaseError(
+                "Catalog provider does not expose a local snapshot"
+            )
+        return list(list_cached())
 
     @classmethod
     def load_storage_profiles(cls, path: str | None) -> dict[str, Mapping[str, Any]]:
@@ -532,7 +929,7 @@ class KnowledgeBaseManager:
         return result
 
     def list_records(self) -> list[KnowledgeBaseRecord]:
-        records = self.catalog.list()
+        records = self._catalog_list_cached()
         if self.multi_workspace_enabled:
             return records
         return [record for record in records if record.id == DEFAULT_KNOWLEDGE_BASE_ID]
@@ -540,16 +937,59 @@ class KnowledgeBaseManager:
     def get_record(self, knowledge_base_id: str) -> KnowledgeBaseRecord:
         normalized = validate_knowledge_base_id(knowledge_base_id)
         if not self.multi_workspace_enabled and normalized != DEFAULT_KNOWLEDGE_BASE_ID:
-            self.catalog.get(normalized)
+            self._catalog_get_cached(normalized)
             raise KnowledgeBaseNotFoundError(
                 "Multi-workspace mode is disabled; only the default knowledge "
                 "base is available"
             )
-        return self.catalog.get(normalized)
+        return self._catalog_get_cached(normalized)
+
+    async def alist_records(self) -> list[KnowledgeBaseRecord]:
+        page = await self.catalog_provider.list_records(limit=1000)
+        records = list(page.records)
+        if self.multi_workspace_enabled:
+            return records
+        return [record for record in records if record.id == DEFAULT_KNOWLEDGE_BASE_ID]
+
+    async def alist_record_page(
+        self,
+        *,
+        limit: int,
+        cursor: str | None,
+        states: Sequence[WorkspaceLifecycleState] | None = None,
+    ):
+        page = await self.catalog_provider.list_records(
+            limit=limit, cursor=cursor, states=states
+        )
+        if self.multi_workspace_enabled:
+            return page
+        records = tuple(
+            record for record in page.records if record.id == DEFAULT_KNOWLEDGE_BASE_ID
+        )
+        return type(page)(records=records, next_cursor=None)
+
+    async def aget_record(self, knowledge_base_id: str) -> KnowledgeBaseRecord:
+        normalized = validate_knowledge_base_id(knowledge_base_id)
+        if not self.multi_workspace_enabled and normalized != DEFAULT_KNOWLEDGE_BASE_ID:
+            await self.catalog_provider.get_record(normalized)
+            raise KnowledgeBaseNotFoundError(
+                "Multi-workspace mode is disabled; only the default knowledge "
+                "base is available"
+            )
+        return await self.catalog_provider.get_record(normalized)
 
     def rename(self, knowledge_base_id: str, name: str) -> KnowledgeBaseRecord:
         current = self.get_record(knowledge_base_id)
         return self.catalog.rename(current.id, name)
+
+    async def arename(self, knowledge_base_id: str, name: str) -> KnowledgeBaseRecord:
+        name = name.strip()
+        if not name or len(name) > 128:
+            raise ValueError("Knowledge-base name must contain 1-128 characters")
+        current = await self.aget_record(knowledge_base_id)
+        return await self.catalog_provider.update_name(
+            current.id, expected_revision=current.revision, name=name
+        )
 
     def _profile_for(self, record: KnowledgeBaseRecord) -> Mapping[str, Any] | None:
         if record.isolation_level == "logical":
@@ -595,7 +1035,7 @@ class KnowledgeBaseManager:
             namespace_codec_version=NAMED_NAMESPACE_CODEC,
         )
         self._profile_for(candidate)
-        for record in self.catalog.list():
+        for record in self._catalog_list_cached():
             if record.storage_profile_id == profile_id:
                 raise StorageProfileError(
                     f"Storage profile {profile_id!r} is already assigned to {record.id!r}"
@@ -613,7 +1053,7 @@ class KnowledgeBaseManager:
                 f"Storage profile {profile_id!r} reuses default resources: "
                 + ", ".join(default_reuse)
             )
-        for record in self.catalog.list():
+        for record in self._catalog_list_cached():
             if not record.storage_profile_id:
                 continue
             assigned_profile = self._storage_profiles.get(record.storage_profile_id)
@@ -636,6 +1076,10 @@ class KnowledgeBaseManager:
     async def initialize(self) -> None:
         self._started = True
         try:
+            durable_default = await self.catalog_provider.initialize(
+                self.default_context.metadata
+            )
+            self.default_context.metadata = durable_default
             await self._initialize_context(self.default_context)
         except BaseException:
             self._started = False
@@ -674,7 +1118,7 @@ class KnowledgeBaseManager:
         except ValueError as exc:
             raise KnowledgeBaseNotFoundError(str(exc)) from exc
         if not self.multi_workspace_enabled and normalized != DEFAULT_KNOWLEDGE_BASE_ID:
-            self.catalog.get(normalized)
+            await self.catalog_provider.get_record(normalized)
             raise KnowledgeBaseNotFoundError(
                 "Multi-workspace mode is disabled; only the default knowledge "
                 "base is available"
@@ -683,13 +1127,18 @@ class KnowledgeBaseManager:
             raise KnowledgeBaseConflictError(
                 f"Knowledge base {normalized!r} is being deleted"
             )
+        record = await self.catalog_provider.get_record(normalized)
+        if record.lifecycle_state != WorkspaceLifecycleState.ACTIVE.value:
+            raise KnowledgeBaseConflictError(
+                f"Knowledge base {normalized!r} is {record.lifecycle_state}"
+            )
         existing = self._contexts.get(normalized)
         if existing is not None:
+            existing.metadata = record
             if self._started:
                 await self._initialize_context(existing)
             return existing
 
-        record = self.catalog.get(normalized)
         profile = self._profile_for(record)
         async with self._manager_lock:
             context = self._contexts.get(normalized)
@@ -715,13 +1164,19 @@ class KnowledgeBaseManager:
         self, knowledge_base_id: str | None
     ) -> AsyncIterator[KnowledgeBaseContext]:
         context = await self.get_context(knowledge_base_id)
-        context.active_requests += 1
+        async with self._manager_lock:
+            if context.metadata.id in self._deleting_ids:
+                raise KnowledgeBaseConflictError(
+                    f"Knowledge base {context.metadata.id!r} is being deleted"
+                )
+            context.active_requests += 1
         token = _current_context.set(context)
         try:
             yield context
         finally:
             _current_context.reset(token)
-            context.active_requests = max(0, context.active_requests - 1)
+            async with self._manager_lock:
+                context.active_requests = max(0, context.active_requests - 1)
 
     async def request_dependency(
         self,
@@ -774,6 +1229,483 @@ class KnowledgeBaseManager:
             storage_profile_id=storage_profile_id,
         )
 
+    async def create_lifecycle(
+        self,
+        *,
+        name: str,
+        isolation_level: Literal["logical", "physical"],
+        storage_profile_id: str | None,
+        idempotency_key: str | None,
+    ) -> tuple[KnowledgeBaseRecord, CatalogOperation, bool]:
+        """Persist an idempotent create operation and schedule its owner task."""
+
+        if not self.multi_workspace_enabled:
+            raise KnowledgeBaseConflictError("Multi-workspace mode is disabled")
+        name = name.strip()
+        if not name or len(name) > 128:
+            raise ValueError("Knowledge-base name must contain 1-128 characters")
+        if idempotency_key is not None:
+            idempotency_key = idempotency_key.strip()
+            if not idempotency_key or len(idempotency_key) > 128:
+                raise ValueError("Idempotency-Key must contain 1-128 characters")
+        if isolation_level == "logical" and storage_profile_id:
+            raise ValueError("storage_profile_id is only valid for physical isolation")
+        if isolation_level == "physical":
+            # A shared provider cache may contain only recently accessed rows.
+            # Refresh it before enforcing profile ownership/fingerprint reuse.
+            await self.alist_records()
+            self._assert_profile_available(storage_profile_id)
+        else:
+            candidate = KnowledgeBaseRecord(
+                id="candidate",
+                name=name,
+                effective_workspace="candidate",
+                isolation_level="logical",
+                storage_profile_id=None,
+                created_at=_utc_now(),
+                updated_at=_utc_now(),
+                workspace_kind="named",
+                canonical_workspace_key="candidate",
+                namespace_codec_version=NAMED_NAMESPACE_CODEC,
+            )
+            self._profile_for(candidate)
+
+        now = _utc_now()
+        knowledge_base_id = f"kb_{uuid4().hex[:12]}"
+        requested = KnowledgeBaseRecord(
+            id=knowledge_base_id,
+            name=name,
+            effective_workspace=knowledge_base_id,
+            isolation_level=isolation_level,
+            storage_profile_id=storage_profile_id,
+            created_at=now,
+            updated_at=now,
+            workspace_kind="named",
+            canonical_workspace_key=knowledge_base_id,
+            namespace_codec_version=NAMED_NAMESPACE_CODEC,
+            lifecycle_state=WorkspaceLifecycleState.CREATING.value,
+        )
+        payload = {
+            "name": name,
+            "isolation_level": isolation_level,
+            "storage_profile_id": storage_profile_id,
+        }
+        (
+            record,
+            operation,
+            created,
+        ) = await self.catalog_provider.create_workspace_operation(
+            record=requested,
+            idempotency_key=idempotency_key,
+            payload=payload,
+        )
+        if created or operation.state in {
+            CatalogOperationState.PENDING,
+            CatalogOperationState.FAILED,
+        }:
+            self._schedule_create_lifecycle(operation.operation_id)
+        return record, operation, created
+
+    def _schedule_create_lifecycle(self, operation_id: str) -> asyncio.Task[None]:
+        existing = self._lifecycle_tasks.get(operation_id)
+        if existing is not None and not existing.done():
+            return existing
+        task = asyncio.create_task(
+            self._run_create_lifecycle(operation_id),
+            name=f"workspace-create:{operation_id}",
+        )
+        self._lifecycle_tasks[operation_id] = task
+
+        def _discard(completed: asyncio.Task[None]) -> None:
+            self._lifecycle_tasks.pop(operation_id, None)
+            try:
+                completed.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.error(
+                    "Workspace lifecycle task %s failed: %s", operation_id, exc
+                )
+
+        task.add_done_callback(_discard)
+        return task
+
+    async def _run_create_lifecycle(self, operation_id: str) -> None:
+        claim: CatalogOperation | None = None
+        context: KnowledgeBaseContext | None = None
+        try:
+            claim = await self.catalog_provider.claim_operation(
+                operation_id, owner_id=self._lifecycle_owner_id
+            )
+            if claim.operation_type is not CatalogOperationType.CREATE:
+                raise CatalogCASConflict(
+                    f"Operation {operation_id!r} is not a workspace create"
+                )
+            record = await self.catalog_provider.get_record(
+                claim.workspace_id, include_tombstoned=True
+            )
+            migrating = await self.catalog_provider.transition_record(
+                record.id,
+                expected_revision=record.revision,
+                expected_states=(
+                    WorkspaceLifecycleState.CREATING,
+                    WorkspaceLifecycleState.ERROR,
+                ),
+                target_state=WorkspaceLifecycleState.MIGRATING,
+                operation_id=operation_id,
+                owner_id=self._lifecycle_owner_id,
+                fencing_token=claim.fencing_token,
+            )
+            profile = self._profile_for(migrating)
+            async with self._manager_lock:
+                context = self._contexts.get(migrating.id)
+                if context is None:
+                    if len(self._contexts) >= self._max_loaded_instances:
+                        raise KnowledgeBaseConflictError(
+                            "Maximum loaded knowledge-base instances reached "
+                            f"({self._max_loaded_instances})"
+                        )
+                    self.side_effect_counters.instance_constructions += 1
+                    context = KnowledgeBaseContext(
+                        metadata=migrating,
+                        rag=self._rag_factory(migrating, profile),
+                        document_manager=self._document_manager_factory(
+                            migrating, profile
+                        ),
+                    )
+                    self._contexts[migrating.id] = context
+            await self._initialize_context(context)
+            # The control-plane migration instance is bound to the MIGRATING
+            # catalog revision.  Never publish/reuse it as an ACTIVE data-plane
+            # instance; finalize it first and let the pool construct from the
+            # immutable ACTIVE snapshot on demand.
+            await context.rag.finalize_storages()
+            self._initialized_ids.discard(migrating.id)
+            self._contexts.pop(migrating.id, None)
+            await self.catalog_provider.transition_record(
+                migrating.id,
+                expected_revision=migrating.revision,
+                expected_states=(WorkspaceLifecycleState.MIGRATING,),
+                target_state=WorkspaceLifecycleState.ACTIVE,
+                operation_id=operation_id,
+                owner_id=self._lifecycle_owner_id,
+                fencing_token=claim.fencing_token,
+            )
+            await self.catalog_provider.finish_operation(
+                operation_id,
+                owner_id=self._lifecycle_owner_id,
+                fencing_token=claim.fencing_token,
+                state=CatalogOperationState.SUCCEEDED,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Workspace create operation %s failed: %s", operation_id, exc)
+            if claim is not None:
+                try:
+                    current = await self.catalog_provider.get_record(
+                        claim.workspace_id, include_tombstoned=True
+                    )
+                    if current.lifecycle_state in {
+                        WorkspaceLifecycleState.CREATING.value,
+                        WorkspaceLifecycleState.MIGRATING.value,
+                    }:
+                        await self.catalog_provider.transition_record(
+                            current.id,
+                            expected_revision=current.revision,
+                            expected_states=(
+                                WorkspaceLifecycleState(current.lifecycle_state),
+                            ),
+                            target_state=WorkspaceLifecycleState.ERROR,
+                            operation_id=operation_id,
+                            owner_id=self._lifecycle_owner_id,
+                            fencing_token=claim.fencing_token,
+                            error_code="workspace_initialization_failed",
+                            error_message=type(exc).__name__,
+                        )
+                    await self.catalog_provider.finish_operation(
+                        operation_id,
+                        owner_id=self._lifecycle_owner_id,
+                        fencing_token=claim.fencing_token,
+                        state=CatalogOperationState.FAILED,
+                        error_code="workspace_initialization_failed",
+                        error_message=type(exc).__name__,
+                    )
+                except Exception as update_error:
+                    logger.error(
+                        "Failed to persist workspace operation %s failure: %s",
+                        operation_id,
+                        update_error,
+                    )
+
+    async def wait_for_operation(
+        self, operation_id: str, *, timeout: float
+    ) -> CatalogOperation:
+        if timeout <= 0:
+            return await self.catalog_provider.get_operation(operation_id)
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            operation = await self.catalog_provider.get_operation(operation_id)
+            if operation.state in {
+                CatalogOperationState.SUCCEEDED,
+                CatalogOperationState.FAILED,
+            }:
+                return operation
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return operation
+            await asyncio.sleep(min(0.05, remaining))
+
+    async def get_operation(self, operation_id: str) -> CatalogOperation:
+        return await self.catalog_provider.get_operation(operation_id)
+
+    async def delete_lifecycle(
+        self,
+        knowledge_base_id: str,
+        *,
+        idempotency_key: str | None,
+    ) -> tuple[KnowledgeBaseRecord, CatalogOperation, bool]:
+        """Fence new local leases, persist deletion intent, and schedule cleanup."""
+
+        if not self.multi_workspace_enabled:
+            raise KnowledgeBaseConflictError("Multi-workspace mode is disabled")
+        normalized = validate_knowledge_base_id(knowledge_base_id)
+        if normalized == DEFAULT_KNOWLEDGE_BASE_ID:
+            raise KnowledgeBaseConflictError(
+                "The default knowledge base cannot be deleted"
+            )
+        if idempotency_key is not None:
+            idempotency_key = idempotency_key.strip()
+            if not idempotency_key or len(idempotency_key) > 128:
+                raise ValueError("Idempotency-Key must contain 1-128 characters")
+
+        reserved = False
+        async with self._manager_lock:
+            if normalized not in self._deleting_ids:
+                context = self._contexts.get(normalized)
+                if context is not None and context.active_requests:
+                    raise KnowledgeBaseConflictError(
+                        f"Knowledge base {normalized!r} has active requests"
+                    )
+                record = await self.catalog_provider.get_record(
+                    normalized, include_tombstoned=True
+                )
+                pipeline_status = await get_namespace_data(
+                    "pipeline_status", workspace=record.effective_workspace
+                )
+                if pipeline_status and (
+                    pipeline_status.get("busy")
+                    or pipeline_status.get("scanning")
+                    or int(pipeline_status.get("pending_enqueues", 0) or 0) > 0
+                ):
+                    raise KnowledgeBaseConflictError(
+                        f"Knowledge base {normalized!r} has an active pipeline"
+                    )
+                self._deleting_ids.add(normalized)
+                reserved = True
+            try:
+                (
+                    record,
+                    operation,
+                    created,
+                ) = await self.catalog_provider.create_delete_operation(
+                    workspace_id=normalized,
+                    idempotency_key=idempotency_key,
+                    payload={"workspace_id": normalized},
+                )
+            except BaseException:
+                if reserved:
+                    self._deleting_ids.discard(normalized)
+                raise
+
+        if operation.state in {
+            CatalogOperationState.PENDING,
+            CatalogOperationState.FAILED,
+        }:
+            self._schedule_delete_lifecycle(operation.operation_id)
+        else:
+            self._deleting_ids.discard(normalized)
+        return record, operation, created
+
+    def _schedule_delete_lifecycle(self, operation_id: str) -> asyncio.Task[None]:
+        existing = self._lifecycle_tasks.get(operation_id)
+        if existing is not None and not existing.done():
+            return existing
+        task = asyncio.create_task(
+            self._run_delete_lifecycle(operation_id),
+            name=f"workspace-delete:{operation_id}",
+        )
+        self._lifecycle_tasks[operation_id] = task
+
+        def _discard(completed: asyncio.Task[None]) -> None:
+            self._lifecycle_tasks.pop(operation_id, None)
+            try:
+                completed.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.error(
+                    "Workspace delete lifecycle task %s failed: %s",
+                    operation_id,
+                    exc,
+                )
+
+        task.add_done_callback(_discard)
+        return task
+
+    async def _run_delete_lifecycle(self, operation_id: str) -> None:
+        claim: CatalogOperation | None = None
+        context: KnowledgeBaseContext | None = None
+        record: KnowledgeBaseRecord | None = None
+        try:
+            claim = await self.catalog_provider.claim_operation(
+                operation_id, owner_id=self._lifecycle_owner_id
+            )
+            if claim.operation_type is not CatalogOperationType.DELETE:
+                raise CatalogCASConflict(
+                    f"Operation {operation_id!r} is not a workspace delete"
+                )
+            record = await self.catalog_provider.get_record(
+                claim.workspace_id, include_tombstoned=True
+            )
+            record = await self.catalog_provider.transition_record(
+                record.id,
+                expected_revision=record.revision,
+                expected_states=(
+                    WorkspaceLifecycleState.DELETING,
+                    WorkspaceLifecycleState.ERROR,
+                ),
+                target_state=WorkspaceLifecycleState.DELETING,
+                operation_id=operation_id,
+                owner_id=self._lifecycle_owner_id,
+                fencing_token=claim.fencing_token,
+            )
+            async with self._manager_lock:
+                context = self._contexts.get(record.id)
+                if context is not None and context.active_requests:
+                    raise KnowledgeBaseConflictError(
+                        f"Knowledge base {record.id!r} has active requests"
+                    )
+                if context is None:
+                    profile = self._profile_for(record)
+                    self.side_effect_counters.instance_constructions += 1
+                    context = KnowledgeBaseContext(
+                        metadata=record,
+                        rag=self._rag_factory(record, profile),
+                        document_manager=self._document_manager_factory(
+                            record, profile
+                        ),
+                    )
+                    self._contexts[record.id] = context
+
+            if record.id not in self._initialized_ids:
+                self.side_effect_counters.storage_initializations += 1
+                await context.rag.initialize_storages()
+                self._initialized_ids.add(record.id)
+
+            validate_bindings = getattr(context.rag, "validate_storage_bindings", None)
+            if callable(validate_bindings):
+                try:
+                    validate_bindings(stage="pre-delete")
+                except ValueError as exc:
+                    raise KnowledgeBaseConflictError(
+                        f"Knowledge base {record.id!r} storage binding validation "
+                        "failed; destructive cleanup was refused"
+                    ) from exc
+
+            errors: list[str] = []
+            for attribute in _STORAGE_ATTRIBUTES:
+                storage = getattr(context.rag, attribute, None)
+                drop = getattr(storage, "drop", None)
+                if drop is None:
+                    continue
+                try:
+                    await drop()
+                except Exception as exc:
+                    errors.append(f"{attribute}: {type(exc).__name__}")
+            if errors:
+                raise KnowledgeBaseError(
+                    "Failed to drop all knowledge-base storages: " + "; ".join(errors)
+                )
+
+            await context.rag.finalize_storages()
+            self._initialized_ids.discard(record.id)
+            self._contexts.pop(record.id, None)
+            input_dir = Path(context.document_manager.input_dir).resolve()
+            base_input_dir = Path(context.document_manager.base_input_dir).resolve()
+            if input_dir != base_input_dir and base_input_dir in input_dir.parents:
+                if input_dir.exists():
+                    shutil.rmtree(input_dir)
+
+            tombstone = await self.catalog_provider.transition_record(
+                record.id,
+                expected_revision=record.revision,
+                expected_states=(WorkspaceLifecycleState.DELETING,),
+                target_state=WorkspaceLifecycleState.TOMBSTONED,
+                operation_id=operation_id,
+                owner_id=self._lifecycle_owner_id,
+                fencing_token=claim.fencing_token,
+            )
+            await self.catalog_provider.finish_operation(
+                operation_id,
+                owner_id=self._lifecycle_owner_id,
+                fencing_token=claim.fencing_token,
+                state=CatalogOperationState.SUCCEEDED,
+            )
+            record = tombstone
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Workspace delete operation %s failed: %s", operation_id, exc)
+            if claim is not None:
+                try:
+                    current = await self.catalog_provider.get_record(
+                        claim.workspace_id, include_tombstoned=True
+                    )
+                    if (
+                        current.lifecycle_state
+                        == WorkspaceLifecycleState.DELETING.value
+                    ):
+                        await self.catalog_provider.transition_record(
+                            current.id,
+                            expected_revision=current.revision,
+                            expected_states=(WorkspaceLifecycleState.DELETING,),
+                            target_state=WorkspaceLifecycleState.ERROR,
+                            operation_id=operation_id,
+                            owner_id=self._lifecycle_owner_id,
+                            fencing_token=claim.fencing_token,
+                            error_code="workspace_deletion_failed",
+                            error_message=type(exc).__name__,
+                        )
+                    await self.catalog_provider.finish_operation(
+                        operation_id,
+                        owner_id=self._lifecycle_owner_id,
+                        fencing_token=claim.fencing_token,
+                        state=CatalogOperationState.FAILED,
+                        error_code="workspace_deletion_failed",
+                        error_message=type(exc).__name__,
+                    )
+                except Exception as update_error:
+                    logger.error(
+                        "Failed to persist workspace delete %s failure: %s",
+                        operation_id,
+                        update_error,
+                    )
+        finally:
+            if context is not None and record is not None:
+                if record.id in self._initialized_ids:
+                    try:
+                        await context.rag.finalize_storages()
+                    except Exception as cleanup_error:
+                        logger.error(
+                            "Failed to finalize deleted workspace %s: %s",
+                            record.id,
+                            cleanup_error,
+                        )
+                    self._initialized_ids.discard(record.id)
+                    self._contexts.pop(record.id, None)
+                self._deleting_ids.discard(record.id)
+
     async def delete(self, knowledge_base_id: str) -> KnowledgeBaseRecord:
         if not self.multi_workspace_enabled:
             raise KnowledgeBaseConflictError("Multi-workspace mode is disabled")
@@ -782,7 +1714,9 @@ class KnowledgeBaseManager:
             raise KnowledgeBaseConflictError(
                 "The default knowledge base cannot be deleted"
             )
-        record = self.catalog.get(normalized)
+        record = await self.catalog_provider.get_record(
+            normalized, include_tombstoned=True
+        )
         context = await self.get_context(normalized)
         async with self._manager_lock:
             if normalized in self._deleting_ids:
@@ -844,6 +1778,12 @@ class KnowledgeBaseManager:
 
     async def finalize(self) -> None:
         errors: list[BaseException] = []
+        lifecycle_tasks = list(self._lifecycle_tasks.values())
+        for task in lifecycle_tasks:
+            task.cancel()
+        if lifecycle_tasks:
+            await asyncio.gather(*lifecycle_tasks, return_exceptions=True)
+        self._lifecycle_tasks.clear()
         for knowledge_base_id, context in list(self._contexts.items()):
             if knowledge_base_id not in self._initialized_ids:
                 continue
@@ -858,6 +1798,7 @@ class KnowledgeBaseManager:
                 )
         self._initialized_ids.clear()
         self._started = False
+        await self.catalog_provider.finalize()
         if errors:
             raise KnowledgeBaseError(
                 f"Failed to finalize {len(errors)} knowledge-base instance(s)"
