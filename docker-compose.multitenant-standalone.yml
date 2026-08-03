@@ -17,6 +17,9 @@ services:
       INPUT_DIR: /app/data/inputs
       PROMPT_DIR: /app/data/prompts
       LIGHTRAG_KNOWLEDGE_BASE_CATALOG: /app/data/rag_storage/knowledge_bases.json
+      LIGHTRAG_MULTI_WORKSPACE_MODE: multi
+      LIGHTRAG_KNOWLEDGE_BASE_CATALOG_PROVIDER: local
+      LIGHTRAG_WORKSPACE_COORDINATOR_PROVIDER: local
       LIGHTRAG_KV_STORAGE: JsonKVStorage
       LIGHTRAG_VECTOR_STORAGE: NanoVectorDBStorage
       LIGHTRAG_GRAPH_STORAGE: NetworkXStorage

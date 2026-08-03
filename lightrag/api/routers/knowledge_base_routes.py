@@ -58,7 +58,7 @@ def create_knowledge_base_routes(
         return {
             "default_id": DEFAULT_KNOWLEDGE_BASE_ID,
             "knowledge_bases": [
-                record.public_dict() for record in manager.catalog.list()
+                record.public_dict() for record in manager.list_records()
             ],
             "storage_profiles": manager.list_storage_profiles(),
         }
@@ -78,7 +78,7 @@ def create_knowledge_base_routes(
     @router.get("/{knowledge_base_id}", dependencies=authenticated)
     async def get_knowledge_base(knowledge_base_id: str):
         try:
-            return manager.catalog.get(knowledge_base_id).public_dict()
+            return manager.get_record(knowledge_base_id).public_dict()
         except Exception as exc:
             raise _translate_error(exc) from exc
 
@@ -87,7 +87,7 @@ def create_knowledge_base_routes(
         knowledge_base_id: str, request: KnowledgeBaseUpdateRequest
     ):
         try:
-            return manager.catalog.rename(knowledge_base_id, request.name).public_dict()
+            return manager.rename(knowledge_base_id, request.name).public_dict()
         except Exception as exc:
             raise _translate_error(exc) from exc
 

@@ -101,6 +101,7 @@ def _manager(
     profiles=None,
     default_storage_profile=None,
     active_storage_implementations=None,
+    multi_workspace_enabled: bool = True,
 ) -> KnowledgeBaseManager:
     catalog = KnowledgeBaseCatalog(
         tmp_path / "rag" / "knowledge_bases.json", default_workspace
@@ -127,6 +128,7 @@ def _manager(
                 "PGDocStatusStorage",
             )
         ),
+        multi_workspace_enabled=multi_workspace_enabled,
     )
 
 
@@ -323,6 +325,76 @@ def test_management_api_crud_and_default_delete_guard(tmp_path: Path):
         == 409
     )
     assert client.delete(f"/knowledge-bases/{knowledge_base_id}").status_code == 400
+
+
+def test_legacy_mode_exposes_only_default_and_rejects_management_create(
+    tmp_path: Path,
+):
+    manager = _manager(tmp_path, multi_workspace_enabled=False)
+    hidden = manager.catalog.create(
+        name="Hidden until multi mode",
+        isolation_level="logical",
+        storage_profile_id=None,
+    )
+    app = FastAPI()
+    app.include_router(create_knowledge_base_routes(manager))
+    client = TestClient(app)
+
+    listed = client.get("/knowledge-bases")
+    assert listed.status_code == 200
+    assert [record["id"] for record in listed.json()["knowledge_bases"]] == [
+        DEFAULT_KNOWLEDGE_BASE_ID
+    ]
+    assert client.get(f"/knowledge-bases/{hidden.id}").status_code == 404
+    assert (
+        client.post(
+            "/knowledge-bases",
+            json={"name": "Rejected", "isolation_level": "logical"},
+        ).status_code
+        == 409
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_mode_rejects_non_default_context(tmp_path: Path):
+    manager = _manager(tmp_path, multi_workspace_enabled=False)
+    hidden = manager.catalog.create(
+        name="Hidden until multi mode",
+        isolation_level="logical",
+        storage_profile_id=None,
+    )
+
+    default_context = await manager.get_context(None)
+    assert default_context.metadata.id == DEFAULT_KNOWLEDGE_BASE_ID
+    with pytest.raises(Exception, match="Multi-workspace mode is disabled"):
+        await manager.get_context(hidden.id)
+
+
+@pytest.mark.asyncio
+async def test_side_effect_counters_expose_construction_init_and_migration(
+    tmp_path: Path,
+):
+    manager = _manager(tmp_path)
+    await manager.initialize()
+    default_snapshot = manager.side_effect_counters.snapshot()
+    assert default_snapshot == {
+        "instance_constructions": 0,
+        "storage_initializations": 1,
+        "migrations": 1,
+    }
+
+    created = manager.create(
+        name="Observable lifecycle",
+        isolation_level="logical",
+        storage_profile_id=None,
+    )
+    await manager.get_context(created.id)
+
+    assert manager.side_effect_counters.snapshot() == {
+        "instance_constructions": 1,
+        "storage_initializations": 2,
+        "migrations": 2,
+    }
 
 
 @pytest.mark.asyncio

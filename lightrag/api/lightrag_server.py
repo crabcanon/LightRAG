@@ -68,6 +68,7 @@ from lightrag.parser.external.mineru.cache import MinerUParserOptions
 from lightrag.api.routers.query_routes import create_query_routes
 from lightrag.api.routers.graph_routes import create_graph_routes
 from lightrag.api.routers.ollama_api import OllamaAPI
+from lightrag.api.endpoint_policy import validate_endpoint_policies
 from lightrag.api.routers.knowledge_base_routes import (
     create_knowledge_base_routes,
 )
@@ -81,6 +82,7 @@ from lightrag.api.knowledge_bases import (
     StorageProfileError,
     storage_profiles_path_from_env,
 )
+from lightrag.api.workspace_config import resolve_workspace_deployment
 from lightrag.kg.storage_profiles import (
     build_default_resource_profile,
     required_profile_sections,
@@ -1346,6 +1348,9 @@ def create_app(args):
     storage_profiles = KnowledgeBaseManager.load_storage_profiles(
         storage_profiles_path_from_env()
     )
+    workspace_deployment = resolve_workspace_deployment(
+        workers=int(getattr(args, "workers", 1) or 1)
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -2339,8 +2344,10 @@ def create_app(args):
         max_loaded_instances=int(
             os.getenv("LIGHTRAG_MAX_LOADED_KNOWLEDGE_BASES", "32")
         ),
+        multi_workspace_enabled=workspace_deployment.multi_workspace_enabled,
     )
     app.state.knowledge_base_manager = knowledge_base_manager
+    app.state.workspace_deployment = workspace_deployment
 
     # Add routes
     # root_path is set on the app for reverse proxy support;
@@ -2901,6 +2908,7 @@ def create_app(args):
             root = request.scope.get("root_path", "")
             return RedirectResponse(url=f"{root}/docs")
 
+    app.state.endpoint_policies = validate_endpoint_policies(app)
     return app
 
 

@@ -338,6 +338,18 @@ class KnowledgeBaseContext:
     active_requests: int = 0
 
 
+@dataclass(slots=True)
+class KnowledgeBaseSideEffectCounters:
+    """Attempt counters used to prove observational routes stay side-effect free."""
+
+    instance_constructions: int = 0
+    storage_initializations: int = 0
+    migrations: int = 0
+
+    def snapshot(self) -> dict[str, int]:
+        return asdict(self)
+
+
 _current_context: ContextVar[KnowledgeBaseContext | None] = ContextVar(
     "lightrag_knowledge_base_context", default=None
 )
@@ -380,6 +392,7 @@ class KnowledgeBaseManager:
             str
         ] = _DEFAULT_STORAGE_IMPLEMENTATIONS,
         max_loaded_instances: int = 32,
+        multi_workspace_enabled: bool = True,
     ) -> None:
         if max_loaded_instances < 1:
             raise ValueError("max_loaded_instances must be at least 1")
@@ -402,6 +415,7 @@ class KnowledgeBaseManager:
             self._active_storage_implementations
         )
         self._max_loaded_instances = max_loaded_instances
+        self.multi_workspace_enabled = multi_workspace_enabled
         default_record = catalog.get(DEFAULT_KNOWLEDGE_BASE_ID)
         self.default_context = KnowledgeBaseContext(
             metadata=default_record,
@@ -416,6 +430,7 @@ class KnowledgeBaseManager:
         self._initialized_ids: set[str] = set()
         self._deleting_ids: set[str] = set()
         self._started = False
+        self.side_effect_counters = KnowledgeBaseSideEffectCounters()
         self.rag_proxy = RequestScopedProxy(self, "rag")
         self.document_manager_proxy = RequestScopedProxy(self, "document_manager")
 
@@ -460,6 +475,26 @@ class KnowledgeBaseManager:
                 }
             )
         return result
+
+    def list_records(self) -> list[KnowledgeBaseRecord]:
+        records = self.catalog.list()
+        if self.multi_workspace_enabled:
+            return records
+        return [record for record in records if record.id == DEFAULT_KNOWLEDGE_BASE_ID]
+
+    def get_record(self, knowledge_base_id: str) -> KnowledgeBaseRecord:
+        normalized = validate_knowledge_base_id(knowledge_base_id)
+        if not self.multi_workspace_enabled and normalized != DEFAULT_KNOWLEDGE_BASE_ID:
+            self.catalog.get(normalized)
+            raise KnowledgeBaseNotFoundError(
+                "Multi-workspace mode is disabled; only the default knowledge "
+                "base is available"
+            )
+        return self.catalog.get(normalized)
+
+    def rename(self, knowledge_base_id: str, name: str) -> KnowledgeBaseRecord:
+        current = self.get_record(knowledge_base_id)
+        return self.catalog.rename(current.id, name)
 
     def _profile_for(self, record: KnowledgeBaseRecord) -> Mapping[str, Any] | None:
         if record.isolation_level == "logical":
@@ -557,7 +592,9 @@ class KnowledgeBaseManager:
             if knowledge_base_id in self._initialized_ids:
                 return
             try:
+                self.side_effect_counters.storage_initializations += 1
                 await context.rag.initialize_storages()
+                self.side_effect_counters.migrations += 1
                 await context.rag.check_and_migrate_data()
             except BaseException:
                 try:
@@ -578,6 +615,12 @@ class KnowledgeBaseManager:
             normalized = validate_knowledge_base_id(knowledge_base_id)
         except ValueError as exc:
             raise KnowledgeBaseNotFoundError(str(exc)) from exc
+        if not self.multi_workspace_enabled and normalized != DEFAULT_KNOWLEDGE_BASE_ID:
+            self.catalog.get(normalized)
+            raise KnowledgeBaseNotFoundError(
+                "Multi-workspace mode is disabled; only the default knowledge "
+                "base is available"
+            )
         if normalized in self._deleting_ids:
             raise KnowledgeBaseConflictError(
                 f"Knowledge base {normalized!r} is being deleted"
@@ -598,6 +641,7 @@ class KnowledgeBaseManager:
                         "Maximum loaded knowledge-base instances reached "
                         f"({self._max_loaded_instances})"
                     )
+                self.side_effect_counters.instance_constructions += 1
                 context = KnowledgeBaseContext(
                     metadata=record,
                     rag=self._rag_factory(record, profile),
@@ -646,6 +690,8 @@ class KnowledgeBaseManager:
         isolation_level: Literal["logical", "physical"],
         storage_profile_id: str | None,
     ) -> KnowledgeBaseRecord:
+        if not self.multi_workspace_enabled:
+            raise KnowledgeBaseConflictError("Multi-workspace mode is disabled")
         if isolation_level == "logical" and storage_profile_id:
             raise ValueError("storage_profile_id is only valid for physical isolation")
         if isolation_level == "physical":
@@ -668,6 +714,8 @@ class KnowledgeBaseManager:
         )
 
     async def delete(self, knowledge_base_id: str) -> KnowledgeBaseRecord:
+        if not self.multi_workspace_enabled:
+            raise KnowledgeBaseConflictError("Multi-workspace mode is disabled")
         normalized = validate_knowledge_base_id(knowledge_base_id)
         if normalized == DEFAULT_KNOWLEDGE_BASE_ID:
             raise KnowledgeBaseConflictError(

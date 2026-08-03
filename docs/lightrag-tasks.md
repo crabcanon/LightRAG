@@ -1472,9 +1472,9 @@ Prompt 依据：OpenAI 官方 [GPT-5.6 model guidance](https://developers.openai
 
 | ID | 阶段 | 任务 | 依赖 | 状态 | 完成定义 |
 | --- | --- | --- | --- | --- | --- |
-| RFC-I00 | 设计 Gate | 评审 `lightrag-rfc-impl.md` 第 13 节八项决策，冻结 selector、catalog provider、lifecycle API、admin 和支持矩阵 | 无 | 待用户评审 | 决策写入 ADR；不再存在会改变 Phase 1～4 边界的未决项 |
-| RFC-I01 | Phase 0 | 增加 legacy/multi-workspace feature mode、deployment support matrix 与 fail-closed 启动校验 | RFC-I00 | 未开始 | 不支持的 workers/catalog/coordinator 组合启动失败；default 行为不变 |
-| RFC-I02 | Phase 0 | 建立 endpoint policy registry、OpenAPI route classification 和 side-effect counter 测试骨架 | RFC-I00 | 未开始 | 每个 route 唯一分类；新增未分类 route 测试失败；health/ready 的零构造断言可执行 |
+| RFC-I00 | 设计 Gate | 评审 `lightrag-rfc-impl.md` 第 13 节八项决策，冻结 selector、catalog provider、lifecycle API、admin 和支持矩阵 | 无 | 已完成 | 决策写入 ADR；不再存在会改变 Phase 1～4 边界的未决项 |
+| RFC-I01 | Phase 0 | 增加 legacy/multi-workspace feature mode、deployment support matrix 与 fail-closed 启动校验 | RFC-I00 | 已完成 | 不支持的 workers/catalog/coordinator 组合启动失败；default 行为不变 |
+| RFC-I02 | Phase 0 | 建立 endpoint policy registry、OpenAPI route classification 和 side-effect counter 测试骨架 | RFC-I00 | 已完成 | 每个 route 唯一分类；新增未分类 route 测试失败；health/ready 的零构造断言可执行 |
 | RFC-I03 | Phase 1 | 实现 `WorkspaceBinding` tagged identity、`legacy-v1`/`namespace-v1` codec、reserved name 规则 | RFC-I01 | 未开始 | empty/default/_/named 不碰撞；default 原物理布局可读；binding 构造后不可变 |
 | RFC-I04 | Phase 1 | 为 KV/vector/graph/doc-status 建立统一 `StorageNamespaceDescriptor` 和四族一致性 preflight | RFC-I03 | 未开始 | 每个 active backend 报告 canonical key/codec/fingerprint；mismatch 在数据访问前失败 |
 | RFC-I05 | Phase 1 | 统一 workspace override 规则并覆盖全部 storage backend | RFC-I04 | 未开始 | multi-workspace 任一 override 启动失败；legacy consistent 可兼容、mixed family 失败；真实 backend 回归通过 |
@@ -1524,3 +1524,15 @@ Prompt 依据：OpenAI 官方 [GPT-5.6 model guidance](https://developers.openai
 - API 全量环境边界：Windows 不提供 Gunicorn 所需 POSIX `fcntl`；一次排除 Gunicorn 的 API sweep 暴露 5 项，其中 tokenizer cache 配置后两项 Ollama input-limit 在对应 13-test 文件中通过。剩余观察项为一个 Windows-only Gunicorn import，以及两个既有 auth contract 断言期望 401、当前 API-key-only 路径实际返回 403；它们未被伪报为本轮全量通过，也未在本设计文档提交中修改无关业务语义。
 - 新审计产物：新增 `docs/lightrag-rfc-impl.md`。结论是最新上游的 workspace ingress、bounded scheduling、recovery fence、scan job store 和 Gunicorn provider global slot 可复用，但 shared catalog/lifecycle、canonical descriptor、lease pool、side-effect-free health、catalog-driven recovery、单进程 shared admission、workspace fairness、fenced deletion 与 Ollama alias 仍需按 Phase 1～7 实现。
 - 任务状态：RFC-I00 等待用户评审；RFC-I01～I20 均未开始。用户确认设计前，本轮停止在文档和任务边界，不实施业务重构。
+
+### 2026-08-03T19:49:46+08:00 — RFC-I00～I02 Phase 0 决策冻结与安全支架
+
+- 决策：用户确认 `docs/lightrag-rfc-impl.md` 第 13 节全部推荐项；PostgreSQL shared catalog、override fail-fast、异步 lifecycle、canonical header/Ollama alias、read→query→write、Admin API Key 和单 worker 首个 MVP 成为后续实现基线。
+- 模式与支持矩阵：新增 `lightrag/api/workspace_config.py`，`LIGHTRAG_MULTI_WORKSPACE_MODE` 默认 `legacy`；显式 `multi + local catalog + local coordinator + workers=1` 作为当前唯一支持的多 workspace 组合。local provider 配置多 worker、未实现的 PostgreSQL/Manager provider 或非法枚举均启动失败，不静默降低安全语义。
+- legacy Gate：API server 把 mode 注入 `KnowledgeBaseManager`；legacy 仅暴露/路由 default，拒绝动态 create/delete 和已存在非默认 record，同时保留真正 unknown ID 的既有 404 语义。直接构造 manager 的 library/API 单元测试默认继续启用多 workspace，避免破坏显式调用方。
+- Endpoint policy：新增 `lightrag/api/endpoint_policy.py`，为 schema-visible route 定义 liveness、control observation、management lifecycle、data read/write 和 runtime observation 等唯一类别；app 构造结束时 fail-closed 校验，任何新 route 未登记会阻止启动。policy 明确 health/version 不得 catalog lookup、load、create 或 migrate。
+- 可观测测试支架：manager 新增 construction/storage-init/migration attempt counter；后续 Phase 3 可用调用前后 snapshot 证明 health/ready 零副作用，而不靠 mock 调用路径猜测。
+- 部署配置：三个 multi-tenant Compose 及对应 example 显式设置 `multi/local/local`；通用 `env.example` 说明 opt-in 和当前单 worker 限制。三份 Compose 均完成 `docker compose config --quiet`；Docker 仅报告用户级 config ACL warning，解析退出码为 0。
+- 验证：新增 deployment matrix、endpoint fail-closed 和 legacy gate/counter 测试；聚焦 suite `48 passed`，包含 health 回归。与默认文件存储隔离组合后的 Phase 0 suite 为 `84 passed`。ruff check 通过。
+- 已知非本轮问题：额外 path-prefix sweep 的三个剩余失败仍是 Windows 无 POSIX `fcntl`，以及两个既有 API-key-only 401/403 断言差异；Phase 0 曾引入的一项 unknown-ID 文案回归已修复并由 health 测试覆盖。
+- 状态：RFC-I00、RFC-I01、RFC-I02 完成；下一项为 RFC-I03 canonical `WorkspaceBinding` 与 versioned codec。

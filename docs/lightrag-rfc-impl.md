@@ -1,6 +1,6 @@
 # LightRAG 多知识库 RFC 实现差距与新一轮优化方案
 
-- 状态：Draft，等待架构评审；本轮不实施业务代码
+- 状态：架构决策已确认，按 Phase 0～7 分阶段实施
 - RFC 基线：`docs/lightrag-rfc-en.md`（2026-07-29）
 - 代码基线：`dev@64713519`，已包含 `upstream/main@301e715c`
 - 审计日期：2026-08-03（Asia/Shanghai）
@@ -574,22 +574,22 @@ sequenceDiagram
 
 其中第 2、3 项会改变 API contract，第 4 项会改变部署可用性，仍应在用户/RFC 评审后按任务顺序实施。本轮只记录，不修改业务代码。
 
-## 13. 需要用户与维护者确认的决策
+## 13. 已确认的架构决策
 
-1. 是否接受 PostgreSQL 作为第一个 shared catalog provider，并明确 local JSON 只支持单 worker？
-2. 是否接受 multi-workspace mode 下任一 active backend workspace override 都启动失败？
-3. 是否接受 `202 + operation_id` 的异步 create/delete lifecycle，或首版必须保持同步 201/200？
-4. public selector 是否继续使用 `LIGHTRAG-KNOWLEDGE-BASE`？resolved response 是否复用同名 header？
-5. Ollama alias 是否采用 `lightrag:default` 与 `lightrag:<knowledge-base-id>`？
-6. Phase 3 是否先只开放非默认 read/query，等 Phase 4 完成后再开放 ingestion/write？
-7. management mutation 的首阶段 admin 策略：专用 API key、JWT admin role，还是由可信反向代理保证？
-8. Gunicorn 是否必须在首次社区 MVP 内支持，还是先明确单 worker supported、随后增加 same-host coordinator？
+用户于 2026-08-03 确认按推荐方案实施：
 
-推荐默认答案依次为：是、是、接受 202、继续现有 header、采用该 alias、先 read 后 write、专用 admin policy、core contract 首先支持单 worker但 provider 接口不阻塞紧随其后的 Gunicorn PR。
+1. PostgreSQL 是首个 shared catalog provider；local JSON 仅支持单 worker。
+2. multi-workspace mode 下任一 active backend workspace override 都导致启动失败。
+3. create/delete 默认采用幂等的 `202 + operation_id`，同时允许有限 `Prefer: wait`。
+4. public selector 保持 `LIGHTRAG-KNOWLEDGE-BASE`；成功响应使用同名 header 返回 resolved public ID。
+5. Ollama alias 使用 `lightrag:default` 与 `lightrag:<knowledge-base-id>`；header/model 冲突 fail closed。
+6. 数据面按“纯 storage read → query → ingestion/write”开放；query 的 cache/provider/stream 副作用必须先完成审计。
+7. management mutation 第一阶段使用独立 Admin API Key，长期演进为 JWT admin role 与 `WorkspaceAuthorizer`。
+8. 首个安全 MVP 明确支持单 worker；shared catalog/coordinator 和故障测试完成后，再把同机 Gunicorn 加入支持矩阵。
 
 ## 14. 实施启动条件
 
-在开始业务代码重构前，应先完成以下评审：
+业务代码按以下已确认 Gate 实施：
 
 - 确认第 13 节至少前六项产品/兼容决策；
 - 确认 Phase 1～4 的 PR 边界，尤其是 non-default ingestion 在 Phase 4 前保持 feature-gated；
@@ -597,4 +597,4 @@ sequenceDiagram
 - 确认 legacy default 零搬迁与 backend override fail-fast 策略；
 - 确认 catalog provider 与 management admin boundary。
 
-用户检查并确认本文后，可以严格按照 `docs/lightrag-tasks.md` 的 RFC-I 任务逐项实现。每项完成后必须先运行对应 deterministic tests、记录真实 pass/fail 和残余风险，再开始下一项；不得把后续 phase 的设计承诺提前写成当前能力。
+上述评审已经完成。实施严格按照 `docs/lightrag-tasks.md` 的 RFC-I 任务推进；每项完成后必须先运行对应 deterministic tests、记录真实 pass/fail 和残余风险，再开始下一项；不得把后续 phase 的设计承诺提前写成当前能力。
