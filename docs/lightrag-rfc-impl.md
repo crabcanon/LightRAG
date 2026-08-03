@@ -1,6 +1,6 @@
 # LightRAG 多知识库 RFC 实现差距与新一轮优化方案
 
-- 状态：架构决策已确认；Phase 0～1 已完成，Phase 2 待实施
+- 状态：架构决策已确认；Phase 0～2 已完成，Phase 3 待实施
 - RFC 基线：`docs/lightrag-rfc-en.md`（2026-07-29）
 - 代码基线：`dev@64713519`，已包含 `upstream/main@301e715c`
 - 审计日期：2026-08-03（Asia/Shanghai）
@@ -11,7 +11,10 @@
 > legacy codec 注册、12-storage descriptor construction/post-connect gate、
 > destructive pre-delete gate，以及 multi/legacy workspace override startup audit。
 > 本文第 5 节的 G-03/G-04 保留为基线审计记录；其 Phase 1 范围已由该提交关闭，
-> shared catalog、lifecycle 与 lease 等后续 Gap 仍未完成。
+> `638a778d` 已继续完成 Phase 2：local/PostgreSQL `CatalogProvider`、revision/CAS、
+> 分页和唯一约束、幂等 create/delete、CREATING～TOMBSTONED 状态机、operation
+> journal、fencing、ACTIVE 数据面门禁、独立 Admin API Key 和有限 `Prefer: wait`。
+> lease pool、显式 execution context、跨 workspace recovery 与调度仍按 Phase 3～5 实施。
 
 ## 1. 结论
 

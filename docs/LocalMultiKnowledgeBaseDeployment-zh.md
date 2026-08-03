@@ -73,11 +73,18 @@ docker compose --env-file .env.local-multikb -f docker-compose.local-multikb.yml
 
 ```powershell
 $headers = @{ 'X-API-Key' = '<LIGHTRAG_API_KEY>' }
+$adminHeaders = @{
+  'X-API-Key' = '<LIGHTRAG_API_KEY>'
+  'X-LightRAG-Admin-Key' = '<LIGHTRAG_ADMIN_API_KEY>'
+  'Idempotency-Key' = 'create-project-a-001'
+  'Prefer' = 'wait=10'
+}
 $catalog = Invoke-RestMethod -Headers $headers -Uri http://localhost:9621/knowledge-bases
 
-$newKb = Invoke-RestMethod -Method Post -Headers $headers `
+$createResult = Invoke-RestMethod -Method Post -Headers $adminHeaders `
   -ContentType 'application/json' -Uri http://localhost:9621/knowledge-bases `
   -Body '{"name":"项目 A","isolation_level":"logical"}'
+$newKb = $createResult.knowledge_base
 
 $kbHeaders = @{
   'X-API-Key' = '<LIGHTRAG_API_KEY>'

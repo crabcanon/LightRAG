@@ -121,11 +121,20 @@ docker compose --env-file .env.multitenant-services -f docker-compose.multitenan
 ```powershell
 $base = 'http://127.0.0.1:9621'
 $headers = @{ 'X-API-Key' = '<LIGHTRAG_API_KEY>' }
+$adminHeaders = @{
+  'X-API-Key' = '<LIGHTRAG_API_KEY>'
+  'X-LightRAG-Admin-Key' = '<LIGHTRAG_ADMIN_API_KEY>'
+  'Idempotency-Key' = 'create-alpha-001'
+  'Prefer' = 'wait=10'
+}
 
-$alpha = Invoke-RestMethod -Method Post -Headers $headers -ContentType 'application/json' `
+$alphaResult = Invoke-RestMethod -Method Post -Headers $adminHeaders -ContentType 'application/json' `
   -Uri "$base/knowledge-bases" -Body '{"name":"Alpha","isolation_level":"logical"}'
-$beta = Invoke-RestMethod -Method Post -Headers $headers -ContentType 'application/json' `
+$adminHeaders['Idempotency-Key'] = 'create-beta-001'
+$betaResult = Invoke-RestMethod -Method Post -Headers $adminHeaders -ContentType 'application/json' `
   -Uri "$base/knowledge-bases" -Body '{"name":"Beta","isolation_level":"logical"}'
+$alpha = $alphaResult.knowledge_base
+$beta = $betaResult.knowledge_base
 
 $alphaHeaders = @{ 'X-API-Key' = '<LIGHTRAG_API_KEY>'; 'LIGHTRAG-KNOWLEDGE-BASE' = $alpha.id }
 $betaHeaders = @{ 'X-API-Key' = '<LIGHTRAG_API_KEY>'; 'LIGHTRAG-KNOWLEDGE-BASE' = $beta.id }
