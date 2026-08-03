@@ -1,6 +1,6 @@
 # LightRAG 多知识库 RFC 实现差距与新一轮优化方案
 
-- 状态：架构决策已确认；Phase 0～4 已完成，Phase 5 待实施
+- 状态：架构决策已确认；Phase 0～5 单进程 Gate 已完成，Phase 6 待实施；同机 Gunicorn 外部集成 Gate 待验证
 - RFC 基线：`docs/lightrag-rfc-en.md`（2026-07-29）
 - 代码基线：`dev@64713519`，已包含 `upstream/main@301e715c`
 - 审计日期：2026-08-03（Asia/Shanghai）
@@ -19,9 +19,12 @@
 > resolved response header，以及 side-effect-free health/ready/runtime observation。
 > `9f2cba61` 已完成 Phase 4：全 catalog 游标恢复、startup-owned migration、
 > 显式 background lease handoff、pipeline restart recovery、fenced cleanup journal
-> 与同 hash doc-status 全生命周期隔离。共享 provider admission、公平 pipeline
-> 调度及 Gunicorn coordinator 仍按 Phase 5 实施；在这些 Gate 完成前，
-> non-default write 默认关闭。
+> 与同 hash doc-status 全生命周期隔离。`b0982bb6` 已完成 Phase 5 的
+> service-level provider/pipeline admission、有界 workspace DRR/aging、可重试
+> overload，以及带 heartbeat/fencing 的同机 startup coordinator；`f735e18b`
+> 在这些 Gate 通过后开放已验证的单 worker 写入路径。单 worker
+> multi-workspace write 已通过 Gate 并默认开放；同机 Gunicorn write 仍默认关闭，
+> 等待真实 PostgreSQL、POSIX worker-kill 与 Gunicorn E2E 后再更新生产支持结论。
 
 ## 1. 结论
 
@@ -529,6 +532,10 @@ sequenceDiagram
 范围：service-level LLM/embedding/rerank controller、global active-pipeline cap、workspace DRR/aging、single-process 与 Gunicorn adapters、bounded overload。
 
 验收：N workspace 峰值仍不超过 C；持续 A 负载下 B 在约定时间获得服务；query reservation 不永久饿死 ingestion；queue saturation 无内存增长。
+
+实施结论：`b0982bb6` 建立单个 API app 共享的 `ResourceAdmissionController`，原始 LLM 各角色、embedding、rerank 与 pipeline 均先进入同一 deployment-total 预算。控制器使用 workspace DRR、同 workspace priority aging、全局/单 workspace pending 上限和总等待超时；过载稳定返回带 `Retry-After` 的 429/503。Gunicorn adapter 复用 master-owned global slot，startup recovery 通过独占 lease、heartbeat 和 fencing token 在 worker 间只执行一次，死亡 owner 可接管且旧 owner 不能发布终态。
+
+单进程与 Manager-backed 离线 Gate 已通过；真实 PostgreSQL catalog + Linux Gunicorn 多 worker、进程 SIGKILL、无 sticky session 的端到端验证因本机 Docker Engine、PostgreSQL 与 POSIX `SIGKILL` 不可用而尚未执行。因此单 worker multi-workspace write 默认开放，同机 multi-worker write 仍需显式 feature opt-in，且本文不把该部署标为已完成生产验证。
 
 ### Phase 6：Ollama selector
 
