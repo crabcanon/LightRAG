@@ -41,12 +41,19 @@ def _p(
     center: bool = False,
     outline: int | None = None,
     page_break: bool = False,
+    pad: str = "",
 ):
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
     from docx.shared import Pt
 
     para = doc.add_paragraph()
+    if pad:
+        # Leading whitespace in its OWN run (python-docx sets
+        # xml:space="preserve" for it), matching how WPS/Word write the
+        # 空格排版 shape: the pad and the text are separate runs.
+        pad_run = para.add_run(pad)
+        pad_run.font.size = Pt(size)
     run = para.add_run(text)
     if page_break:
         # explicit page break at the start of the run (before the text)
@@ -95,6 +102,73 @@ def _build_redhead():
     _body_filler(doc, 6)
     _p(doc, "（一）突出重点任务", size=12.0, bold=True)
     _body_filler(doc, 5)
+    return doc
+
+
+def _build_signature_pad():
+    """Controlled contrast for the space-padded 落款 rule.
+
+    Both centered lines sit at the body size (12pt), are equally short and
+    equally free of body signals — the ONLY difference is that 某某市科学技术局
+    carries a wide leading space pad, the 公文 author's way of parking a
+    signature at the bottom right of a centered paragraph. Body paragraphs
+    separate the centered lines so neither joins the other's centered run (the
+    anti-poetry cap must not be what decides this test).
+    """
+    from docx import Document
+
+    doc = Document()
+    _p(doc, "关于开展某某专项工作的函", size=18.0, center=True)
+    _body_filler(doc, 6, prefix="缘由")
+    _p(doc, "一、工作安排", size=12.0)
+    _body_filler(doc, 6, prefix="安排")
+    _p(doc, "编制说明", size=12.0, center=True)  # genuinely centered heading
+    _body_filler(doc, 6, prefix="说明")
+    _p(doc, "二、联系方式", size=12.0)
+    _body_filler(doc, 6, prefix="联系")
+    _p(doc, "某某市科学技术局", size=12.0, center=True, pad=" " * 29)
+    _p(doc, "2026年7月31日", size=12.0, center=True, pad=" " * 30)
+    return doc
+
+
+def _build_citation_swallows_heading():
+    """A citation line adjacent to an outlineLvl heading (the test21 shape).
+
+    `（2）《…》。` is admitted as a candidate through the numbered-series channel
+    — its strong-body verdict is DEFERRED to the post-merge sweep — and sits
+    right before `【政策内容】`, an outlineLvl=0 baseline heading. The merge pass
+    runs between admission and the sweep, so without the strong-body gates it
+    absorbs that heading, the sweep then demotes the join, and the stranded
+    outline member trips I2 — costing the WHOLE document its smart output,
+    cover title block included.
+
+    `【政策执行期】` / `【办理方式】` are the untouched siblings: whatever level
+    they land on, `【政策内容】` must land on the same one.
+    """
+    from docx import Document
+
+    doc = Document()
+    _p(doc, "某某省支持某某产业园", size=22.0, center=True)
+    _p(doc, "发展税费政策措施指引", size=22.0, center=True)
+    _p(doc, "某某省某某局", size=14.0, center=True)
+    _p(doc, "2026年7月", size=14.0, center=True)
+    _p(doc, "为便于纳税人全面了解税费政策，特编写本指引。", size=12.0)
+    _body_filler(doc, 6, prefix="序言")
+    _p(doc, "5.4为农户及小型微型企业提供融资担保业务免征增值税", size=12.0, outline=3)
+    _p(doc, "【政策依据】", size=12.0)
+    _p(doc, "（1）《某某部关于某某增值税政策的通知》（某税〔2017〕90号）；", size=12.0)
+    _p(
+        doc,
+        "（2）《某某部 某某局 某某委员会 某某部关于印发中小企业划型标准规定的通知》"
+        "（某部联企业〔2011〕300号）。",
+        size=12.0,
+    )
+    _p(doc, "【政策内容】", size=12.0, outline=0)
+    _body_filler(doc, 5, prefix="政策内容")
+    _p(doc, "【政策执行期】", size=12.0, outline=0)
+    _body_filler(doc, 5, prefix="执行期")
+    _p(doc, "【办理方式】", size=12.0, outline=0)
+    _body_filler(doc, 5, prefix="办理方式")
     return doc
 
 
@@ -229,6 +303,8 @@ SCENARIOS = {
     "oversize_outline": _build_oversize_outline,
     "demoted_parent": _build_demoted_parent,
     "demoted_parent_survivor": _build_demoted_parent_survivor,
+    "signature_pad": _build_signature_pad,
+    "citation_swallows_heading": _build_citation_swallows_heading,
 }
 
 
@@ -515,6 +591,96 @@ def test_spliced_articles_only_opening_line_is_title_block(monkeypatch) -> None:
     assert second["level"] == 1
     assert metadata["first_heading"] == "数字化转型研究综述"
     assert metadata["doc_title"] == "数字化转型研究综述"
+
+
+def test_space_padded_centered_signature_is_not_a_heading(monkeypatch) -> None:
+    """A 落款 the author positioned by padding a centered paragraph with spaces
+    is not a heading, while an unpadded centered line at the same size is.
+
+    Fix-proof: 某某市科学技术局 is centered, at FS_base, short, and free of
+    numbering / strong-body / caption / date signals, so before
+    ``is_visually_centered`` the solo centered channel promoted it — the
+    difference from 编制说明 is the leading pad and nothing else.
+    """
+    responses = {
+        "关于开展某某专项工作的函": {
+            "is_title_block": True,
+            "main_title": "关于开展某某专项工作的函",
+        }
+    }
+    blocks, warnings, metadata = _extract(
+        "signature_pad", _make_llm(responses), monkeypatch
+    )
+    headings = {b["heading"] for b in blocks}
+    assert "某某市科学技术局" not in headings
+    assert "2026年7月31日" not in headings
+    # The unpadded centered line at the SAME size still takes the channel —
+    # this rule narrows the centered channel, it does not close it.
+    assert "编制说明" in headings
+    # Both padded lines are reported; the count is over centered paragraphs the
+    # pad disqualified, not only those that would otherwise have been promoted.
+    assert warnings.get("smart_center_pad_offset") == 2
+    # Nothing is dropped: the signature and date land as body text.
+    body = "\n".join(b["content"] for b in blocks)
+    assert "某某市科学技术局" in body
+    assert "2026年7月31日" in body
+    assert "smart_fallback_baseline" not in warnings
+    assert metadata["doc_title"] == "关于开展某某专项工作的函"
+    # The disqualified paragraphs match no rule afterwards and so leave NO
+    # decision — the audit row is their only trace. Record order, and only
+    # ints/floats/strs, so the artifact stays deterministic across runs.
+    events = [
+        e
+        for e in metadata["smart_audit"]["rule_events"]
+        if e["rule"] == "center_pad_offset"
+    ]
+    assert [e["index"] for e in events] == sorted(e["index"] for e in events)
+    assert [e["pad_em"] for e in events] == [14.5, 15.0]
+
+
+def test_citation_line_does_not_swallow_an_outline_heading(monkeypatch) -> None:
+    """A body-shaped citation line must not absorb the outlineLvl heading next
+    to it — one such merge used to cost the WHOLE document its smart output.
+
+    Chain being locked: `（2）《…》。` is admitted through the numbered-series
+    channel with its strong-body verdict deferred to the post-merge sweep; the
+    merge pass runs in between and swallowed `【政策内容】`; the sweep then
+    demoted the join, stranding that outlineLvl paragraph without a decision;
+    invariant I2 tripped and the document fell back to baseline assembly, which
+    has no notion of title blocks.
+
+    Fix-proof: with the merge gates reverted this fixture reports
+    ``guardrail violation (I1 missing=0, I2=[15], ...)`` — no title block, no
+    ``doc_title``, and the cover lines land in a `Preface/Uncategorized` block.
+    The three assertions below all flip on that revert. Note that `【政策内容】`
+    stays a heading either way (baseline splits on outlineLvl), which is exactly
+    why the fallback is the safe outcome and why it is NOT the discriminator.
+    """
+    responses = {
+        "某某省支持某某产业园": {
+            "is_title_block": True,
+            "main_title": "某某省支持某某产业园发展税费政策措施指引",
+            "publisher": "某某省某某局",
+        }
+    }
+    blocks, warnings, metadata = _extract(
+        "citation_swallows_heading", _make_llm(responses), monkeypatch
+    )
+    assert "smart_fallback_baseline" not in warnings
+    assert blocks[0]["level"] == 0
+    assert blocks[0]["is_title_block"] is True
+    assert metadata["doc_title"] == "某某省支持某某产业园发展税费政策措施指引"
+    # The merge never happens, so no member is stranded and nothing is unwound.
+    assert "smart_heading_merges" not in warnings
+    assert "smart_merge_outline_stranded" not in warnings
+
+    levels = {b["heading"]: b["level"] for b in blocks}
+    # 【政策内容】 keeps its own heading identity at its siblings' level.
+    assert levels["【政策内容】"] == levels["【政策执行期】"] == levels["【办理方式】"]
+    # The citation lines stay body text and are not lost.
+    body = "\n".join(b["content"] for b in blocks)
+    assert "（某部联企业〔2011〕300号）。" in body
+    assert "（2）《某某部" not in {b["heading"][:7] for b in blocks}
 
 
 # ---------------------------------------------------------------------------

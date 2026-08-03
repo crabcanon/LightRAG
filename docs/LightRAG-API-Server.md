@@ -25,6 +25,37 @@ LIGHTRAG_PARSER=*:legacy-F
 - Changing chunker settings (`CHUNK_*`) affects documents enqueued after the server restarts. Reprocess older documents if you want their stored `chunk_options` snapshot to match the new settings.
 - Enabling multimodal options (`i/t/e`) requires parsed sidecars plus `VLM_PROCESS_ENABLE=true`. Existing documents can be reprocessed to run VLM analysis on available sidecars; switching extraction engines still requires delete + re-upload.
 
+## Upgrading to bounded request sizes
+
+The release that layers `MAX_REQUEST_BODY_BYTES` turns it **on by default** at 1 MiB, where it used to be off and to cover three ingestion routes only. Two things change for clients:
+
+- **A request body over 1 MiB is refused with 413 on the ordinary routes** — `/query*`, `/api/chat`, `/api/generate` and everything else that is neither an upload nor a text insert. `/documents/text` and `/documents/texts` keep a 50 MiB ceiling, and `/documents/upload` derives its own from `MAX_UPLOAD_SIZE`, so bulk ingestion is unaffected. Set `MAX_REQUEST_BODY_BYTES` to any positive value to govern every non-upload route with it, or `0` to turn every ceiling off.
+- **The model-facing fields now have fixed ceilings**: 64 KiB per query or prompt, 32 KiB per message, 128 KiB of model-facing text per request, 128 messages, `top_k` / `chunk_top_k` at most 1000, and the `max_*_tokens` budgets at most 1,000,000. Clients that relied on unbounded `top_k` or on multi-megabyte queries need adjusting. These are not configurable by design.
+
+Neither change affects a deployment that was already sizing its requests sensibly; both bound how much work one unauthenticated request can ask the server to do.
+
+## Upgrading to bounded pipeline scheduling
+
+The release that introduces `PIPELINE_SCHEDULING_PAGE_SIZE`, `MAX_PENDING_DOCUMENTS` and `MAX_UNACKED_MANUAL_RETRIES` (see `env.example`) also changes the **concurrency protocol** writers use to coordinate through shared state. It is a one-time, in-place upgrade that writes no marker and no protocol version, so the storage cannot detect a stale writer for you. The requirement is therefore operational:
+
+> **Stop every old writer before starting a new one against the same storage and workspace.** A rolling restart that leaves one old worker — or one old instance sharing the same Redis/PostgreSQL workspace — running is the failure case, not a slower upgrade.
+
+Three things an old writer cannot honour:
+
+- **The manual retry freeze.** `/documents/reprocess_failed` no longer resets `FAILED` rows inline. It publishes an intent, freezes ingestion, waits for the pipeline to go idle, and only then rewrites `FAILED`→`PENDING` page by page with no worker running. An old writer does not read the freeze flag, so it keeps enqueueing into a window the reset assumes is exclusive.
+- **The scheduling sort key.** `created_at` is now the immutable `(created_at, id)` keyset cursor, written as a UTC ISO-8601 timestamp. Rows an old writer stamps in another format sort inconsistently against it, and a keyset page can then skip or repeat documents.
+- **Derived indexes.** On Redis the status set and the source multimap are maintained in the same transaction as the document row. An old writer updates the row only, leaving the index stale — after which strict paging and the strict active count silently omit that document.
+
+Recommended sequence:
+
+1. Stop accepting new documents and let the pipeline finish. On the authenticated `/health`, `scheduling.drain_waiting_on_workers` is `false` and `scheduling.drain_pending_enqueues` is `0` when nothing is in flight.
+2. Stop **all** workers and instances that share the storage and workspace.
+3. Start the new version.
+
+No data migration is required. The first sweep after startup is a strict full sweep, so a document an old writer left mid-flight — a row stuck in `PARSING`/`ANALYZING`/`PROCESSING` with no worker behind it — is picked up and reprocessed on its own. If a run genuinely cannot be drained, stopping mid-run is still safe for the same reason; what is not safe is starting the old version again afterwards.
+
+**After starting, check the log for a strict-capability warning.** All five built-in `doc_status` backends (JSON, Redis, PostgreSQL, MongoDB, OpenSearch) have every capability. A third-party backend may not, and each gap fails closed rather than degrading quietly: admission answers 503, the source-conflict endpoints answer 501, and a scan keeps re-examining a stale `FAILED` stub. Startup names each missing capability and what it costs, and the authenticated `/health` reports the same under `capabilities`. Set `PIPELINE_REQUIRE_STRICT_STORAGE_READS=true` to turn those gaps into a startup failure instead. There is no equivalent knob for bounded paging: the paging and typed source-resolution methods are abstract, so a backend without them cannot be constructed at all.
+
 ## Getting Started
 
 ### Installation
@@ -200,7 +231,7 @@ During startup, configurations in the `.env` file can be overridden by command-l
 
 ### Path Prefix and Multi-Site WebUI
 
-Set `LIGHTRAG_API_PREFIX` or `--api-prefix` when one host serves multiple LightRAG instances behind a reverse proxy that strips a site prefix before forwarding to the backend:
+Set `LIGHTRAG_API_PREFIX` or `--api-prefix` when one host serves multiple LightRAG instances behind a reverse proxy. Either forwarding style works: the proxy may strip the site prefix before forwarding to the backend, or forward the request unchanged.
 
 ```bash
 LIGHTRAG_API_PREFIX=/site01
@@ -208,6 +239,8 @@ lightrag-server --port 9621
 ```
 
 The backend passes this value to FastAPI as `root_path` and injects the same runtime prefix into the WebUI. The WebUI is always mounted at `/webui` inside the server, so one frontend build can serve any prefix. See [Single-Server Multi-Site Deployment](./MultiSiteDeployment.md) for full Nginx, Docker, and Kubernetes examples.
+
+> **`WHITELIST_PATHS` is written without the prefix.** Its entries are internal route paths, exactly as the routes are declared. The mount prefix is removed before matching, in both forwarding styles, so with `LIGHTRAG_API_PREFIX=/site01` the shipped default `WHITELIST_PATHS=/health,/api/*` is already correct and exempts `/site01/health` as the browser sees it. Writing the browser-visible form (`WHITELIST_PATHS=/site01/health`) matches nothing and makes those paths require authentication.
 
 ### Launching LightRAG Server with Docker
 
@@ -454,6 +487,46 @@ server {
    - Nginx validates the `Content-Length` header first
    - LightRAG performs streaming validation during upload
    - Setting appropriate limits at both layers ensures better error messages and security
+6. **Server-side request limits** (see `env.example`):
+   - `MAX_REQUEST_BODY_BYTES` bounds the raw body of **every** route, counted as
+     it streams through ASGI. Unlike `MAX_UPLOAD_SIZE` (which bounds one uploaded
+     file after multipart parsing), it also stops a body that understates or
+     omits its `Content-Length`, answering **413** before the whole body is read.
+     It is layered, because routes differ by orders of magnitude in what they
+     legitimately carry:
+
+     | Route | Ceiling |
+     |---|---|
+     | ordinary routes (`/query`, `/api/chat`, ...) | `MAX_REQUEST_BODY_BYTES`, default **1 MiB** |
+     | `/documents/text`, `/documents/texts` | **50 MiB**, built in, when `MAX_REQUEST_BODY_BYTES` is not set |
+     | `/documents/upload` | `MAX_UPLOAD_SIZE` + 1 MiB of multipart overhead |
+
+     Setting `MAX_REQUEST_BODY_BYTES` to any positive value makes it govern
+     every non-upload route, ingestion included — including when that value
+     happens to equal the 1 MiB default, which is the behaviour this knob had
+     before the tiers existed. Setting it to `0` turns off every ceiling,
+     including the derived upload one, and the server warns at startup.
+   - **Input field ceilings** apply to the model-facing fields of `/query*`,
+     `/api/chat` and `/api/generate`: 64 KiB per query or prompt, 32 KiB per
+     message, 128 KiB of model-facing text per request, 128 messages, and upper
+     bounds on `top_k` / `chunk_top_k` (1000) and the `max_*_tokens` budgets
+     (1,000,000). These are fixed rather than configurable — a limit that keeps
+     an unauthenticated caller from choosing how much CPU the server spends is
+     worth nothing if it can be misconfigured away. `/query*` answers **422** for
+     an over-limit field (FastAPI's own validation response); `/api/*` answers
+     **413**.
+   - `MAX_TEXTS_PER_REQUEST` bounds how many texts one `/documents/texts` request
+     may carry, answering **413** before any per-text storage lookup. It bounds
+     the fan-out of a single request, so — unlike the capacity limit below — it is
+     not a "retry later" condition: an oversized batch never fits and must be
+     split.
+   - `MAX_PENDING_DOCUMENTS` bounds how many documents may be active
+     (`PENDING`/`PARSING`/`ANALYZING`/`PROCESSING`) or reserved by an in-flight
+     request. Over capacity the server answers **429** with a `Retry-After`
+     header and a detail naming the current count, the requested count and the
+     capacity — refused *before* the body is transferred. `/documents/scan` and
+     manual retries exceed the cap on purpose; the documents they create make
+     ordinary uploads wait.
 
 ### Offline Deployment
 
@@ -552,7 +625,7 @@ Open WebUI uses an LLM to do the session title and session keyword generation ta
 
 ### Choose Query mode in chat
 
-The default query mode is `hybrid` if you send a message (query) from the Ollama interface of LightRAG. You can select query mode by sending a message with a query prefix.
+The default query mode is `mix` if you send a message (query) from the Ollama interface of LightRAG. You can select query mode by sending a message with a query prefix.
 
 A query prefix in the query string can determine which LightRAG query mode is used to generate the response for the query. The supported prefixes include:
 
@@ -572,7 +645,7 @@ A query prefix in the query string can determine which LightRAG query mode is us
 /mixcontext
 ```
 
-For example, the chat message `/mix What's LightRAG?` will trigger a mix mode query for LightRAG. A chat message without a query prefix will trigger a hybrid mode query by default.
+For example, the chat message `/hybrid What's LightRAG?` will trigger a hybrid mode query for LightRAG. A chat message without a query prefix will trigger a mix mode query by default.
 
 `/bypass` is not a LightRAG query mode; it will tell the API Server to pass the query directly to the underlying LLM, including the chat history. So the user can use the LLM to answer questions based on the chat history. If you are using Open WebUI as a front end, you can just switch the model to a normal LLM instead of using the `/bypass` prefix.
 
@@ -599,6 +672,8 @@ WHITELIST_PATHS=/health,/api/*
 ```
 
 > Health check and Ollama emulation endpoints are excluded from API Key check by default. For security reasons, remove `/api/*` from `WHITELIST_PATHS` if the Ollama service is not required. `/health` stays whitelisted as a liveness probe but only returns its full configuration to authenticated callers — unauthenticated requests get liveness signals only.
+>
+> **Entries are internal route paths, never prefixed.** A `/*` suffix matches on path-segment boundaries, so `/api/*` covers `/api` and everything under `/api/` and nothing else. If `LIGHTRAG_API_PREFIX` is set, do **not** include it here: the prefix is removed before matching, so `WHITELIST_PATHS=/health` exempts `/site01/health` and `WHITELIST_PATHS=/site01/health` exempts nothing. See [Path Prefix and Multi-Site WebUI](#path-prefix-and-multi-site-webui).
 
 The API key is passed using the request header `X-API-Key`. Below is an example of accessing the LightRAG Server via API:
 
@@ -780,10 +855,9 @@ For cross-provider rules, provider-specific options such as `QUERY_OPENAI_LLM_RE
 
 ### Multimodal Analysis Configuration
 
-The parser can produce sidecars for drawings/images, tables, and equations. VLM analysis only runs when both conditions are true:
+The parser can produce sidecars for drawings/images, tables, and equations. Analysis of a modality requires the document's `process_options` to contain the matching flag — `i` for images, `t` for tables, `e` for equations — and the corresponding sidecar to exist.
 
-- The document's `process_options` contains the matching modality flag: `i` for images, `t` for tables, or `e` for equations.
-- `VLM_PROCESS_ENABLE=true` and the effective VLM binding supports image input.
+`VLM_PROCESS_ENABLE` gates **images only**. Tables and equations are analyzed by the `EXTRACT` role and run regardless of this switch, so `*:native-teP` works without any VLM configured. With `i` enabled and the VLM unavailable, an image that survives the pre-filters (file present, raster format, both sides at least `VLM_MIN_IMAGE_PIXEL`) **fails the document** rather than being skipped — it lands in `FAILED` with `error_msg` "VLM analysis required but VLM role is not available".
 
 Current vision-capable providers are `openai`, `azure_openai`, `gemini`, `bedrock`, `ollama`, and `anthropic`; `lollms` is rejected for VLM use. Typical configuration:
 
@@ -1127,6 +1201,10 @@ Processing options are appended after the engine with a hyphen, or supplied alon
 | `P` | Paragraph semantic chunking for structured LightRAG Document content; falls back to `R` when structured content is unavailable |
 
 At most one of `F`, `R`, `V`, and `P` should be selected for a file. Chunker parameters are configured with `CHUNK_SIZE`, `CHUNK_OVERLAP_SIZE`, and strategy-specific variables such as `CHUNK_R_SEPARATORS`, `CHUNK_V_BREAKPOINT_THRESHOLD_TYPE`, `CHUNK_P_SIZE`, and `CHUNK_P_OVERLAP_SIZE`. These values are read at server startup and stored as a per-document `chunk_options` snapshot when a document is enqueued.
+
+The `V` strategy's sentence splitter is the one chunker parameter that cannot be set per request: `CHUNK_V_SENTENCE_SPLIT_REGEX` (or the SDK's `addon_params`) is the only way to change it. `/documents/text` and `/documents/texts` reject a `sentence_split_regex` key inside `chunking.params` with HTTP 422. A caller-supplied pattern is applied to that same request's text, and CPython's regex engine holds the GIL while backtracking, so a pattern such as `(a+)+$` can freeze an entire worker process — see [GHSA-32jh-39m7-8x84](https://github.com/HKUDS/LightRAG/security/advisories/GHSA-32jh-39m7-8x84). A value already stored in a document's `chunk_options` snapshot is discarded at processing time as well (logged at `WARNING`), so a pattern persisted by an older build cannot freeze the worker after an upgrade.
+
+The `R` strategy's separator cascade is bounded to 64 entries of at most 256 characters each, wherever it comes from; the built-in cascade is 9. A request body over the limit is rejected with HTTP 422. A non-HTTP configured value is converged and logged once when cached: `CHUNK_R_SEPARATORS` at configuration load, and a supplied or replaced `addon_params['chunker']` immediately (a compatible nested in-place mutation is handled at its first enqueue). The normalized value is then reused for later documents, corrected in place so a caller-held reference to the nested `recursive_character` dict still applies. Direct SDK calls and per-document snapshots persisted before the bound existed retain their stored value and are converged silently at execution, so one stale value cannot warn once per document. A `separators` value that is neither a list/tuple nor `None` is not converged at all — the key is dropped, with its own warning, because bounding a bare string would silently turn it into 64 single-character separators. Converging is not the same as shortening: an entry over 256 characters is **dropped**, while a list over 64 entries is **truncated** to 64 (keeping the trailing char-level `""` sentinel when present). A lone 300-character separator therefore disappears rather than matching its first 256, and the split points come from the fallback cascade — see the [pipeline spec](./FileProcessingPipeline.md#r--recursive-character) for which fallback applies where.
 
 For the full routing syntax, supported extensions, parser cache behavior, chunker configuration, concurrency rules, and Python SDK differences, see [File Processing Pipeline Specification](./FileProcessingPipeline.md). For the `P` strategy details, see [Paragraph Semantic Chunking](./ParagraphSemanticChunking.md). To debug parser output before indexing a file, see [Parser Debug CLI](./ParserDebugCLI.md).
 

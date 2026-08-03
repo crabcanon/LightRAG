@@ -14,6 +14,20 @@ from lightrag.llm.bedrock import (
     bedrock_complete_if_cache,
     bedrock_embed,
 )
+from lightrag.llm_roles import ROLES
+
+_ROLE_ATTR_SUFFIXES = (
+    "llm_binding",
+    "llm_model",
+    "llm_binding_host",
+    "llm_binding_api_key",
+    "llm_max_async",
+    "llm_timeout",
+    "aws_region",
+    "aws_access_key_id",
+    "aws_secret_access_key",
+    "aws_session_token",
+)
 
 _API_ENV_VARS_TO_ISOLATE = (
     "AUTH_ACCOUNTS",
@@ -647,8 +661,34 @@ class _FakeOllamaAPI:
         self.router = APIRouter()
 
 
-def _make_args(tmp_path) -> SimpleNamespace:
-    return SimpleNamespace(
+def _make_args(tmp_path):
+    """Server args for the ``create_app`` tests below.
+
+    Derived from the REAL parser and then overridden, NOT hand-rolled: every
+    server-consumed config knob added later (LR2 Phase 2's
+    ``pipeline_scheduling_page_size`` broke all seven ``create_app`` tests here
+    with an ``AttributeError``) exists automatically. ``sys.argv`` is pinned so
+    the parse never sees pytest's own arguments, and the auth/env-sensitive
+    fields stay pinned below so a developer ``.env`` cannot reach the app.
+    """
+    original_argv = sys.argv[:]
+    sys.argv = ["lightrag-server"]
+    try:
+        from lightrag.api.config import parse_args
+
+        args = parse_args()
+    finally:
+        sys.argv = original_argv
+
+    # parse_args() reads per-role LLM env vars (e.g. QUERY_LLM_MODEL) straight
+    # from a developer's local .env. Clear them all so these tests exercise
+    # only the base llm_binding/llm_model set below, never leaking whatever
+    # role overrides happen to be configured on the machine running pytest.
+    for spec in ROLES:
+        for suffix in _ROLE_ATTR_SUFFIXES:
+            setattr(args, f"{spec.name}_{suffix}", None)
+
+    overrides = dict(
         host="127.0.0.1",
         port=9621,
         log_level="INFO",
@@ -729,6 +769,9 @@ def _make_args(tmp_path) -> SimpleNamespace:
         rerank_max_async=4,
         rerank_timeout=30,
     )
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
 
 
 @pytest.mark.offline

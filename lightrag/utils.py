@@ -17,10 +17,12 @@ import os
 import re
 import time
 import uuid
+import threading
 import warnings
+from concurrent.futures import Future as ConcurrentFuture, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
-from functools import wraps
+from functools import partial, wraps
 from hashlib import md5
 from pathlib import Path
 from typing import (
@@ -306,9 +308,23 @@ def get_env_value(
             return default
 
     try:
-        return value_type(value)
+        converted = value_type(value)
     except (ValueError, TypeError):
         return default
+
+    # Reject non-finite floats so env-backed thresholds cannot become NaN/Inf.
+    if (
+        value_type is float
+        and isinstance(converted, float)
+        and not math.isfinite(converted)
+    ):
+        logger.warning(
+            "Environment variable %s=%r is not a finite float, using default",
+            env_key,
+            value,
+        )
+        return default
+    return converted
 
 
 # Use TYPE_CHECKING to avoid circular imports
@@ -363,6 +379,24 @@ def performance_timing_log(msg: str, *args, **kwargs):
     """Emit targeted performance timing logs only when explicitly enabled."""
     if PERFORMANCE_TIMING_LOGS:
         logger.info(msg, *args, **kwargs)
+
+
+def safe_log_value(value: str, max_length: int = 200) -> str:
+    """Make a caller-supplied value safe to embed in a log line.
+
+    Replaces non-printable characters -- notably CR/LF, which could otherwise
+    be used to forge extra log lines (log injection) -- with '?' and truncates
+    over-long values. Only the *logged* form is sanitized; the caller keeps the
+    original value for its own logic.
+
+    Used wherever untrusted input reaches the log: rate-limit keys built from a
+    submitted username, and operator-supplied identifiers in audited admin
+    actions (source-conflict repair).
+    """
+    sanitized = "".join(ch if ch.isprintable() else "?" for ch in value)
+    if len(sanitized) > max_length:
+        sanitized = sanitized[:max_length] + "…(truncated)"
+    return sanitized
 
 
 statistic_data = {"llm_call": 0, "llm_cache": 0, "embed_call": 0}
@@ -948,7 +982,7 @@ def priority_limit_async_func_call(
         Decorator function
     """
 
-    def final_decro(func):
+    def final_dec(func):
         # Ensure func is callable
         if not callable(func):
             raise TypeError(f"Expected a callable object, got {type(func)}")
@@ -2302,7 +2336,7 @@ def priority_limit_async_func_call(
 
         return wait_func
 
-    return final_decro
+    return final_dec
 
 
 def wrap_embedding_func_with_attrs(**kwargs):
@@ -2375,7 +2409,7 @@ def wrap_embedding_func_with_attrs(**kwargs):
         A decorator that wraps the function as an EmbeddingFunc instance
     """
 
-    def final_decro(func) -> EmbeddingFunc:
+    def final_dec(func) -> EmbeddingFunc:
         embedding_kwargs = dict(kwargs)
         # Auto-detect supports_asymmetric from the wrapped function's signature
         # if the caller did not declare it explicitly. Without this, any user or
@@ -2393,7 +2427,7 @@ def wrap_embedding_func_with_attrs(**kwargs):
         new_func = EmbeddingFunc(**embedding_kwargs, func=func)
         return new_func
 
-    return final_decro
+    return final_dec
 
 
 def load_json(file_name):
@@ -2549,20 +2583,266 @@ def write_json(json_obj, file_name):
 class TokenizerInterface(Protocol):
     """
     Defines the interface for a tokenizer, requiring encode and decode methods.
+
+    Implementations MUST be safe to call concurrently from multiple OS threads —
+    LightRAG runs token counting in worker threads to keep it off the asyncio
+    event loop, and does not serialize calls on the implementation's behalf. See
+    :class:`Tokenizer` for why serializing here would be the wrong layer.
     """
 
     def encode(self, content: str) -> List[int]:
-        """Encodes a string into a list of tokens."""
+        """Encodes a string into a list of tokens.
+
+        May be called concurrently from multiple threads.
+        """
         ...
 
     def decode(self, tokens: List[int]) -> str:
-        """Decodes a list of tokens into a string."""
+        """Decodes a list of tokens into a string.
+
+        May be called concurrently from multiple threads.
+        """
         ...
+
+
+# ---------------------------------------------------------------------------
+# Bounded submission to a thread pool
+# ---------------------------------------------------------------------------
+#
+# Moving CPU-bound work off the event loop frees the loop to keep accepting
+# requests, which means more work can be in flight at once than before. A
+# ``ThreadPoolExecutor``'s wait queue is unbounded, so submissions need their own
+# ceiling.
+#
+# The subtle part is WHO holds the permit. Writing ``async with sem: await
+# run_in_executor(...)`` is wrong: cancelling the awaiting coroutine returns the
+# permit immediately, but the thread-pool task is not cancelled — an already
+# running ``concurrent.futures.Future.cancel()`` just returns False and the thread
+# runs to completion. A client that repeatedly submits and cancels would hand back
+# permits it is still consuming and rebuild an unbounded queue. The permit
+# therefore belongs to the executor future and is released from its done callback,
+# so permit occupancy tracks actual thread occupancy exactly.
+
+
+def _consume_future_exception(fut: "asyncio.Future") -> None:
+    """Mark a shielded future's exception as retrieved.
+
+    When ``shield`` is cancelled nobody awaits the inner future any more, so an
+    exception raised by the thread would surface as an "exception was never
+    retrieved" traceback at GC time. Retrieving it here only clears that log
+    flag; a caller that is still awaiting still sees the exception.
+    """
+    if not fut.cancelled():
+        fut.exception()
+
+
+async def bounded_submit(
+    executor: ThreadPoolExecutor,
+    semaphore: asyncio.Semaphore,
+    fn: Callable[..., Any],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Run ``fn`` in ``executor`` under a permit owned by the executor future.
+
+    Args:
+        executor: destination pool.
+        semaphore: submission ceiling for this pool, from :func:`get_loop_semaphore`.
+        fn: synchronous callable to run in the pool.
+        *args, **kwargs: forwarded to ``fn``.
+
+    Returns:
+        Whatever ``fn`` returns.
+
+    Cancelling the caller does not cancel the thread: the work runs to completion
+    and only then is the permit returned. That is deliberate — see the module
+    comment above.
+    """
+    await semaphore.acquire()
+    try:
+        concurrent_future: ConcurrentFuture = executor.submit(
+            contextvars.copy_context().run, partial(fn, *args, **kwargs)
+        )
+    except BaseException:
+        semaphore.release()
+        raise
+
+    loop = asyncio.get_running_loop()
+
+    def _release(_done: ConcurrentFuture) -> None:
+        # Runs on the worker thread, so the release has to be posted back to the
+        # loop that owns the semaphore. A closed loop means the semaphore died
+        # with it and there is nothing left to release.
+        try:
+            loop.call_soon_threadsafe(semaphore.release)
+        except RuntimeError:
+            pass
+
+    concurrent_future.add_done_callback(_release)
+
+    async_future = asyncio.wrap_future(concurrent_future)
+    async_future.add_done_callback(_consume_future_exception)
+    return await asyncio.shield(async_future)
+
+
+# Semaphores are per event loop, executors are per process. ``asyncio.Semaphore``
+# binds to the first loop that has to wait on it and raises from any other loop
+# (``asyncio.mixins._LoopBoundMixin``), and the test suite runs one fresh loop per
+# case, so a module-level singleton would fail. Storing it ON the loop makes its
+# lifetime exactly the loop's; a container keyed by the loop would not, because
+# once contended the semaphore holds a strong reference back to its loop and a
+# ``WeakKeyDictionary`` entry whose value references its key never expires.
+_LOOP_SEMAPHORE_ATTR_PREFIX = "_lightrag_submit_semaphore_"
+_LOOP_SEMAPHORE_FALLBACK: dict[int, tuple[Any, dict[str, asyncio.Semaphore]]] = {}
+
+
+def _fallback_semaphore(loop: Any, name: str, capacity: int) -> asyncio.Semaphore:
+    """Per-loop semaphore for loops that reject attribute assignment.
+
+    The entry keeps a strong reference to the loop on purpose. Deriving the loop
+    from the semaphore does not work: ``Semaphore.acquire()`` only binds ``_loop``
+    when it actually has to wait, so an uncontended semaphore never learns which
+    loop it belongs to, leaving nothing to test ``is_closed()`` on and no way to
+    detect ``id()`` reuse. Closed loops are swept on the next call, so a closed
+    loop outlives itself by at most one lookup.
+    """
+    for stale_key, (stale_loop, _) in list(_LOOP_SEMAPHORE_FALLBACK.items()):
+        if stale_loop.is_closed():
+            _LOOP_SEMAPHORE_FALLBACK.pop(stale_key, None)
+    key = id(loop)
+    entry = _LOOP_SEMAPHORE_FALLBACK.get(key)
+    if entry is None or entry[0] is not loop:
+        entry = (loop, {})
+        _LOOP_SEMAPHORE_FALLBACK[key] = entry
+    semaphores = entry[1]
+    semaphore = semaphores.get(name)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(capacity)
+        semaphores[name] = semaphore
+    return semaphore
+
+
+def get_loop_semaphore(name: str, capacity: int) -> asyncio.Semaphore:
+    """Return the running loop's semaphore called ``name``, creating it once.
+
+    ``capacity`` is only used on creation. It is intentionally a fixed constant
+    rather than a per-``LightRAG`` setting: this helper is module level and is
+    called from places that hold no instance, and several instances sharing a loop
+    would otherwise each build their own semaphore and lose the global ceiling.
+    """
+    loop = asyncio.get_running_loop()
+    attr = _LOOP_SEMAPHORE_ATTR_PREFIX + name
+    semaphore = getattr(loop, attr, None)
+    if semaphore is not None:
+        return semaphore
+    semaphore = asyncio.Semaphore(capacity)
+    try:
+        setattr(loop, attr, semaphore)
+    except (AttributeError, TypeError):
+        return _fallback_semaphore(loop, name, capacity)
+    return semaphore
+
+
+# ---------------------------------------------------------------------------
+# Chunking off the event loop
+# ---------------------------------------------------------------------------
+#
+# Chunking is CPU-bound in the document the caller supplied and, for the
+# recursive strategy, in the separator cascade supplied with it. Run inline in an
+# ``async def`` — which is what every branch except V did — it holds the only
+# thread serving HTTP for its whole duration, so one 414 KiB document made an
+# unrelated ``GET /health`` take 63 seconds (GHSA-26pm-px5v-8c4w).
+#
+# One worker. Chunking is serialized by the event loop as things stand — while
+# one document chunks, no other document's coroutine can run — so a single worker
+# preserves that concurrency exactly while freeing the loop, rather than
+# introducing parallelism this change has no reason to introduce.
+#
+# Invariants:
+#   * code running in here calls the SYNCHRONOUS tokenizer API. Awaiting an async
+#     helper from a worker thread would park it on the loop while the loop waits
+#     for the thread.
+#   * no nested submissions. One worker plus a held permit means a task that
+#     submits again deadlocks. Where a chunker calls another chunker (V's
+#     post-processing calls R), it calls it DIRECTLY — it is already in the pool.
+
+_CHUNKING_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_CHUNKING_EXECUTOR_GUARD = threading.Lock()
+
+
+def get_chunking_executor() -> ThreadPoolExecutor:
+    """The process-wide single-worker pool used for chunking."""
+    global _CHUNKING_EXECUTOR
+    if _CHUNKING_EXECUTOR is None:
+        with _CHUNKING_EXECUTOR_GUARD:
+            if _CHUNKING_EXECUTOR is None:
+                _CHUNKING_EXECUTOR = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="lightrag-chunking"
+                )
+    return _CHUNKING_EXECUTOR
+
+
+async def run_in_chunking_executor(fn: Callable[..., Any], *args: Any, **kwargs) -> Any:
+    """Run a synchronous, chunking-bound callable off the event loop.
+
+    Bounded like any other submission: the submitters include public SDK entry
+    points (``ainsert_custom_kg``, ``ainsert_custom_chunks``) gated by neither
+    ``max_parallel_insert`` nor the pipeline's busy flag, so "the pipeline limits
+    concurrency" is not a ceiling that actually holds here.
+    """
+    from lightrag.constants import CHUNKING_SUBMIT_LIMIT
+
+    semaphore = get_loop_semaphore("chunking", CHUNKING_SUBMIT_LIMIT)
+    return await bounded_submit(
+        get_chunking_executor(), semaphore, partial(fn, *args, **kwargs)
+    )
 
 
 class Tokenizer:
     """
     A wrapper around a tokenizer to provide a consistent interface for encoding and decoding.
+
+    Thread-safety contract
+    ----------------------
+    ``encode`` and ``decode`` MAY be called concurrently from several OS threads:
+    token counting is CPU-bound and runs in worker threads so it does not block
+    the asyncio event loop. **An injected tokenizer is responsible for its own
+    thread safety** — through immutable state, an internal lock, thread-local
+    state, or whatever its implementation requires. LightRAG does not serialize
+    it, and adding a lock here would be actively harmful: the event loop would
+    then wait on a worker thread holding it, recreating the very freeze that
+    moving this work off the loop exists to remove.
+
+    The built-in :class:`TiktokenTokenizer` satisfies this: ``tiktoken``'s own
+    ``encode_batch`` / ``decode_batch`` fan ``Encoding.encode`` / ``.decode`` of a
+    single instance across a ``ThreadPoolExecutor``, so concurrent use is a
+    supported capability of the library rather than an assumption made here. The
+    dependency floor in ``pyproject.toml`` is pinned to the oldest release for
+    which that holds.
+
+    Note that sharing is the norm, not the exception: ``tiktoken`` caches
+    encodings in a process-wide registry, and ``Encoding.__setstate__`` rebinds a
+    copy's ``__dict__`` to the registered instance's — so every
+    ``TiktokenTokenizer`` in the process, including ones produced by
+    ``copy.deepcopy``, funnels into a single ``CoreBPE``. An injected tokenizer
+    that is not thread-safe cannot be made safe by copying it.
+
+    Deep-copy requirement
+    ---------------------
+    An injected tokenizer must additionally survive ``copy.deepcopy``: ``LightRAG``
+    is a dataclass and ``_build_global_config`` runs ``dataclasses.asdict`` over
+    it, which deep-copies non-dataclass fields. An implementation that achieves
+    thread safety with an internal ``threading.Lock`` would otherwise fail at
+    construction with ``TypeError: cannot pickle '_thread.lock' object``. Such an
+    implementation should define ``__deepcopy__`` returning ``self`` — correct
+    precisely because being thread-safe is what makes it shareable.
+
+    ``_build_global_config`` then restores this object over the copy ``asdict``
+    made, so every consumer reading ``global_config["tokenizer"]`` holds the same
+    instance as ``LightRAG.tokenizer``. That is an identity guarantee, not a
+    saving: ``asdict`` copies the field before the restore can intervene, which is
+    exactly why the deep-copy requirement above still applies.
     """
 
     def __init__(self, model_name: str, tokenizer: TokenizerInterface):
@@ -2571,7 +2851,8 @@ class Tokenizer:
 
         Args:
             model_name: The associated model name for the tokenizer.
-            tokenizer: An instance of a class implementing the TokenizerInterface.
+            tokenizer: An instance of a class implementing the TokenizerInterface,
+                which must be safe to call concurrently from multiple threads.
         """
         self.model_name: str = model_name
         self.tokenizer: TokenizerInterface = tokenizer
@@ -2579,6 +2860,8 @@ class Tokenizer:
     def encode(self, content: str) -> List[int]:
         """
         Encodes a string into a list of tokens using the underlying tokenizer.
+
+        May be called concurrently from multiple threads; see the class docstring.
 
         Args:
             content: The string to encode.
@@ -2608,6 +2891,8 @@ class Tokenizer:
     def decode(self, tokens: List[int]) -> str:
         """
         Decodes a list of tokens into a string using the underlying tokenizer.
+
+        May be called concurrently from multiple threads; see the class docstring.
 
         Args:
             tokens: A list of integer tokens to decode.
@@ -2664,8 +2949,67 @@ def split_string_by_multi_markers(content: str, markers: list[str]) -> list[str]
     return [r.strip() for r in results if r.strip()]
 
 
-def is_float_regex(value: str) -> bool:
-    return bool(re.match(r"^[-+]?[0-9]*\.?[0-9]+$", value))
+# ---------------------------------------------------------------------------
+# Token counting off the event loop
+# ---------------------------------------------------------------------------
+#
+# Tokenizing is CPU-bound and roughly linear in the input the caller chose —
+# about half a second per MiB — so doing it inline in an ``async def`` stops the
+# process from answering anything at all for the duration, /health included
+# (GHSA-r8jh-295g-vv42). These helpers move it to a thread.
+#
+# One worker, deliberately. Query-side tokenizing is serialized by the event loop
+# today, so a single worker preserves that concurrency exactly rather than
+# introducing parallelism this change has no reason to introduce. Thread-safety
+# is NOT what the single worker is for — that is the injected tokenizer's own
+# responsibility (see ``Tokenizer``), and it does not depend on how many pools
+# exist.
+#
+# Invariant: code running inside this executor must call the SYNCHRONOUS
+# tokenizer API. Awaiting these helpers from a worker thread would park that
+# thread on the loop while the loop waits for the thread.
+
+_TOKENIZER_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_TOKENIZER_EXECUTOR_GUARD = threading.Lock()
+
+
+def get_tokenizer_executor() -> ThreadPoolExecutor:
+    """The process-wide single-worker pool used for token counting."""
+    global _TOKENIZER_EXECUTOR
+    if _TOKENIZER_EXECUTOR is None:
+        with _TOKENIZER_EXECUTOR_GUARD:
+            if _TOKENIZER_EXECUTOR is None:
+                _TOKENIZER_EXECUTOR = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="lightrag-tokenizer"
+                )
+    return _TOKENIZER_EXECUTOR
+
+
+async def run_in_tokenizer_executor(fn: Callable[..., Any], *args: Any) -> Any:
+    """Run a synchronous, tokenizer-bound callable off the event loop.
+
+    Callers that already have a whole loop of encodes should hand over the loop,
+    not each encode: submissions must stay O(1) per request or the executor's
+    queue depth scales with the work instead of with the concurrency.
+    """
+    from lightrag.constants import TOKENIZER_SUBMIT_LIMIT
+
+    semaphore = get_loop_semaphore("tokenizer", TOKENIZER_SUBMIT_LIMIT)
+    return await bounded_submit(get_tokenizer_executor(), semaphore, fn, *args)
+
+
+async def aencode(tokenizer: Tokenizer, content: str) -> List[int]:
+    """Encode ``content`` without occupying the event loop."""
+    return await run_in_tokenizer_executor(tokenizer.encode, content)
+
+
+async def acount_tokens(tokenizer: Tokenizer, content: str) -> int:
+    """Token count of ``content``, computed off the event loop."""
+    return await run_in_tokenizer_executor(_count_tokens_sync, tokenizer, content)
+
+
+def _count_tokens_sync(tokenizer: Tokenizer, content: str) -> int:
+    return len(tokenizer.encode(content))
 
 
 def truncate_list_by_token_size(
@@ -2673,8 +3017,8 @@ def truncate_list_by_token_size(
     key: Callable[[Any], str],
     max_token_size: int,
     tokenizer: Tokenizer,
-) -> list[int]:
-    """Truncate a list of data by token size"""
+) -> list[Any]:
+    """Truncate a list of data by token size."""
     if max_token_size <= 0:
         return []
     tokens = 0
@@ -2683,6 +3027,25 @@ def truncate_list_by_token_size(
         if tokens > max_token_size:
             return list_data[:i]
     return list_data
+
+
+async def atruncate_list_by_token_size(
+    list_data: list[Any],
+    key: Callable[[Any], str],
+    max_token_size: int,
+    tokenizer: Tokenizer,
+) -> list[Any]:
+    """Async :func:`truncate_list_by_token_size`.
+
+    The WHOLE loop is one submission, never one per element. Submitting per
+    element would make the executor's queue depth scale with the list length
+    times the number of in-flight requests, turning a bounded queue into an
+    amplifier — and this loop routinely runs over every retrieved chunk, which is
+    the largest single block of synchronous tokenizing on the query path.
+    """
+    return await run_in_tokenizer_executor(
+        truncate_list_by_token_size, list_data, key, max_token_size, tokenizer
+    )
 
 
 def normalize_string_list(raw_values: Any, context: str = "") -> list[str]:
@@ -4400,6 +4763,8 @@ def pick_by_weighted_polling(
     """
     if not entities_or_relations:
         return []
+    if max_related_chunks <= 0:
+        return []
 
     n = len(entities_or_relations)
     if n == 1:
@@ -4531,15 +4896,34 @@ async def pick_by_vector_similarity(
             f"Vector similarity chunk selection: {len(chunk_vectors)} chunk vectors Retrieved"
         )
 
-        if not chunk_vectors or len(chunk_vectors) != len(all_chunk_ids):
-            if not chunk_vectors:
-                logger.warning(
-                    "Vector similarity chunk selection: no vectors retrieved from chunks_vdb"
-                )
-            else:
-                logger.warning(
-                    f"Vector similarity chunk selection: found {len(chunk_vectors)} but expecting {len(all_chunk_ids)}"
-                )
+        if not chunk_vectors:
+            logger.warning(
+                "Vector similarity chunk selection: no vectors retrieved from chunks_vdb"
+            )
+            return []
+
+        if len(chunk_vectors) != len(all_chunk_ids):
+            # A referenced chunk with no stored vector signals an inconsistency
+            # between the graph/text stores and the vector store. Keep the
+            # existing safety behavior: abort vector ranking so callers can fall
+            # back to the WEIGHT method, but make the mismatch easier to observe
+            # and repair by logging counts and a bounded sample of missing IDs.
+            expected = len(all_chunk_ids)
+            retrieved = len(chunk_vectors)
+            missing_ids = [
+                chunk_id for chunk_id in all_chunk_ids if chunk_id not in chunk_vectors
+            ]
+            sample = missing_ids[:5]
+            logger.warning(
+                "Vector similarity chunk selection: data inconsistency detected "
+                "(expected %s, retrieved %s, missing %s). Falling back to WEIGHT method. "
+                "Missing chunk IDs (sample): %s. "
+                "Vector/text storages may be out of sync; consider re-embedding or repairing.",
+                expected,
+                retrieved,
+                expected - retrieved,
+                sample,
+            )
             return []
 
         # Calculate cosine similarities
@@ -4811,7 +5195,7 @@ async def process_chunks_unified(
 
         original_count = len(unique_chunks)
 
-        unique_chunks = truncate_list_by_token_size(
+        unique_chunks = await atruncate_list_by_token_size(
             unique_chunks,
             key=lambda x: "\n".join(
                 json.dumps(item, ensure_ascii=False) for item in [x]
