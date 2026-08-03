@@ -668,6 +668,9 @@ def test_management_api_crud_and_default_delete_guard(
         "X-LightRAG-Admin-Key": "admin-secret",
         "Prefer": "wait=2",
     }
+    capabilities = client.get("/knowledge-bases").json()
+    assert capabilities["multi_workspace_enabled"] is True
+    assert capabilities["admin_key_required"] is True
 
     created_response = client.post(
         "/knowledge-bases",
@@ -807,6 +810,8 @@ def test_legacy_mode_exposes_only_default_and_rejects_management_create(
 
     listed = client.get("/knowledge-bases")
     assert listed.status_code == 200
+    assert listed.json()["multi_workspace_enabled"] is False
+    assert listed.json()["admin_key_required"] is False
     assert [record["id"] for record in listed.json()["knowledge_bases"]] == [
         DEFAULT_KNOWLEDGE_BASE_ID
     ]

@@ -84,7 +84,7 @@ def test_requires_auth(client):
 def test_cache_headers(client):
     resp = client.get("/documents/supported_file_types", headers=_HEADERS)
     assert resp.headers["Cache-Control"] == "no-store"
-    assert resp.headers["Vary"] == "LIGHTRAG-WORKSPACE"
+    assert resp.headers["Vary"] == "LIGHTRAG-KNOWLEDGE-BASE"
 
 
 def test_mineru_routing_splits_allowlist_and_matrix(client, monkeypatch):

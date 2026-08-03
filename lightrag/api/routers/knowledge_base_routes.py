@@ -133,6 +133,9 @@ def create_knowledge_base_routes(
             "knowledge_bases": [record.public_dict() for record in page.records],
             "next_cursor": page.next_cursor,
             "storage_profiles": manager.list_storage_profiles(),
+            "multi_workspace_enabled": manager.multi_workspace_enabled,
+            "admin_key_required": manager.multi_workspace_enabled
+            and bool(admin_api_key),
         }
 
     @router.post("", status_code=202, dependencies=admin_authenticated)

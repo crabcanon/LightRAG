@@ -69,7 +69,7 @@ class MemgraphStorage(BaseGraphStorage):
         """Return sanitized workspace label safe for use as a backtick-quoted identifier in Cypher queries.
 
         Escapes backticks by doubling them to prevent Cypher injection
-        via the LIGHTRAG-WORKSPACE header, while preserving a 1-to-1 mapping
+        via the LIGHTRAG-KNOWLEDGE-BASE header, while preserving a 1-to-1 mapping
         for all other characters. The returned value is intended to be used
         inside backticks (for example, MATCH (n:`{label}`)) and is not
         validated as a standalone unquoted identifier.

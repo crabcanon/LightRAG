@@ -2,7 +2,7 @@
 Unit tests for workspace label sanitization in Memgraph and Neo4j implementations.
 
 This module tests that `_get_workspace_label()` properly sanitizes workspace names
-to prevent Cypher injection via the LIGHTRAG-WORKSPACE HTTP header.
+to prevent Cypher injection via the LIGHTRAG-KNOWLEDGE-BASE HTTP header.
 
 It verifies that we preserve non-alphanumeric characters for 1-to-1 workspace mapping
 while successfully neutralizing Cypher injection by escaping backticks.

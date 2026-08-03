@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import type { KnowledgeBase } from '@/api/lightrag'
 import {
   buildKnowledgeBaseUploadOptions,
+  buildKnowledgeBaseUploadTargetOptions,
   formatKnowledgeBaseUploadLabel,
   NEW_KNOWLEDGE_BASE_UPLOAD_TARGET
 } from './uploadKnowledgeBaseOptions'
@@ -38,5 +39,19 @@ describe('knowledge-base upload targets', () => {
     expect(formatKnowledgeBaseUploadLabel(knowledgeBase('kb_c', 'Archive'))).toBe(
       'Archive (kb_c)'
     )
+  })
+
+  test('puts create first in multi-workspace mode and removes it in legacy mode', () => {
+    const records = [
+      knowledgeBase('default', 'Default'),
+      knowledgeBase('kb_a', 'Project A')
+    ]
+
+    expect(
+      buildKnowledgeBaseUploadTargetOptions(records, true).map((option) => option.value)
+    ).toEqual([NEW_KNOWLEDGE_BASE_UPLOAD_TARGET, 'default', 'kb_a'])
+    expect(
+      buildKnowledgeBaseUploadTargetOptions(records, false).map((option) => option.value)
+    ).toEqual(['default', 'kb_a'])
   })
 })

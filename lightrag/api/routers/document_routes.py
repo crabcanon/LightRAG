@@ -6493,14 +6493,14 @@ def create_document_routes(
         so the WebUI can pre-validate hinted filenames like
         ``img.[mineru].png`` without uploading the file first.
 
-        Derived from process-level configuration today; when per-workspace
-        parser rules land, this endpoint resolves the ``LIGHTRAG-WORKSPACE``
-        header internally — the response contract stays unchanged (hence the
-        ``Vary`` header, declared ahead of time so caches never reuse a
-        response across workspaces).
+        Derived from process-level configuration today; when per-knowledge-base
+        parser rules land, this endpoint resolves the canonical
+        ``LIGHTRAG-KNOWLEDGE-BASE`` selector internally — the response contract
+        stays unchanged (hence the ``Vary`` header, declared ahead of time so
+        caches never reuse a response across knowledge bases).
         """
         response.headers["Cache-Control"] = "no-store"
-        response.headers["Vary"] = "LIGHTRAG-WORKSPACE"
+        response.headers["Vary"] = "LIGHTRAG-KNOWLEDGE-BASE"
         return SupportedFileTypesResponse(
             supported_extensions=list(doc_manager.supported_extensions),
             engines=doc_manager.engine_capabilities,
