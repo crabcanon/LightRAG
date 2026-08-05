@@ -48,6 +48,16 @@ COPY uv.lock .
 RUN --mount=type=cache,target=/root/.local/share/uv \
     uv sync --frozen --no-dev --extra api --extra offline --no-install-project --no-editable
 
+# Cache assets depend only on the downloader and locked dependencies, not on
+# application source. Keeping this before COPY lightrag lets normal code edits
+# reuse the slow tiktoken/spaCy download layer.
+COPY lightrag/tools/download_cache.py /tmp/download_cache.py
+RUN --mount=type=cache,target=/root/.cache/pip \
+    mkdir -p /app/data/tiktoken \
+    && /app/.venv/bin/python -m ensurepip --upgrade \
+    && /app/.venv/bin/python /tmp/download_cache.py --cache-dir /app/data/tiktoken --spacy --spacy-dir /app/spacy_models || status=$?; \
+    if [ -n "${status:-}" ] && [ "$status" -ne 0 ] && [ "$status" -ne 2 ]; then exit "$status"; fi
+
 # Copy project sources after dependency layer
 COPY lightrag/ ./lightrag/
 
@@ -59,13 +69,6 @@ RUN --mount=type=cache,target=/root/.local/share/uv \
     uv sync --frozen --no-dev --extra api --extra offline --no-editable \
     && /app/.venv/bin/python -m ensurepip --upgrade
 
-# Prepare offline cache directory, pre-populate tiktoken data, and download the
-# pinned spaCy model wheels for the docx smart_heading engine parameter.
-# Use uv run to execute commands from the virtual environment
-RUN mkdir -p /app/data/tiktoken \
-    && uv run lightrag-download-cache --cache-dir /app/data/tiktoken --spacy --spacy-dir /app/spacy_models || status=$?; \
-    if [ -n "${status:-}" ] && [ "$status" -ne 0 ] && [ "$status" -ne 2 ]; then exit "$status"; fi
-
 # Final stage
 # Pin to bookworm: keeps Python 3.12 (venv compat with the builder stage) while
 # avoiding Debian trixie's perl 5.40.x exposure (CVE-2026-12087, no patch yet),
@@ -74,6 +77,19 @@ FROM python:3.12-slim-bookworm
 
 WORKDIR /app
 
+# Install the stable runtime package set and create the service account before
+# copying application layers. Source-only changes can then reuse this apt
+# layer; ownership is fixed after the copies below.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gosu \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -g 1000 lightrag \
+    && useradd -u 1000 -g lightrag -m -d /home/lightrag -s /usr/sbin/nologin lightrag
+
+# Gunicorn writes its default log file in WORKDIR. Only the directory itself
+# needs to be writable; application trees are owned during COPY below.
+RUN chown lightrag:lightrag /app
+
 # Install uv for package management
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
@@ -81,32 +97,30 @@ ENV UV_SYSTEM_PYTHON=1
 
 # Copy installed packages and application code
 COPY --from=builder /root/.local /root/.local
-COPY --from=builder /app/.venv /app/.venv
-COPY --from=builder /app/lightrag ./lightrag
-COPY pyproject.toml .
-COPY setup.py .
-COPY uv.lock .
+COPY --chown=lightrag:lightrag --from=builder /app/.venv /app/.venv
+COPY --chown=lightrag:lightrag --from=builder /app/lightrag ./lightrag
+COPY --chown=lightrag:lightrag pyproject.toml .
+COPY --chown=lightrag:lightrag setup.py .
+COPY --chown=lightrag:lightrag uv.lock .
 
 # Ensure the installed scripts are on PATH
 ENV PATH=/app/.venv/bin:/root/.local/bin:$PATH
 
-# Install dependencies with uv sync (uses locked versions from uv.lock)
-# and ensure pip is available for runtime installs. The pinned spaCy model
-# wheels (docx smart_heading) MUST be installed after uv sync — sync is exact
-# and would remove packages that are not in the lock. The bind mount exposes
-# the wheels downloaded in the builder stage without adding an image layer.
-RUN --mount=type=cache,target=/root/.local/share/uv \
-    --mount=type=bind,from=builder,source=/app/spacy_models,target=/tmp/spacy_models \
-    uv sync --frozen --no-dev --extra api --extra offline --no-editable \
-    && /app/.venv/bin/python -m ensurepip --upgrade \
-    && /app/.venv/bin/python -m pip install --no-index --no-cache-dir \
+# The builder already produced the exact locked virtual environment. Re-running
+# uv sync here would discard it and download the dependency graph again.
+# Install only the pinned spaCy model wheels after copying that environment;
+# these models are intentionally outside uv.lock. The bind mount exposes the
+# builder's wheels without adding a separate image layer.
+RUN --mount=type=bind,from=builder,source=/app/spacy_models,target=/tmp/spacy_models \
+    /app/.venv/bin/python -m pip install --no-index --no-cache-dir \
         --find-links=/tmp/spacy_models zh_core_web_sm en_core_web_sm
 
 # Create persistent data directories AFTER package installation
-RUN mkdir -p /app/data/rag_storage /app/data/inputs /app/data/prompts /app/data/tiktoken
+RUN install -d -o lightrag -g lightrag \
+    /app/data/rag_storage /app/data/inputs /app/data/prompts /app/data/tiktoken
 
 # Copy offline cache into the newly created directory
-COPY --from=builder /app/data/tiktoken /app/data/tiktoken
+COPY --chown=lightrag:lightrag --from=builder /app/data/tiktoken /app/data/tiktoken
 
 # Point to the prepared cache
 ENV TIKTOKEN_CACHE_DIR=/app/data/tiktoken
@@ -114,16 +128,8 @@ ENV WORKING_DIR=/app/data/rag_storage
 ENV INPUT_DIR=/app/data/inputs
 ENV PROMPT_DIR=/app/data/prompts
 
-# Create a non-root user (CIS Docker 4.1) and install gosu for privilege drop.
-# Fixed UID/GID 1000 gives predictable ownership for bind-mounts / PVCs.
-# chown -R /app MUST run after every data COPY above so the venv (pipmaster
-# installs packages at runtime), data dirs, and the tiktoken cache are writable.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends gosu \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd -g 1000 lightrag \
-    && useradd -u 1000 -g lightrag -m -d /home/lightrag -s /usr/sbin/nologin lightrag \
-    && chown -R lightrag:lightrag /app /home/lightrag
+# COPY --chown and install -o above keep the runtime-writable venv/cache/data
+# tree owned by the fixed UID/GID without a slow recursive chown layer.
 
 # HOME and cache dirs for the non-root user so pipmaster's runtime pip installs
 # never fall back to an unwritable /root or a missing HOME.
@@ -134,7 +140,8 @@ ENV HOME=/home/lightrag \
 
 # Entrypoint starts as root, fixes mount ownership, then drops to lightrag.
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \
+    && chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Expose API port
 EXPOSE 9621
