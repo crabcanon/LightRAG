@@ -46,6 +46,7 @@ class _ScriptedConnection:
     def __init__(self, fetchrow_results) -> None:
         self.fetchrow_results = list(fetchrow_results)
         self.statements: list[str] = []
+        self.execute_calls: list[tuple[str, tuple[object, ...]]] = []
         self.fetchrow_calls: list[tuple[str, tuple[object, ...]]] = []
 
     def transaction(self):
@@ -53,6 +54,7 @@ class _ScriptedConnection:
 
     async def execute(self, statement, *args):
         self.statements.append(statement)
+        self.execute_calls.append((statement, args))
         return "OK"
 
     async def fetchrow(self, statement, *args):
@@ -407,6 +409,11 @@ async def test_postgres_provider_bootstrap_and_mutations_emit_cas_guards() -> No
         "ADD COLUMN IF NOT EXISTS storage_resource_fingerprints" in sql
         for sql in connection.statements
     )
+    _bootstrap_sql, bootstrap_args = connection.execute_calls[-1]
+    assert isinstance(bootstrap_args[-2], datetime)
+    assert isinstance(bootstrap_args[-1], datetime)
+    assert bootstrap_args[-2].tzinfo is not None
+    assert bootstrap_args[-1].tzinfo is not None
 
     assert (
         await provider.update_name(default.id, expected_revision=1, name="Renamed")
@@ -426,6 +433,8 @@ async def test_postgres_provider_bootstrap_and_mutations_emit_cas_guards() -> No
     )
     assert transitioned == renamed
     mutation_sql = "\n".join(connection.statements)
+    assert "lifecycle_state = $4::varchar(32)" in mutation_sql
+    assert "$4::varchar(32) = 'TOMBSTONED'" in mutation_sql
     assert "c.revision = $2" in mutation_sql
     assert "o.owner_id = $6" in mutation_sql
     assert "o.fencing_token = $7" in mutation_sql

@@ -65,6 +65,25 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _postgres_timestamp(value: str | datetime) -> datetime:
+    """Convert the catalog's JSON-safe timestamp into asyncpg's native type."""
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        normalized = value.strip()
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError as exc:
+            raise CatalogError(f"Invalid catalog timestamp {value!r}") from exc
+    else:
+        raise CatalogError(f"Invalid catalog timestamp type {type(value).__name__}")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
 def canonical_payload_hash(payload: Mapping[str, Any]) -> str:
     serialized = json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -739,7 +758,7 @@ class PostgresCatalogProvider(CatalogProvider):
     ) -> tuple[Any, CatalogOperation, bool]:
         payload_hash = canonical_payload_hash(payload)
         operation_id = f"op_{uuid4().hex}"
-        now = utc_now()
+        now = _postgres_timestamp(utc_now())
         async with self._connection() as connection:
             async with connection.transaction():
                 row = await connection.fetchrow(
@@ -816,8 +835,8 @@ class PostgresCatalogProvider(CatalogProvider):
                     record.namespace_codec_version,
                     record.schema_version,
                     operation_id,
-                    record.created_at,
-                    record.updated_at,
+                    _postgres_timestamp(record.created_at),
+                    _postgres_timestamp(record.updated_at),
                 )
         operation = self._operation_from_row(row)
         durable = await self.get_record(record.id, include_tombstoned=True)
@@ -832,7 +851,7 @@ class PostgresCatalogProvider(CatalogProvider):
     ) -> tuple[Any, CatalogOperation, bool]:
         payload_hash = canonical_payload_hash(payload)
         operation_id = f"op_{uuid4().hex}"
-        now = utc_now()
+        now = _postgres_timestamp(utc_now())
         async with self._connection() as connection:
             async with connection.transaction():
                 row = await connection.fetchrow(
@@ -912,7 +931,7 @@ class PostgresCatalogProvider(CatalogProvider):
     ) -> tuple[Any, CatalogOperation, bool]:
         payload_hash = canonical_payload_hash(payload)
         operation_id = f"op_{uuid4().hex}"
-        now = utc_now()
+        now = _postgres_timestamp(utc_now())
         async with self._connection() as connection:
             async with connection.transaction():
                 row = await connection.fetchrow(
@@ -1060,7 +1079,7 @@ class PostgresCatalogProvider(CatalogProvider):
             row = await connection.fetchrow(
                 f"""
                 UPDATE {_CATALOG_TABLE} AS c
-                SET lifecycle_state = $4, revision = revision + 1,
+                SET lifecycle_state = $4::varchar(32), revision = revision + 1,
                     error_code = $8, error_message = $9, updated_at = NOW(),
                     storage_profile_fingerprint = COALESCE(
                         c.storage_profile_fingerprint, $10
@@ -1070,7 +1089,10 @@ class PostgresCatalogProvider(CatalogProvider):
                         THEN COALESCE($11::jsonb, '{{}}'::jsonb)
                         ELSE c.storage_resource_fingerprints
                     END,
-                    tombstoned_at = CASE WHEN $4 = 'TOMBSTONED' THEN NOW() ELSE tombstoned_at END
+                    tombstoned_at = CASE
+                        WHEN $4::varchar(32) = 'TOMBSTONED'
+                        THEN NOW() ELSE tombstoned_at
+                    END
                 WHERE c.id = $1 AND c.revision = $2
                   AND c.lifecycle_state = ANY($3::text[])
                   AND c.current_operation_id = $5
@@ -1211,6 +1233,6 @@ def _record_parameters(record: Any) -> tuple[Any, ...]:
         record.revision,
         record.schema_version,
         record.current_operation_id,
-        record.created_at,
-        record.updated_at,
+        _postgres_timestamp(record.created_at),
+        _postgres_timestamp(record.updated_at),
     )
