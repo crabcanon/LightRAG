@@ -1585,6 +1585,40 @@ class _PipelineMixin:
     async def apipeline_process_enqueue_documents(
         self, _holding_busy: bool = False, token: str | None = None
     ) -> None:
+        """Admit one workspace pipeline before entering its single-writer loop."""
+
+        controller = getattr(self, "_resource_admission_controller", None)
+        if controller is None:
+            return await self._apipeline_process_enqueue_documents_unadmitted(
+                _holding_busy=_holding_busy,
+                token=token,
+            )
+
+        from lightrag.workspace_scope import current_workspace_execution_scope
+
+        scope = current_workspace_execution_scope()
+        if (
+            scope is not None
+            and scope.workspace_id != self._resource_admission_workspace_id
+        ):
+            raise RuntimeError(
+                "Pipeline admission scope does not match the immutable "
+                "LightRAG workspace binding"
+            )
+        operation_kind = scope.operation_kind if scope else "ingestion"
+        async with controller.admit(
+            "pipeline",
+            workspace_id=self._resource_admission_workspace_id,
+            operation_kind=operation_kind,
+        ):
+            return await self._apipeline_process_enqueue_documents_unadmitted(
+                _holding_busy=_holding_busy,
+                token=token,
+            )
+
+    async def _apipeline_process_enqueue_documents_unadmitted(
+        self, _holding_busy: bool = False, token: str | None = None
+    ) -> None:
         """
         Process pending documents by splitting them into chunks, processing
         each chunk for entity and relation extraction, and updating the

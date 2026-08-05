@@ -10,6 +10,7 @@ type DocumentsRequest = {
 
 type LightragApiModule = typeof import('./lightrag')
 type SettingsModule = typeof import('@/stores/settings')
+type KnowledgeBase = import('./lightrag').KnowledgeBase
 
 const storageMock = () => {
   const data = new Map<string, string>()
@@ -69,6 +70,116 @@ describe('knowledge-base request routing', () => {
       'LIGHTRAG-KNOWLEDGE-BASE': 'kb_upload_target'
     })
     expect(apiModule.buildKnowledgeBaseHeaders('default')).toEqual({})
+  })
+
+  test('classifies only data-plane URLs for automatic selector injection', () => {
+    for (const url of [
+      '/documents',
+      '/documents/supported_file_types?live=true',
+      '/query',
+      '/query/stream',
+      '/graph/entity/exists#result',
+      '/graphs'
+    ]) {
+      expect(apiModule.isKnowledgeBaseDataPlaneUrl(url)).toBe(true)
+    }
+    for (const url of [
+      '/health',
+      '/ready',
+      '/auth-status',
+      '/login',
+      '/knowledge-bases',
+      '/knowledge-bases/operations/op_1',
+      '/api/tags',
+      undefined
+    ]) {
+      expect(apiModule.isKnowledgeBaseDataPlaneUrl(url)).toBe(false)
+    }
+  })
+})
+
+const knowledgeBase = (id: string, name: string): KnowledgeBase => ({
+  id,
+  name,
+  effective_workspace: id,
+  isolation_level: 'logical',
+  storage_profile_id: null,
+  created_at: '2026-08-03T00:00:00Z',
+  updated_at: '2026-08-03T00:00:00Z',
+  lifecycle_state: 'ACTIVE'
+})
+
+describe('knowledge-base catalog lifecycle', () => {
+  test('collects every deterministic catalog page', async () => {
+    const requestedCursors: Array<string | undefined> = []
+    const result = await apiModule.collectKnowledgeBasePages(async (cursor) => {
+      requestedCursors.push(cursor)
+      if (!cursor) {
+        return {
+          default_id: 'default',
+          knowledge_bases: [knowledgeBase('default', 'Default')],
+          storage_profiles: [],
+          next_cursor: 'default',
+          multi_workspace_enabled: true,
+          admin_key_required: true
+        }
+      }
+      return {
+        default_id: 'default',
+        knowledge_bases: [knowledgeBase('kb_a', 'Project A')],
+        storage_profiles: [],
+        next_cursor: null,
+        multi_workspace_enabled: true,
+        admin_key_required: true
+      }
+    })
+
+    expect(requestedCursors).toEqual([undefined, 'default'])
+    expect(result.knowledge_bases.map((item) => item.id)).toEqual([
+      'default',
+      'kb_a'
+    ])
+    expect(result.next_cursor).toBeNull()
+    expect(result.admin_key_required).toBe(true)
+  })
+
+  test('rejects a repeated catalog cursor instead of looping forever', async () => {
+    await expect(
+      apiModule.collectKnowledgeBasePages(async () => ({
+        default_id: 'default',
+        knowledge_bases: [],
+        storage_profiles: [],
+        next_cursor: 'same'
+      }))
+    ).rejects.toThrow('repeated page cursor')
+  })
+
+  test('unwraps successful lifecycle responses and surfaces failures', () => {
+    const record = knowledgeBase('kb_a', 'Project A')
+    const operation = {
+      operation_id: 'op_1',
+      workspace_id: record.id,
+      state: 'SUCCEEDED' as const
+    }
+    expect(apiModule.resolveKnowledgeBaseMutation(record)).toEqual(record)
+    expect(
+      apiModule.resolveKnowledgeBaseMutation({
+        knowledge_base: record,
+        operation
+      })
+    ).toEqual(record)
+    expect(
+      apiModule.resolveKnowledgeBaseMutation({
+        knowledge_base: record,
+        operation: { ...operation, state: 'RUNNING' }
+      })
+    ).toBeNull()
+    expect(() =>
+      apiModule.resolveKnowledgeBaseMutation({
+        knowledge_base: { ...record, error_message: 'safe failure' },
+        operation: { ...operation, state: 'FAILED' }
+      })
+    ).toThrow('safe failure')
   })
 })
 

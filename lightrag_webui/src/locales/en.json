@@ -35,6 +35,9 @@
     "storageProfile": "Storage profile",
     "selectStorageProfile": "Select a storage profile",
     "profileRequired": "Select an available storage profile",
+    "adminKeyLabel": "Knowledge-base admin key",
+    "adminKeyPlaceholder": "Knowledge-base admin key",
+    "adminKeyRequired": "Enter the knowledge-base admin key",
     "createdWithoutUpload": "The knowledge base was created, but no file was accepted. You can select it and retry.",
     "incrementalHint": "The files will incrementally update the selected RAG, graph, and cache.",
     "isolatedHint": "A new RAG, graph, cache, document directory, and pipeline namespace will be created."

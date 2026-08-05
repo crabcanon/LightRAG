@@ -39,7 +39,7 @@ import {
 import { useSettingsStore } from '@/stores/settings'
 import { useGraphStore } from '@/stores/graph'
 import {
-  buildKnowledgeBaseUploadOptions,
+  buildKnowledgeBaseUploadTargetOptions,
   NEW_KNOWLEDGE_BASE_UPLOAD_TARGET
 } from './uploadKnowledgeBaseOptions'
 
@@ -69,12 +69,18 @@ export default function UploadDocumentsDialog({
   const [newKnowledgeBaseName, setNewKnowledgeBaseName] = useState('')
   const [newIsolationLevel, setNewIsolationLevel] = useState<'logical' | 'physical'>('logical')
   const [newStorageProfileId, setNewStorageProfileId] = useState('')
+  const [newKnowledgeBaseAdminKey, setNewKnowledgeBaseAdminKey] = useState('')
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[]>([])
   const [storageProfiles, setStorageProfiles] = useState<StorageProfileSummary[]>([])
+  const [multiWorkspaceEnabled, setMultiWorkspaceEnabled] = useState(true)
+  const [adminKeyRequired, setAdminKeyRequired] = useState(false)
   const [loadingTargets, setLoadingTargets] = useState(false)
   const selectedKnowledgeBaseId = useSettingsStore.use.selectedKnowledgeBaseId()
   const setSelectedKnowledgeBaseId = useSettingsStore.use.setSelectedKnowledgeBaseId()
-  const uploadOptions = buildKnowledgeBaseUploadOptions(knowledgeBases)
+  const uploadOptions = buildKnowledgeBaseUploadTargetOptions(
+    knowledgeBases,
+    multiWorkspaceEnabled
+  )
 
   useEffect(() => {
     if (!open) return
@@ -84,6 +90,11 @@ export default function UploadDocumentsDialog({
       .then((response) => {
         if (!active) return
         setKnowledgeBases(response.knowledge_bases)
+        setMultiWorkspaceEnabled(response.multi_workspace_enabled !== false)
+        setAdminKeyRequired(response.admin_key_required === true)
+        if (response.multi_workspace_enabled === false) {
+          setUploadTarget(response.default_id)
+        }
         setStorageProfiles(
           response.storage_profiles.filter((profile) => profile.available && profile.dedicated)
         )
@@ -192,12 +203,20 @@ export default function UploadDocumentsDialog({
               t('knowledgeBases.profileRequired', 'Select an available storage profile')
             )
           }
+          if (adminKeyRequired && !newKnowledgeBaseAdminKey.trim()) {
+            throw new Error(
+              t(
+                'knowledgeBases.adminKeyRequired',
+                'Enter the knowledge-base admin key'
+              )
+            )
+          }
           createdKnowledgeBase = await createKnowledgeBase({
             name,
             isolation_level: newIsolationLevel,
             storage_profile_id:
               newIsolationLevel === 'physical' ? newStorageProfileId : null
-          })
+          }, newKnowledgeBaseAdminKey)
           targetKnowledgeBaseId = createdKnowledgeBase.id
           window.dispatchEvent(new CustomEvent('lightrag:knowledge-bases-changed'))
         }
@@ -351,6 +370,8 @@ export default function UploadDocumentsDialog({
       newKnowledgeBaseName,
       newIsolationLevel,
       newStorageProfileId,
+      newKnowledgeBaseAdminKey,
+      adminKeyRequired,
       selectedKnowledgeBaseId,
       setSelectedKnowledgeBaseId
     ]
@@ -378,6 +399,7 @@ export default function UploadDocumentsDialog({
           setNewKnowledgeBaseName('')
           setNewIsolationLevel('logical')
           setNewStorageProfileId('')
+          setNewKnowledgeBaseAdminKey('')
           setFileTypes({ status: 'idle' })
         }
         setOpen(nextOpen)
@@ -404,12 +426,14 @@ export default function UploadDocumentsDialog({
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value={NEW_KNOWLEDGE_BASE_UPLOAD_TARGET}>
-                {t('knowledgeBases.createIsolated', 'Create an isolated knowledge base')}
-              </SelectItem>
               {uploadOptions.map((option) => (
                 <SelectItem key={option.value} value={option.value}>
-                  {option.label}
+                  {option.kind === 'create'
+                    ? t(
+                      'knowledgeBases.createIsolated',
+                      'Create an isolated knowledge base'
+                    )
+                    : option.label}
                 </SelectItem>
               ))}
             </SelectContent>
@@ -463,6 +487,23 @@ export default function UploadDocumentsDialog({
                     ))}
                   </SelectContent>
                 </Select>
+              )}
+              {adminKeyRequired && (
+                <Input
+                  type="password"
+                  value={newKnowledgeBaseAdminKey}
+                  onChange={(event) => setNewKnowledgeBaseAdminKey(event.target.value)}
+                  placeholder={t(
+                    'knowledgeBases.adminKeyPlaceholder',
+                    'Knowledge-base admin key'
+                  )}
+                  aria-label={t(
+                    'knowledgeBases.adminKeyLabel',
+                    'Knowledge-base admin key'
+                  )}
+                  disabled={isUploading}
+                  autoComplete="new-password"
+                />
               )}
             </div>
           )}

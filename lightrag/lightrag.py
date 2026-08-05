@@ -41,6 +41,13 @@ from lightrag.prompt import (
     resolve_entity_extraction_prompt_profile,
     validate_entity_extraction_prompt_profile_for_mode,
 )
+from lightrag.workspace import (
+    StorageNamespaceDescriptor,
+    WorkspaceBinding,
+    WorkspaceBindingError,
+    WorkspaceKind,
+    validate_storage_namespace_descriptors,
+)
 from lightrag.constants import (
     DEFAULT_CHUNK_P_SIZE,
     DEFAULT_MAX_GLEANING,
@@ -422,6 +429,13 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
 
     workspace: str = field(default_factory=lambda: os.getenv("WORKSPACE", ""))
     """Workspace for data isolation. Defaults to empty string if WORKSPACE environment variable is not set."""
+
+    workspace_binding: WorkspaceBinding | None = field(default=None, repr=False)
+    """Immutable canonical identity shared by every storage in this instance.
+
+    API-server instances receive this from the knowledge-base catalog. Direct
+    library callers that omit it retain the legacy single-workspace codec.
+    """
 
     # ---
     # TODO: Deprecated, use setup_logger in utils.py instead
@@ -940,6 +954,8 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     """Placeholder text when file paths exceed max_file_paths limit."""
 
     addon_params: InitVar[dict[str, Any] | None] = None
+    resource_admission_controller: InitVar[Any | None] = None
+    resource_admission_workspace_id: InitVar[str | None] = None
     _addon_params: ObservableAddonParams = field(
         default_factory=ObservableAddonParams,
         init=False,
@@ -1199,6 +1215,10 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         # instance's, so every "independent" copy already shared one CoreBPE. Now
         # that the injection contract is thread safety, sharing is what it asks for.
         global_config["tokenizer"] = self.tokenizer
+        # ``asdict`` recursively converts frozen dataclasses into dictionaries.
+        # Storage constructors need the validated binding object itself so its
+        # enum tags and immutability survive the construction chain.
+        global_config["workspace_binding"] = self.workspace_binding
         global_config.pop("_addon_params", None)
         global_config.pop("_addon_params_dirty", None)
         global_config.pop("_cached_entity_extraction_use_json", None)
@@ -1235,7 +1255,12 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             "host": metadata.get("host"),
         }
 
-    def __post_init__(self, addon_params: dict[str, Any] | None):
+    def __post_init__(
+        self,
+        addon_params: dict[str, Any] | None,
+        resource_admission_controller: Any | None,
+        resource_admission_workspace_id: str | None,
+    ):
         from lightrag.kg.shared_storage import (
             initialize_share_data,
         )
@@ -1247,6 +1272,27 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 "Please customize entity type guidance through the prompt template instead. "
                 "Set addon_params={'entity_types_guidance': '...'} or replace the prompt template."
             )
+
+        if self.workspace_binding is None:
+            self.workspace_binding = WorkspaceBinding.legacy_default(self.workspace)
+        self.workspace_binding.validate()
+        if (
+            self.workspace_binding.kind is WorkspaceKind.NAMED
+            and self.workspace != self.workspace_binding.physical_workspace
+        ):
+            raise WorkspaceBindingError(
+                "A named LightRAG instance workspace must equal its immutable "
+                "binding's physical workspace"
+            )
+
+        # InitVars deliberately keep the live controller (which owns asyncio
+        # synchronization state) out of dataclasses.asdict/deepcopy and storage
+        # global_config. API instances receive one shared controller; ordinary
+        # library instances keep the existing per-instance queues unchanged.
+        self._resource_admission_controller = resource_admission_controller
+        self._resource_admission_workspace_id = (
+            resource_admission_workspace_id or self.workspace_binding.public_id
+        )
 
         self._replace_addon_params(addon_params, mark_dirty=False)
         self._apply_chunk_size_overlay()
@@ -1315,7 +1361,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             # Verify storage implementation compatibility
             verify_storage_implementation(storage_type, storage_name)
             # Check environment variables
-            check_storage_env_vars(storage_name)
+            check_storage_env_vars(storage_name, self.storage_profile)
 
         # Ensure vector_db_storage_cls_kwargs has required fields
         self.vector_db_storage_cls_kwargs = {
@@ -1350,12 +1396,24 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             )
 
         if self.rerank_model_func is not None:
+            rerank_func = self.rerank_model_func
+            if self._resource_admission_controller is not None:
+                rerank_func = self._resource_admission_controller.wrap(
+                    rerank_func,
+                    group="rerank",
+                    workspace_id=self._resource_admission_workspace_id,
+                    default_operation_kind="query",
+                )
             self.rerank_model_func = priority_limit_async_func_call(
                 self.rerank_model_max_async,
                 llm_timeout=self.default_rerank_timeout,
                 queue_name="Rerank func",
-                concurrency_group="rerank",
-            )(self.rerank_model_func)
+                concurrency_group=(
+                    None
+                    if self._resource_admission_controller is not None
+                    else "rerank"
+                ),
+            )(rerank_func)
 
         # Init Embedding
         # Step 1: Capture embedding_func and max_token_size before applying rate_limit decorator
@@ -1386,12 +1444,24 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         # This ensures _generate_collection_suffix can still access attributes (model_name, embedding_dim)
         # while preventing side effects when the same EmbeddingFunc is reused across multiple LightRAG instances
         if self.embedding_func is not None:
+            embedding_inner = self.embedding_func.func
+            if self._resource_admission_controller is not None:
+                embedding_inner = self._resource_admission_controller.wrap(
+                    embedding_inner,
+                    group="embedding",
+                    workspace_id=self._resource_admission_workspace_id,
+                    default_operation_kind="ingestion",
+                )
             wrapped_func = priority_limit_async_func_call(
                 self.embedding_func_max_async,
                 llm_timeout=self.default_embedding_timeout,
                 queue_name="Embedding func",
-                concurrency_group="embedding",
-            )(self.embedding_func.func)
+                concurrency_group=(
+                    None
+                    if self._resource_admission_controller is not None
+                    else "embedding"
+                ),
+            )(embedding_inner)
             # Use dataclasses.replace() to create a new instance, leaving the original unchanged
             self.embedding_func = replace(self.embedding_func, func=wrapped_func)
 
@@ -1494,6 +1564,10 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             embedding_func=None,
         )
 
+        self.storage_namespace_descriptors: tuple[StorageNamespaceDescriptor, ...] = (
+            self.validate_storage_bindings(stage="construction")
+        )
+
         # Per-role isolated LLM wrappers (independent queues per role).
         # The base ``self.llm_model_func`` is intentionally NOT queue-wrapped:
         # every code path that calls an LLM goes through one of the role
@@ -1576,6 +1650,35 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
 
         self._storages_status = StoragesStatus.CREATED
 
+    def _workspace_storages(self) -> tuple[StorageNameSpace, ...]:
+        """Return every storage whose namespace must match the binding."""
+
+        return (
+            self.full_docs,
+            self.text_chunks,
+            self.full_entities,
+            self.full_relations,
+            self.entity_chunks,
+            self.relation_chunks,
+            self.entities_vdb,
+            self.relationships_vdb,
+            self.chunks_vdb,
+            self.chunk_entity_relation_graph,
+            self.llm_response_cache,
+            self.doc_status,
+        )
+
+    def validate_storage_bindings(
+        self, *, stage: str
+    ) -> tuple[StorageNamespaceDescriptor, ...]:
+        """Fail closed when any storage no longer matches this instance binding."""
+
+        return validate_storage_namespace_descriptors(
+            self._workspace_storages(),
+            self.workspace_binding,
+            stage=stage,
+        )
+
     async def initialize_storages(self):
         """Storage initialization must be called one by one to prevent deadlock"""
         if self._storages_status == StoragesStatus.CREATED:
@@ -1600,23 +1703,14 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
 
             await initialize_pipeline_status(workspace=self.workspace)
 
-            for storage in (
-                self.full_docs,
-                self.text_chunks,
-                self.full_entities,
-                self.full_relations,
-                self.entity_chunks,
-                self.relation_chunks,
-                self.entities_vdb,
-                self.relationships_vdb,
-                self.chunks_vdb,
-                self.chunk_entity_relation_graph,
-                self.llm_response_cache,
-                self.doc_status,
-            ):
+            for storage in self._workspace_storages():
                 if storage:
                     # logger.debug(f"Initializing storage: {storage}")
                     await storage.initialize()
+
+            self.storage_namespace_descriptors = self.validate_storage_bindings(
+                stage="post-connect"
+            )
 
             # After initialize(), so a backend that derives capabilities during
             # startup (Redis builds its status/source indexes there) is judged on

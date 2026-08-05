@@ -1,0 +1,124 @@
+# Ephemeral dual-profile services for strict physical-isolation integration tests.
+#
+# Start:
+#   docker compose -f docker-compose.integration-physical.yml up -d --wait
+# Test:
+#   LIGHTRAG_PHYSICAL_IT=true ./scripts/test.sh \
+#     tests/workspace/test_physical_services_multitenant_integration.py \
+#     --run-integration
+# Stop and remove test data:
+#   docker compose -f docker-compose.integration-physical.yml down -v
+name: lightrag-multikb-physical-it
+
+services:
+  postgres-a:
+    image: pgvector/pgvector:pg18
+    environment:
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: rag-physical-it
+      POSTGRES_DB: rag
+    ports:
+      - "127.0.0.1:${IT_POSTGRES_A_PORT:-55432}:5432"
+    volumes:
+      - postgres_a_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d rag"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
+
+  postgres-b:
+    image: pgvector/pgvector:pg18
+    environment:
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: rag-physical-it
+      POSTGRES_DB: rag
+    ports:
+      - "127.0.0.1:${IT_POSTGRES_B_PORT:-55433}:5432"
+    volumes:
+      - postgres_b_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d rag"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
+
+  neo4j-a:
+    image: neo4j:5.26-community
+    environment:
+      NEO4J_AUTH: neo4j/neo4j-physical-it
+      NEO4J_dbms_default__database: neo4j
+    ports:
+      - "127.0.0.1:${IT_NEO4J_A_HTTP_PORT:-57474}:7474"
+      - "127.0.0.1:${IT_NEO4J_A_BOLT_PORT:-57687}:7687"
+    volumes:
+      - neo4j_a_data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          cypher-shell -u neo4j -p neo4j-physical-it
+          "RETURN 1" >/dev/null
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 10s
+
+  neo4j-b:
+    image: neo4j:5.26-community
+    environment:
+      NEO4J_AUTH: neo4j/neo4j-physical-it
+      NEO4J_dbms_default__database: neo4j
+    ports:
+      - "127.0.0.1:${IT_NEO4J_B_HTTP_PORT:-57475}:7474"
+      - "127.0.0.1:${IT_NEO4J_B_BOLT_PORT:-57688}:7687"
+    volumes:
+      - neo4j_b_data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          cypher-shell -u neo4j -p neo4j-physical-it
+          "RETURN 1" >/dev/null
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 10s
+
+  redis-a:
+    image: redis:7.4-alpine
+    # RDB keeps the operator backup/restore exercise deterministic. Production
+    # durability policy remains an operator decision, not a LightRAG contract.
+    command: ["redis-server", "--appendonly", "no", "--save", "60", "1"]
+    ports:
+      - "127.0.0.1:${IT_REDIS_A_PORT:-56379}:6379"
+    volumes:
+      - redis_a_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  redis-b:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "no", "--save", "60", "1"]
+    ports:
+      - "127.0.0.1:${IT_REDIS_B_PORT:-56380}:6379"
+    volumes:
+      - redis_b_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+volumes:
+  postgres_a_data:
+  postgres_b_data:
+  neo4j_a_data:
+  neo4j_b_data:
+  redis_a_data:
+  redis_b_data:

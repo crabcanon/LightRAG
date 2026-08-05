@@ -41,21 +41,11 @@ def _build_global_concurrency_limits(args) -> dict:
     plus ``embedding`` and ``rerank``. Role fallbacks mirror the runtime
     resolution in ``_get_effective_role_llm_max_async``.
     """
-    from lightrag.llm_roles import ROLES
+    from lightrag.admission import build_service_admission_limits
+    from lightrag.api.workspace_coordinator import STARTUP_RECOVERY_GROUP
 
-    limits = {}
-    for spec in ROLES:
-        role_limit = getattr(args, f"{spec.name}_llm_max_async", None)
-        if role_limit is None:
-            role_limit = args.max_async
-        if role_limit is not None and role_limit > 0:
-            limits[f"llm:{spec.name}"] = role_limit
-    embedding_limit = getattr(args, "embedding_func_max_async", None)
-    if embedding_limit is not None and embedding_limit > 0:
-        limits["embedding"] = embedding_limit
-    rerank_limit = getattr(args, "rerank_max_async", None)
-    if rerank_limit is not None and rerank_limit > 0:
-        limits["rerank"] = rerank_limit
+    limits = build_service_admission_limits(args)
+    limits[STARTUP_RECOVERY_GROUP] = 1
     return limits
 
 

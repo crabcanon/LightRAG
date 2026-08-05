@@ -133,7 +133,10 @@ def test_sigkilled_holder_never_deadlocks_other_processes():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(shared_storage.psutil is None, reason="needs psutil")
+@pytest.mark.skipif(
+    shared_storage.psutil is None or not hasattr(signal, "SIGKILL"),
+    reason="needs psutil and POSIX SIGKILL",
+)
 def test_zombie_holder_is_confirmed_dead():
     """A SIGKILLed-but-not-reaped child (its wedged parent has not called
     wait()) is a zombie: it executes no code and cannot be using the lock, so
@@ -516,6 +519,7 @@ def test_my_start_id_recomputed_after_real_fork():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(os.name == "nt", reason="os.kill(pid, 0) is a POSIX probe")
 def test_pid_alive_fallback_without_psutil(monkeypatch):
     monkeypatch.setattr(shared_storage, "psutil", None)
     assert shared_storage._pid_alive(os.getpid()) is True
@@ -527,7 +531,8 @@ def test_pid_alive_fallback_without_psutil(monkeypatch):
 
 
 @pytest.mark.skipif(
-    shared_storage.psutil is None, reason="needs psutil to observe the zombie"
+    shared_storage.psutil is None or not hasattr(signal, "SIGKILL"),
+    reason="needs psutil and POSIX SIGKILL",
 )
 def test_pid_alive_fallback_keeps_zombies_alive(monkeypatch):
     """Without psutil the historical os.kill(pid, 0) behavior is preserved:

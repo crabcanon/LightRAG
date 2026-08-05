@@ -1,2 +1,3 @@
 lightrag/api/webui/** binary
 lightrag/api/webui/** linguist-generated
+*.sh text eol=lf

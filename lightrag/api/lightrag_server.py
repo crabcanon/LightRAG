@@ -69,23 +69,44 @@ from lightrag.parser.external.mineru.cache import MinerUParserOptions
 from lightrag.api.routers.query_routes import create_query_routes
 from lightrag.api.routers.graph_routes import create_graph_routes
 from lightrag.api.routers.ollama_api import OllamaAPI
+from lightrag.api.endpoint_policy import validate_endpoint_policies
 from lightrag.api.routers.knowledge_base_routes import (
     create_knowledge_base_routes,
 )
 from lightrag.api.knowledge_bases import (
-    KnowledgeBaseHeader,
+    DEFAULT_KNOWLEDGE_BASE_ID,
+    KNOWLEDGE_BASE_HEADER,
     KnowledgeBaseCatalog,
     KnowledgeBaseConflictError,
     KnowledgeBaseManager,
     KnowledgeBaseNotFoundError,
+    OllamaSelectorError,
     KnowledgeBaseRecord,
     StorageProfileError,
     storage_profiles_path_from_env,
 )
+from lightrag.api.catalog import LocalCatalogProvider, PostgresCatalogProvider
+from lightrag.admission import (
+    ResourceAdmissionController,
+    build_service_admission_limits,
+)
+from lightrag.api.workspace_config import (
+    CatalogProviderKind,
+    CoordinatorProviderKind,
+    WorkspaceDeploymentError,
+    resolve_non_default_writes,
+    resolve_workspace_deployment,
+)
+from lightrag.api.workspace_coordinator import (
+    LocalWorkspaceCoordinator,
+    SameHostManagerWorkspaceCoordinator,
+)
 from lightrag.kg.storage_profiles import (
+    audit_workspace_overrides,
     build_default_resource_profile,
     required_profile_sections,
 )
+from lightrag.workspace import WorkspaceBinding
 
 from lightrag.utils import logger, set_verbose_debug
 from lightrag.kg.shared_storage import (
@@ -1357,13 +1378,61 @@ def create_app(args):
     # Check if API key is provided either through env var or args
     api_key = os.getenv("LIGHTRAG_API_KEY") or args.key
 
-    # Initialize document manager with workspace support for data isolation
-    doc_manager = DocumentManager(args.input_dir, workspace=args.workspace)
-    catalog_path = os.getenv(
-        "LIGHTRAG_KNOWLEDGE_BASE_CATALOG",
-        str(Path(args.working_dir) / "knowledge_bases.json"),
+    workspace_deployment = resolve_workspace_deployment(
+        workers=int(getattr(args, "workers", 1) or 1)
     )
-    knowledge_base_catalog = KnowledgeBaseCatalog(catalog_path, args.workspace)
+    resource_admission_controller = (
+        ResourceAdmissionController.from_environment(
+            build_service_admission_limits(args)
+        )
+        if workspace_deployment.multi_workspace_enabled
+        else None
+    )
+    admin_api_key = os.getenv("LIGHTRAG_ADMIN_API_KEY")
+    if workspace_deployment.multi_workspace_enabled and not admin_api_key:
+        raise WorkspaceDeploymentError(
+            "Multi-workspace mode requires LIGHTRAG_ADMIN_API_KEY for "
+            "knowledge-base management mutations"
+        )
+    if (
+        workspace_deployment.coordinator_provider is CoordinatorProviderKind.MANAGER
+        and "LIGHTRAG_GUNICORN_MODE" not in os.environ
+    ):
+        raise WorkspaceDeploymentError(
+            "The manager coordinator requires lightrag-gunicorn so shared "
+            "state is initialized in the preloaded master"
+        )
+    workspace_coordinator = (
+        SameHostManagerWorkspaceCoordinator.from_environment()
+        if workspace_deployment.coordinator_provider is CoordinatorProviderKind.MANAGER
+        else LocalWorkspaceCoordinator()
+    )
+    active_storage_implementations = {
+        "kv": args.kv_storage,
+        "vector": args.vector_storage,
+        "graph": args.graph_storage,
+        "doc_status": args.doc_status_storage,
+    }
+    workspace_override_audit = audit_workspace_overrides(
+        mode=workspace_deployment.mode.value,
+        storage_implementations=active_storage_implementations,
+        server_workspace=str(args.workspace),
+    )
+
+    # Only create local catalog/input artifacts after deployment preflight has
+    # proved that backend workspace overrides cannot collapse or split tenants.
+    doc_manager = DocumentManager(args.input_dir, workspace=args.workspace)
+    default_knowledge_base_record = KnowledgeBaseRecord.legacy_default(args.workspace)
+    if workspace_deployment.catalog_provider is CatalogProviderKind.LOCAL:
+        catalog_path = os.getenv(
+            "LIGHTRAG_KNOWLEDGE_BASE_CATALOG",
+            str(Path(args.working_dir) / "knowledge_bases.json"),
+        )
+        local_catalog = KnowledgeBaseCatalog(catalog_path, args.workspace)
+        knowledge_base_catalog = LocalCatalogProvider(local_catalog)
+        default_knowledge_base_record = local_catalog.get(DEFAULT_KNOWLEDGE_BASE_ID)
+    else:
+        knowledge_base_catalog = PostgresCatalogProvider.from_environment()
     storage_profiles = KnowledgeBaseManager.load_storage_profiles(
         storage_profiles_path_from_env()
     )
@@ -1461,6 +1530,16 @@ def create_app(args):
     }
 
     app = FastAPI(**app_kwargs)
+
+    @app.exception_handler(OllamaSelectorError)
+    async def ollama_selector_exception_handler(
+        _request: Request, exc: OllamaSelectorError
+    ):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": exc.message, "code": exc.code},
+            headers=exc.headers,
+        )
 
     # Add custom validation error handler for /query/data endpoint
     @app.exception_handler(RequestValidationError)
@@ -2226,8 +2305,10 @@ def create_app(args):
     def build_rag(
         workspace: str,
         *,
+        admission_workspace_id: str,
         working_dir: str,
         input_dir: str,
+        workspace_binding: WorkspaceBinding,
         storage_profile: dict[str, Any] | None = None,
     ) -> LightRAG:
         """Build one fully independent RAG instance from server settings."""
@@ -2236,6 +2317,7 @@ def create_app(args):
                 working_dir=working_dir,
                 input_dir=input_dir,
                 workspace=workspace,
+                workspace_binding=workspace_binding,
                 llm_model_func=create_llm_model_func(args.llm_binding),
                 llm_model_name=args.llm_model,
                 llm_model_max_async=args.max_async,
@@ -2298,6 +2380,8 @@ def create_app(args):
                     )
                     for spec in ROLES
                 },
+                resource_admission_controller=resource_admission_controller,
+                resource_admission_workspace_id=admission_workspace_id,
             )
         except Exception as e:
             logger.error(f"Failed to initialize LightRAG: {e}")
@@ -2314,8 +2398,12 @@ def create_app(args):
 
     rag = build_rag(
         args.workspace,
+        admission_workspace_id=DEFAULT_KNOWLEDGE_BASE_ID,
         working_dir=args.working_dir,
         input_dir=args.input_dir,
+        workspace_binding=default_knowledge_base_record.to_workspace_binding(
+            server_mode=workspace_deployment.mode.value
+        ),
     )
 
     def build_knowledge_base_rag(
@@ -2328,8 +2416,12 @@ def create_app(args):
         input_dir = str(profile["input_dir"]) if profile else str(args.input_dir)
         return build_rag(
             record.effective_workspace,
+            admission_workspace_id=record.id,
             working_dir=working_dir,
             input_dir=input_dir,
+            workspace_binding=record.to_workspace_binding(
+                server_mode=workspace_deployment.mode.value
+            ),
             storage_profile=profile_with_id,
         )
 
@@ -2339,37 +2431,76 @@ def create_app(args):
         input_dir = str(profile["input_dir"]) if profile else str(args.input_dir)
         return DocumentManager(input_dir, workspace=record.effective_workspace)
 
-    active_storage_implementations = (
-        args.kv_storage,
-        args.vector_storage,
-        args.graph_storage,
-        args.doc_status_storage,
-    )
+    active_storage_implementation_names = tuple(active_storage_implementations.values())
     default_storage_profile = build_default_resource_profile(
         working_dir=str(args.working_dir),
         input_dir=str(args.input_dir),
         workspace=str(args.workspace),
-        required_sections=required_profile_sections(active_storage_implementations),
+        required_sections=required_profile_sections(
+            active_storage_implementation_names
+        ),
     )
     knowledge_base_manager = KnowledgeBaseManager(
         catalog=knowledge_base_catalog,
+        default_record=default_knowledge_base_record,
         default_rag=rag,
         default_document_manager=doc_manager,
         rag_factory=build_knowledge_base_rag,
         document_manager_factory=build_knowledge_base_document_manager,
         storage_profiles=storage_profiles,
         default_storage_profile=default_storage_profile,
-        active_storage_implementations=active_storage_implementations,
+        active_storage_implementations=active_storage_implementation_names,
         max_loaded_instances=int(
             os.getenv("LIGHTRAG_MAX_LOADED_KNOWLEDGE_BASES", "32")
         ),
+        max_loaded_resource_weight=int(
+            os.getenv(
+                "LIGHTRAG_WORKSPACE_POOL_MAX_WEIGHT",
+                os.getenv("LIGHTRAG_MAX_LOADED_KNOWLEDGE_BASES", "32"),
+            )
+        ),
+        multi_workspace_enabled=workspace_deployment.multi_workspace_enabled,
+        allow_non_default_writes=resolve_non_default_writes(workspace_deployment),
+        workspace_coordinator=workspace_coordinator,
+        ollama_model_name=ollama_server_infos.LIGHTRAG_MODEL,
     )
     app.state.knowledge_base_manager = knowledge_base_manager
+    app.state.catalog_provider = knowledge_base_catalog
+    app.state.workspace_deployment = workspace_deployment
+    app.state.workspace_override_audit = workspace_override_audit
+    app.state.resource_admission_controller = resource_admission_controller
+    app.state.workspace_coordinator = workspace_coordinator
+
+    @app.middleware("http")
+    async def publish_resolved_knowledge_base(request: Request, call_next):
+        response = await call_next(request)
+        selected = getattr(request.state, "knowledge_base", None)
+        if (
+            200 <= response.status_code < 400
+            and isinstance(selected, dict)
+            and selected.get("id")
+        ):
+            response.headers[KNOWLEDGE_BASE_HEADER] = str(selected["id"])
+            vary = [
+                item.strip()
+                for item in response.headers.get("Vary", "").split(",")
+                if item.strip()
+            ]
+            if not any(item.lower() == KNOWLEDGE_BASE_HEADER.lower() for item in vary):
+                vary.append(KNOWLEDGE_BASE_HEADER)
+            response.headers["Vary"] = ", ".join(vary)
+        return response
 
     # Add routes
     # root_path is set on the app for reverse proxy support;
     # routes stay at their natural paths and are prefixed by the proxy or uvicorn --root-path
-    app.include_router(create_knowledge_base_routes(knowledge_base_manager, api_key))
+    app.include_router(
+        create_knowledge_base_routes(
+            knowledge_base_manager,
+            api_key,
+            admin_api_key=admin_api_key,
+        )
+    )
     app.include_router(
         create_document_routes(
             knowledge_base_manager.rag_proxy,
@@ -2400,6 +2531,7 @@ def create_app(args):
         top_k=args.top_k,
         api_key=api_key,
         context_dependency=knowledge_base_manager.request_dependency,
+        model_alias_provider=knowledge_base_manager.list_ollama_workspace_ids,
     )
     app.include_router(ollama_api.router, prefix="/api")
 
@@ -2558,6 +2690,45 @@ def create_app(args):
         }
 
     @app.get(
+        "/ready",
+        dependencies=[Depends(combined_auth)],
+        summary="Check control-plane readiness without loading a workspace",
+    )
+    async def get_readiness():
+        """Read catalog and pool snapshots without instance lifecycle effects."""
+
+        before = knowledge_base_manager.side_effect_counters.snapshot()
+        try:
+            default_record = await knowledge_base_catalog.get_record(
+                DEFAULT_KNOWLEDGE_BASE_ID, include_tombstoned=True
+            )
+        except Exception as exc:
+            logger.warning("Readiness catalog probe failed: %s", type(exc).__name__)
+            raise HTTPException(
+                status_code=503,
+                detail={"status": "not_ready", "catalog": "unavailable"},
+                headers={"Retry-After": "1"},
+            ) from exc
+        after = knowledge_base_manager.side_effect_counters.snapshot()
+        if after != before:
+            raise RuntimeError("Readiness probe caused a workspace lifecycle effect")
+        return {
+            "status": "ready",
+            "catalog": "available",
+            "default_lifecycle_state": default_record.lifecycle_state,
+            "workspace_deployment": workspace_deployment.public_dict(),
+            "pool": knowledge_base_manager.instance_pool.peek(),
+            "recovery": knowledge_base_manager.recovery_coordinator.last_report.public_dict(),
+            "service_admission": (
+                await resource_admission_controller.snapshot()
+                if resource_admission_controller is not None
+                else None
+            ),
+            "workspace_coordinator": await workspace_coordinator.snapshot(),
+            "side_effect_counters": after,
+        }
+
+    @app.get(
         "/health",
         dependencies=[Depends(combined_auth)],
         summary="Get system health and configuration status",
@@ -2621,7 +2792,6 @@ def create_app(args):
     async def get_status(
         request: Request,
         authenticated: bool = Depends(auth_status),
-        knowledge_base_id: KnowledgeBaseHeader = None,
     ):
         """Get current system status including WebUI availability.
 
@@ -2630,9 +2800,10 @@ def create_app(args):
         caller is authenticated (see get_auth_status_dependency).
         """
         try:
-            selected_context = await knowledge_base_manager.get_context(
-                knowledge_base_id
-            )
+            # Liveness never interprets a workspace selector and never acquires
+            # or constructs a pooled instance. The startup-pinned default is a
+            # read-only diagnostic snapshot here.
+            selected_context = knowledge_base_manager.default_context
             selected_rag = selected_context.rag
             selected_record = selected_context.metadata
             workspace = selected_record.effective_workspace
@@ -2788,6 +2959,12 @@ def create_app(args):
                     ),
                     "embedding_queue_status": await selected_rag.get_embedding_queue_status(),
                     "rerank_queue_status": await selected_rag.get_rerank_queue_status(),
+                    "service_admission": (
+                        await resource_admission_controller.snapshot()
+                        if resource_admission_controller is not None
+                        else None
+                    ),
+                    "workspace_coordinator": await workspace_coordinator.snapshot(),
                 }
             )
             return status_data
@@ -2925,6 +3102,7 @@ def create_app(args):
             root = request.scope.get("root_path", "")
             return RedirectResponse(url=f"{root}/docs")
 
+    app.state.endpoint_policies = validate_endpoint_policies(app)
     return app
 
 

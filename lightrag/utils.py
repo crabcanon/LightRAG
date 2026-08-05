@@ -5165,7 +5165,9 @@ def tolerant_load_json_dict(text: str) -> dict[str, Any]:
     return {}
 
 
-def check_storage_env_vars(storage_name: str) -> None:
+def check_storage_env_vars(
+    storage_name: str, storage_profile: dict[str, Any] | None = None
+) -> None:
     """Check if all required environment variables for storage implementation exist
 
     Args:
@@ -5175,6 +5177,29 @@ def check_storage_env_vars(storage_name: str) -> None:
         ValueError: If required environment variables are missing
     """
     from lightrag.kg import STORAGE_ENV_REQUIREMENTS
+    from lightrag.kg.storage_profiles import (
+        PROFILE_REQUIRED_FIELDS,
+        STORAGE_ISOLATION_CAPABILITIES,
+    )
+
+    capability = STORAGE_ISOLATION_CAPABILITIES.get(storage_name)
+    profile_section = capability.profile_section if capability is not None else None
+    section_config = (
+        (storage_profile or {}).get(profile_section, {}) if profile_section else {}
+    )
+    if section_config:
+        required_fields = PROFILE_REQUIRED_FIELDS.get(profile_section, ())
+        missing_profile_fields = [
+            field
+            for field in required_fields
+            if section_config.get(field) in (None, "")
+        ]
+        if missing_profile_fields:
+            raise ValueError(
+                f"Storage profile section {profile_section!r} for {storage_name!r} "
+                "is missing: " + ", ".join(missing_profile_fields)
+            )
+        return
 
     required_vars = STORAGE_ENV_REQUIREMENTS.get(storage_name, [])
     missing_vars = [var for var in required_vars if var not in os.environ]

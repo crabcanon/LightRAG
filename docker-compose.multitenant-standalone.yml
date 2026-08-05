@@ -1,0 +1,48 @@
+# Full LightRAG image with the default file-backed storage implementations.
+# Each knowledge base is isolated below /app/data/rag_storage/<workspace>.
+name: ${COMPOSE_PROJECT_NAME:-lightrag-multitenant-standalone}
+
+services:
+  lightrag:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${LIGHTRAG_IMAGE:-lightrag-multitenant:standalone}
+    env_file:
+      - ${LIGHTRAG_ENV_FILE:-.env.multitenant-standalone}
+    environment:
+      HOST: 0.0.0.0
+      PORT: 9621
+      WORKING_DIR: /app/data/rag_storage
+      INPUT_DIR: /app/data/inputs
+      PROMPT_DIR: /app/data/prompts
+      LIGHTRAG_KNOWLEDGE_BASE_CATALOG: /app/data/rag_storage/knowledge_bases.json
+      LIGHTRAG_MULTI_WORKSPACE_MODE: multi
+      LIGHTRAG_ADMIN_API_KEY: ${LIGHTRAG_ADMIN_API_KEY:?Set LIGHTRAG_ADMIN_API_KEY in the env file}
+      LIGHTRAG_KNOWLEDGE_BASE_CATALOG_PROVIDER: local
+      LIGHTRAG_WORKSPACE_COORDINATOR_PROVIDER: local
+      LIGHTRAG_KV_STORAGE: JsonKVStorage
+      LIGHTRAG_VECTOR_STORAGE: NanoVectorDBStorage
+      LIGHTRAG_GRAPH_STORAGE: NetworkXStorage
+      LIGHTRAG_DOC_STATUS_STORAGE: JsonDocStatusStorage
+    ports:
+      - "${LIGHTRAG_BIND_HOST:-127.0.0.1}:${LIGHTRAG_PORT:-9621}:9621"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lightrag_standalone_data:/app/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:9621/health', timeout=5).read()"
+      interval: 10s
+      timeout: 8s
+      retries: 30
+      start_period: 30s
+    init: true
+    restart: unless-stopped
+
+volumes:
+  lightrag_standalone_data:

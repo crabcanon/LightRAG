@@ -23,6 +23,7 @@ from .exceptions import (
     StorageCapabilityError,
     StorageRecordNotFoundError,
 )
+from .workspace import StorageNamespaceDescriptor, describe_storage_namespace
 from .constants import (
     CUSTOM_CHUNK_PATCH_METADATA_KEY,
     DEFAULT_TOP_K,
@@ -170,6 +171,13 @@ class StorageNameSpace(ABC):
     workspace: str
     global_config: dict[str, Any]
 
+    storage_family: ClassVar[str] = "unknown"
+
+    def namespace_descriptor(self) -> StorageNamespaceDescriptor:
+        """Return this storage's canonical, credential-free namespace identity."""
+
+        return describe_storage_namespace(self)
+
     async def initialize(self):
         """Initialize the storage"""
         pass
@@ -225,6 +233,8 @@ class StorageNameSpace(ABC):
 
 @dataclass
 class BaseVectorStorage(StorageNameSpace, ABC):
+    storage_family: ClassVar[str] = "vector"
+
     embedding_func: EmbeddingFunc
     cosine_better_than_threshold: float = field(default=0.2)
     meta_fields: set[str] = field(default_factory=set)
@@ -388,6 +398,8 @@ class BaseVectorStorage(StorageNameSpace, ABC):
 
 @dataclass
 class BaseKVStorage(StorageNameSpace, ABC):
+    storage_family: ClassVar[str] = "kv"
+
     embedding_func: EmbeddingFunc
 
     supports_strict_point_reads: ClassVar[bool] = False
@@ -490,6 +502,8 @@ class BaseKVStorage(StorageNameSpace, ABC):
 @dataclass
 class BaseGraphStorage(StorageNameSpace, ABC):
     """All operations related to edges in graph should be undirected."""
+
+    storage_family: ClassVar[str] = "graph"
 
     embedding_func: EmbeddingFunc
 
@@ -1064,6 +1078,8 @@ class DocStatusStorage(BaseKVStorage, ABC):
     missing any of them cannot instantiate. There is no degraded fallback and
     no capability flag: instantiability IS the capability guarantee.
     """
+
+    storage_family: ClassVar[str] = "doc_status"
 
     @staticmethod
     def resolve_status_filter_values(

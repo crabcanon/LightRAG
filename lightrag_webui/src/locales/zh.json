@@ -35,6 +35,9 @@
     "storageProfile": "存储配置档案",
     "selectStorageProfile": "请选择存储配置档案",
     "profileRequired": "请选择一个可用的存储配置档案",
+    "adminKeyLabel": "知识库管理员密钥",
+    "adminKeyPlaceholder": "请输入知识库管理员密钥",
+    "adminKeyRequired": "请输入知识库管理员密钥",
     "createdWithoutUpload": "知识库已创建，但没有文件被接受。您可以选择该知识库后重试。",
     "incrementalHint": "文件将增量更新当前选中知识库的 RAG、图谱与缓存。",
     "isolatedHint": "系统将新建独立的 RAG、图谱、缓存、文档目录和流水线命名空间。"

@@ -1,4 +1,5 @@
 import importlib
+import os
 import sys
 from io import BytesIO
 from pathlib import Path
@@ -3338,7 +3339,12 @@ def test_upload_file_opener_refuses_existing_symlink(tmp_path):
     outside = tmp_path / "outside.txt"
     outside.write_text("keep", encoding="utf-8")
     link = tmp_path / "safe.pdf"
-    link.symlink_to(outside)
+    try:
+        link.symlink_to(outside)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege is unavailable")
+        raise
 
     opener = _document_routes.upload_file_opener(tmp_path)
     with pytest.raises(FileExistsError):
@@ -3356,7 +3362,8 @@ def test_upload_file_opener_creates_new_file_with_private_permissions(tmp_path):
         fh.write(b"content")
 
     assert path.read_bytes() == b"content"
-    assert (path.stat().st_mode & 0o777) == 0o600
+    if os.name != "nt":
+        assert (path.stat().st_mode & 0o777) == 0o600
 
 
 def test_upload_file_opener_falls_back_when_dir_fd_unsupported(tmp_path, monkeypatch):
@@ -3382,7 +3389,8 @@ def test_upload_file_opener_falls_back_when_dir_fd_unsupported(tmp_path, monkeyp
         fh.write(b"content")
 
     assert path.read_bytes() == b"content"
-    assert (path.stat().st_mode & 0o777) == 0o600
+    if os.name != "nt":
+        assert (path.stat().st_mode & 0o777) == 0o600
     assert directory_open_attempts == []
 
     with pytest.raises(FileExistsError):

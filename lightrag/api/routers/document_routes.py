@@ -5919,10 +5919,21 @@ def create_document_routes(
                 get_namespace_lock,
                 get_all_update_flags_status,
             )
+            from lightrag.exceptions import PipelineNotInitializedError
 
-            pipeline_status = await get_namespace_data(
-                "pipeline_status", workspace=rag.workspace
-            )
+            try:
+                pipeline_status = await get_namespace_data(
+                    "pipeline_status", workspace=rag.workspace
+                )
+            except PipelineNotInitializedError:
+                if getattr(rag, "runtime_state", None) != "UNLOADED":
+                    raise
+                return PipelineStatusResponse(
+                    runtime_state="UNLOADED",
+                    latest_message="Workspace runtime is not loaded",
+                    history_messages=[],
+                    update_status={},
+                )
             pipeline_status_lock = get_namespace_lock(
                 "pipeline_status", workspace=rag.workspace
             )
@@ -5967,6 +5978,7 @@ def create_document_routes(
                 status_dict.pop(_internal_field, None)
 
             status_dict.update(fence_view)
+            status_dict["runtime_state"] = getattr(rag, "runtime_state", "READY")
 
             # Add processed update_status to the status dictionary
             status_dict["update_status"] = processed_update_status
@@ -6583,14 +6595,14 @@ def create_document_routes(
         so the WebUI can pre-validate hinted filenames like
         ``img.[mineru].png`` without uploading the file first.
 
-        Derived from process-level configuration today; when per-workspace
-        parser rules land, this endpoint resolves the ``LIGHTRAG-WORKSPACE``
-        header internally — the response contract stays unchanged (hence the
-        ``Vary`` header, declared ahead of time so caches never reuse a
-        response across workspaces).
+        Derived from process-level configuration today; when per-knowledge-base
+        parser rules land, this endpoint resolves the canonical
+        ``LIGHTRAG-KNOWLEDGE-BASE`` selector internally — the response contract
+        stays unchanged (hence the ``Vary`` header, declared ahead of time so
+        caches never reuse a response across knowledge bases).
         """
         response.headers["Cache-Control"] = "no-store"
-        response.headers["Vary"] = "LIGHTRAG-WORKSPACE"
+        response.headers["Vary"] = "LIGHTRAG-KNOWLEDGE-BASE"
         return SupportedFileTypesResponse(
             supported_extensions=list(doc_manager.supported_extensions),
             engines=doc_manager.engine_capabilities,

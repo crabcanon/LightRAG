@@ -9,6 +9,14 @@ import { navigationService } from '@/services/navigation'
 export const KNOWLEDGE_BASE_HEADER = 'LIGHTRAG-KNOWLEDGE-BASE'
 export const DEFAULT_KNOWLEDGE_BASE_ID = 'default'
 
+export type KnowledgeBaseLifecycleState =
+  | 'CREATING'
+  | 'MIGRATING'
+  | 'ACTIVE'
+  | 'DELETING'
+  | 'TOMBSTONED'
+  | 'ERROR'
+
 export type KnowledgeBase = {
   id: string
   name: string
@@ -17,18 +25,45 @@ export type KnowledgeBase = {
   storage_profile_id: string | null
   created_at: string
   updated_at: string
+  lifecycle_state?: KnowledgeBaseLifecycleState
+  revision?: number
+  error_code?: string | null
+  error_message?: string | null
 }
 
 export type StorageProfileSummary = {
   id: string
   available: boolean
   dedicated: boolean
+  lifecycle?: {
+    resource_ownership: 'operator'
+    provisioning: 'preprovisioned'
+    deletion: 'drop_workspace_namespaces'
+    backup: 'operator_managed'
+  } | null
 }
 
 export type KnowledgeBaseListResponse = {
   default_id: string
   knowledge_bases: KnowledgeBase[]
   storage_profiles: StorageProfileSummary[]
+  next_cursor?: string | null
+  multi_workspace_enabled?: boolean
+  admin_key_required?: boolean
+}
+
+export type KnowledgeBaseOperation = {
+  operation_id: string
+  workspace_id: string
+  state: 'PENDING' | 'RUNNING' | 'SUCCEEDED' | 'FAILED'
+  error_code?: string | null
+  error_message?: string | null
+}
+
+export type KnowledgeBaseMutationResponse = {
+  created?: boolean
+  knowledge_base: KnowledgeBase
+  operation: KnowledgeBaseOperation
 }
 
 // Types
@@ -457,12 +492,14 @@ axiosInstance.interceptors.request.use((config) => {
   if (apiKey) {
     config.headers['X-API-Key'] = apiKey
   }
-  const knowledgeBaseHeaders = buildKnowledgeBaseHeaders()
-  Object.entries(knowledgeBaseHeaders).forEach(([name, value]) => {
-    if (!config.headers.get(name)) {
-      config.headers[name] = value
-    }
-  })
+  if (isKnowledgeBaseDataPlaneUrl(config.url)) {
+    const knowledgeBaseHeaders = buildKnowledgeBaseHeaders()
+    Object.entries(knowledgeBaseHeaders).forEach(([name, value]) => {
+      if (!config.headers.get(name)) {
+        config.headers[name] = value
+      }
+    })
+  }
   return config
 })
 
@@ -739,6 +776,21 @@ export function buildKnowledgeBaseHeaders(
   return { [KNOWLEDGE_BASE_HEADER]: knowledgeBaseId }
 }
 
+const KNOWLEDGE_BASE_DATA_PLANE_PREFIXES = [
+  '/documents',
+  '/query',
+  '/graph',
+  '/graphs'
+] as const
+
+export function isKnowledgeBaseDataPlaneUrl(url: string | undefined): boolean {
+  if (!url) return false
+  const path = url.split(/[?#]/, 1)[0]
+  return KNOWLEDGE_BASE_DATA_PLANE_PREFIXES.some(
+    (prefix) => path === prefix || path.startsWith(`${prefix}/`)
+  )
+}
+
 function _buildStreamHeaders(): HeadersInit {
   const apiKey = useSettingsStore.getState().apiKey;
   const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
@@ -926,32 +978,141 @@ export const queryTextStream = async (
   }
 };
 
-export const listKnowledgeBases = async (): Promise<KnowledgeBaseListResponse> => {
-  const response = await axiosInstance.get('/knowledge-bases')
-  return response.data
+type KnowledgeBasePageFetcher = (
+  cursor?: string
+) => Promise<KnowledgeBaseListResponse>
+
+export async function collectKnowledgeBasePages(
+  fetchPage: KnowledgeBasePageFetcher
+): Promise<KnowledgeBaseListResponse> {
+  let cursor: string | undefined
+  let firstPage: KnowledgeBaseListResponse | undefined
+  const records: KnowledgeBase[] = []
+  const seenCursors = new Set<string>()
+
+  while (true) {
+    const page = await fetchPage(cursor)
+    firstPage ??= page
+    records.push(...page.knowledge_bases)
+    const nextCursor = page.next_cursor ?? null
+    if (!nextCursor) break
+    if (seenCursors.has(nextCursor)) {
+      throw new Error('Knowledge-base catalog returned a repeated page cursor')
+    }
+    seenCursors.add(nextCursor)
+    cursor = nextCursor
+  }
+
+  return {
+    ...firstPage!,
+    knowledge_bases: records,
+    next_cursor: null
+  }
 }
+
+export const listKnowledgeBases = async (): Promise<KnowledgeBaseListResponse> =>
+  collectKnowledgeBasePages(async (cursor) => {
+    const response = await axiosInstance.get('/knowledge-bases', {
+      params: {
+        limit: 1000,
+        state: 'ACTIVE',
+        ...(cursor ? { cursor } : {})
+      }
+    })
+    return response.data
+  })
+
+export function resolveKnowledgeBaseMutation(
+  payload: KnowledgeBase | KnowledgeBaseMutationResponse
+): KnowledgeBase | null {
+  if (!('operation' in payload)) return payload
+  if (payload.operation.state === 'SUCCEEDED') return payload.knowledge_base
+  if (payload.operation.state === 'FAILED') {
+    throw new Error(
+      payload.operation.error_message ||
+      payload.knowledge_base.error_message ||
+      'Knowledge-base operation failed'
+    )
+  }
+  return null
+}
+
+const waitForKnowledgeBaseOperation = async (
+  initial: KnowledgeBaseMutationResponse,
+  timeoutMs: number = 60000
+): Promise<KnowledgeBase> => {
+  let payload = initial
+  const deadline = Date.now() + timeoutMs
+
+  while (true) {
+    const completed = resolveKnowledgeBaseMutation(payload)
+    if (completed) return completed
+    if (Date.now() >= deadline) {
+      throw new Error('Knowledge-base operation timed out')
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    const response = await axiosInstance.get(
+      `/knowledge-bases/operations/${encodeURIComponent(payload.operation.operation_id)}`
+    )
+    payload = response.data
+  }
+}
+
+const managementHeaders = (adminApiKey?: string): Record<string, string> => {
+  const headers: Record<string, string> = {}
+  const normalizedKey = adminApiKey?.trim()
+  if (normalizedKey) headers['X-LightRAG-Admin-Key'] = normalizedKey
+  return headers
+}
+
+const lifecycleIdempotencyKey = (): string =>
+  globalThis.crypto?.randomUUID?.() ??
+  `webui-${Date.now()}-${Math.random().toString(16).slice(2)}`
 
 export const createKnowledgeBase = async (request: {
   name: string
   isolation_level?: 'logical' | 'physical'
   storage_profile_id?: string | null
-}): Promise<KnowledgeBase> => {
-  const response = await axiosInstance.post('/knowledge-bases', request)
-  return response.data
+}, adminApiKey?: string): Promise<KnowledgeBase> => {
+  const response = await axiosInstance.post('/knowledge-bases', request, {
+    headers: {
+      ...managementHeaders(adminApiKey),
+      'Idempotency-Key': lifecycleIdempotencyKey(),
+      Prefer: 'wait=10'
+    }
+  })
+  const immediate = resolveKnowledgeBaseMutation(response.data)
+  if (immediate) return immediate
+  return waitForKnowledgeBaseOperation(response.data)
 }
 
 export const renameKnowledgeBase = async (
   knowledgeBaseId: string,
-  name: string
+  name: string,
+  adminApiKey?: string
 ): Promise<KnowledgeBase> => {
-  const response = await axiosInstance.patch(`/knowledge-bases/${knowledgeBaseId}`, { name })
+  const response = await axiosInstance.patch(
+    `/knowledge-bases/${knowledgeBaseId}`,
+    { name },
+    { headers: managementHeaders(adminApiKey) }
+  )
   return response.data
 }
 
-export const deleteKnowledgeBase = async (knowledgeBaseId: string): Promise<void> => {
-  await axiosInstance.delete(`/knowledge-bases/${knowledgeBaseId}`, {
-    params: { confirm: true }
+export const deleteKnowledgeBase = async (
+  knowledgeBaseId: string,
+  adminApiKey?: string
+): Promise<void> => {
+  const response = await axiosInstance.delete(`/knowledge-bases/${knowledgeBaseId}`, {
+    params: { confirm: true },
+    headers: {
+      ...managementHeaders(adminApiKey),
+      'Idempotency-Key': lifecycleIdempotencyKey(),
+      Prefer: 'wait=10'
+    }
   })
+  const immediate = resolveKnowledgeBaseMutation(response.data)
+  if (!immediate) await waitForKnowledgeBaseOperation(response.data)
 }
 
 export const insertText = async (text: string): Promise<DocActionResponse> => {

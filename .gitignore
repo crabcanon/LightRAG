@@ -24,6 +24,8 @@ storage-profiles.local.json
 docker-compose.*.yml
 !docker-compose.podman.yml
 !docker-compose.local-multikb.yml
+!docker-compose.multitenant-standalone.yml
+!docker-compose.multitenant-services.yml
 
 # Build / Distribution
 dist/

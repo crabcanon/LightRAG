@@ -1,0 +1,123 @@
+# Full LightRAG image plus PostgreSQL/pgvector, Neo4j, and Redis.
+# All app requests route through the knowledge-base manager; do not set any
+# process-wide *_WORKSPACE override in this deployment.
+name: ${COMPOSE_PROJECT_NAME:-lightrag-multitenant-services}
+
+services:
+  lightrag:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${LIGHTRAG_IMAGE:-lightrag-multitenant:services}
+    env_file:
+      - ${LIGHTRAG_ENV_FILE:-.env.multitenant-services}
+    environment:
+      HOST: 0.0.0.0
+      PORT: 9621
+      WORKING_DIR: /app/data/rag_storage
+      INPUT_DIR: /app/data/inputs
+      PROMPT_DIR: /app/data/prompts
+      LIGHTRAG_KNOWLEDGE_BASE_CATALOG: /app/data/rag_storage/knowledge_bases.json
+      LIGHTRAG_MULTI_WORKSPACE_MODE: multi
+      LIGHTRAG_ADMIN_API_KEY: ${LIGHTRAG_ADMIN_API_KEY:?Set LIGHTRAG_ADMIN_API_KEY in the env file}
+      LIGHTRAG_KNOWLEDGE_BASE_CATALOG_PROVIDER: local
+      LIGHTRAG_WORKSPACE_COORDINATOR_PROVIDER: local
+      LIGHTRAG_KV_STORAGE: RedisKVStorage
+      LIGHTRAG_VECTOR_STORAGE: PGVectorStorage
+      LIGHTRAG_GRAPH_STORAGE: Neo4JStorage
+      LIGHTRAG_DOC_STATUS_STORAGE: PGDocStatusStorage
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      NEO4J_URI: neo4j://neo4j:7687
+      REDIS_URI: redis://:${REDIS_PASSWORD}@redis:6379/0
+      # Dynamic knowledge bases require the instance workspace to reach every store.
+      POSTGRES_WORKSPACE: ""
+      NEO4J_WORKSPACE: ""
+      REDIS_WORKSPACE: ""
+    ports:
+      - "${LIGHTRAG_BIND_HOST:-127.0.0.1}:${LIGHTRAG_PORT:-9621}:9621"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lightrag_services_app_data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:9621/health', timeout=5).read()"
+      interval: 10s
+      timeout: 8s
+      retries: 30
+      start_period: 30s
+    init: true
+    restart: unless-stopped
+
+  postgres:
+    image: pgvector/pgvector:pg18
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env.multitenant-services}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.multitenant-services}
+      POSTGRES_DB: ${POSTGRES_DATABASE:?Set POSTGRES_DATABASE in .env.multitenant-services}
+    volumes:
+      - lightrag_services_postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+
+  neo4j:
+    image: neo4j:5.26-community
+    environment:
+      NEO4J_AUTH: ${NEO4J_USERNAME:?Set NEO4J_USERNAME in .env.multitenant-services}/${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in .env.multitenant-services}
+      NEO4J_dbms_default__database: ${NEO4J_DATABASE:?Set NEO4J_DATABASE in .env.multitenant-services}
+      NEO4J_USERNAME: ${NEO4J_USERNAME}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD}
+    volumes:
+      - lightrag_services_neo4j_data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          cypher-shell -u "$${NEO4J_USERNAME}" -p "$${NEO4J_PASSWORD}"
+          "RETURN 1" >/dev/null
+      interval: 10s
+      timeout: 8s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env.multitenant-services}
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env.multitenant-services}
+    volumes:
+      - lightrag_services_redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+volumes:
+  lightrag_services_app_data:
+  lightrag_services_postgres_data:
+  lightrag_services_neo4j_data:
+  lightrag_services_redis_data:

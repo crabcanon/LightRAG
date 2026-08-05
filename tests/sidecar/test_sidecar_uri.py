@@ -5,7 +5,9 @@ introduced when ``full_docs`` collapsed its four path fields to
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -72,6 +74,16 @@ def test_resolve_sidecar_uri_tolerates_missing_trailing_slash(tmp_path):
     sidecar_dir.mkdir()
     uri_no_slash = sidecar_uri_for(sidecar_dir).rstrip("/")
     assert resolve_sidecar_uri(uri_no_slash) == sidecar_dir.resolve()
+
+
+@pytest.mark.offline
+@pytest.mark.skipif(os.name != "nt", reason="legacy encoding was Windows-only")
+def test_resolve_sidecar_uri_accepts_legacy_windows_encoding(tmp_path):
+    sidecar_dir = tmp_path / "legacy path.parsed"
+    sidecar_dir.mkdir()
+    legacy_uri = f"file://{quote(str(sidecar_dir.resolve()), safe='/')}/"
+
+    assert resolve_sidecar_uri(legacy_uri) == sidecar_dir.resolve()
 
 
 @pytest.mark.offline

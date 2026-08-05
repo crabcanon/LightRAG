@@ -77,7 +77,7 @@ export default function KnowledgeBaseSelector() {
         disabled={loading || knowledgeBases.length === 0}
       >
         <SelectTrigger
-          className="h-7 w-40 text-xs"
+          className="h-7 w-64 text-xs"
           aria-label={t('knowledgeBases.selector', 'Knowledge base')}
         >
           <SelectValue placeholder={t('knowledgeBases.loading', 'Loading knowledge bases…')} />
@@ -85,7 +85,7 @@ export default function KnowledgeBaseSelector() {
         <SelectContent>
           {knowledgeBases.map((knowledgeBase) => (
             <SelectItem key={knowledgeBase.id} value={knowledgeBase.id}>
-              {knowledgeBase.name}
+              {knowledgeBase.name} ({knowledgeBase.id})
               {knowledgeBase.isolation_level === 'physical' ? ' · P' : ''}
             </SelectItem>
           ))}

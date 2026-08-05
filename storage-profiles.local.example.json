@@ -2,6 +2,12 @@
   "profiles": {
     "dedicated-project-a": {
       "dedicated": true,
+      "lifecycle": {
+        "resource_ownership": "operator",
+        "provisioning": "preprovisioned",
+        "deletion": "drop_workspace_namespaces",
+        "backup": "operator_managed"
+      },
       "working_dir": "/app/data/physical/project-a/rag_storage",
       "input_dir": "/app/data/physical/project-a/inputs",
       "postgres": {

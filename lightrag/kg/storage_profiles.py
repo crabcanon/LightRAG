@@ -27,6 +27,37 @@ class StorageIsolationCapability:
     workspace_environment_variable: str | None
 
 
+class StorageWorkspaceConsistencyError(ValueError):
+    """Raised when backend workspace overrides would split storage families."""
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceOverrideSource:
+    storage_family: str
+    implementation: str
+    source: str
+    value: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceOverrideAudit:
+    """Side-effect-free startup result for active workspace override sources."""
+
+    mode: str
+    resolved_workspace: str
+    overrides: tuple[WorkspaceOverrideSource, ...]
+    effective_workspaces: tuple[tuple[str, str], ...]
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "override_sources": [item.source for item in self.overrides],
+            "effective_workspace_families": [
+                family for family, _value in self.effective_workspaces
+            ],
+        }
+
+
 STORAGE_ISOLATION_CAPABILITIES: dict[str, StorageIsolationCapability] = {
     # File-backed implementations use the profile's dedicated working_dir.
     "JsonKVStorage": StorageIsolationCapability(None, None),
@@ -40,6 +71,7 @@ STORAGE_ISOLATION_CAPABILITIES: dict[str, StorageIsolationCapability] = {
     "PGKVStorage": StorageIsolationCapability("postgres", "POSTGRES_WORKSPACE"),
     "PGVectorStorage": StorageIsolationCapability("postgres", "POSTGRES_WORKSPACE"),
     "PGGraphStorage": StorageIsolationCapability("postgres", "POSTGRES_WORKSPACE"),
+    "PGTableGraphStorage": StorageIsolationCapability("postgres", "POSTGRES_WORKSPACE"),
     "PGDocStatusStorage": StorageIsolationCapability("postgres", "POSTGRES_WORKSPACE"),
     "Neo4JStorage": StorageIsolationCapability("neo4j", "NEO4J_WORKSPACE"),
     "MongoKVStorage": StorageIsolationCapability("mongo", "MONGODB_WORKSPACE"),
@@ -90,6 +122,58 @@ PROFILE_RESOURCE_FIELDS: dict[str, tuple[str, ...]] = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class PhysicalProfileLifecycle:
+    """Credential-free lifecycle contract for operator-owned resources.
+
+    LightRAG creates, migrates, and deletes only its workspace namespaces.
+    The database/service itself is provisioned, backed up, and retired by the
+    operator.  Keeping this contract explicit prevents a namespace ``drop``
+    from being mistaken for permission to destroy an entire endpoint.
+    """
+
+    resource_ownership: str = "operator"
+    provisioning: str = "preprovisioned"
+    deletion: str = "drop_workspace_namespaces"
+    backup: str = "operator_managed"
+
+    def public_dict(self) -> dict[str, str]:
+        return {
+            "resource_ownership": self.resource_ownership,
+            "provisioning": self.provisioning,
+            "deletion": self.deletion,
+            "backup": self.backup,
+        }
+
+
+_PHYSICAL_LIFECYCLE = PhysicalProfileLifecycle()
+
+
+def physical_profile_lifecycle(
+    profile_id: str, profile: Mapping[str, Any]
+) -> PhysicalProfileLifecycle:
+    """Validate and return the supported physical-resource lifecycle policy."""
+
+    configured = profile.get("lifecycle") or {}
+    if not isinstance(configured, Mapping):
+        raise ValueError(f"Storage profile {profile_id!r} lifecycle must be an object")
+    expected = _PHYSICAL_LIFECYCLE.public_dict()
+    unknown = sorted(set(configured) - set(expected))
+    if unknown:
+        raise ValueError(
+            f"Storage profile {profile_id!r} lifecycle has unknown fields: "
+            + ", ".join(unknown)
+        )
+    for field, expected_value in expected.items():
+        value = configured.get(field, expected_value)
+        if value != expected_value:
+            raise ValueError(
+                f"Storage profile {profile_id!r} lifecycle {field!r} must be "
+                f"{expected_value!r}"
+            )
+    return _PHYSICAL_LIFECYCLE
+
+
 def get_storage_profile_section(
     global_config: Mapping[str, Any], section: str
 ) -> Mapping[str, Any]:
@@ -111,6 +195,93 @@ def resolve_workspace_override(
         return None
     value = os.environ.get(environment_variable, "").strip()
     return value or None
+
+
+def audit_workspace_overrides(
+    *,
+    mode: str,
+    storage_implementations: Mapping[str, str],
+    server_workspace: str,
+    environment: Mapping[str, str] | None = None,
+    config_path: str | Path = "config.ini",
+) -> WorkspaceOverrideAudit:
+    """Resolve all active legacy override sources before storage construction.
+
+    In multi-workspace mode any active override is rejected.  Legacy mode keeps
+    the historic precedence only when every active storage family resolves to
+    the same logical workspace.  Values are retained only in the in-memory
+    result and are omitted from error messages and public diagnostics.
+    """
+
+    if mode not in {"legacy", "multi"}:
+        raise StorageWorkspaceConsistencyError(
+            f"Unsupported workspace mode for override audit: {mode!r}"
+        )
+    environ = os.environ if environment is None else environment
+    parser = configparser.ConfigParser()
+    parser.read(config_path, encoding="utf-8")
+    overrides: list[WorkspaceOverrideSource] = []
+    effective: list[tuple[str, str]] = []
+
+    for family, implementation in storage_implementations.items():
+        try:
+            capability = STORAGE_ISOLATION_CAPABILITIES[implementation]
+        except KeyError as exc:
+            raise StorageWorkspaceConsistencyError(
+                f"Storage implementation {implementation!r} has no isolation capability"
+            ) from exc
+
+        override: WorkspaceOverrideSource | None = None
+        variable = capability.workspace_environment_variable
+        if variable and variable in environ:
+            value = str(environ[variable]).strip()
+            if value:
+                override = WorkspaceOverrideSource(
+                    storage_family=family,
+                    implementation=implementation,
+                    source=variable,
+                    value=value,
+                )
+        elif variable == "POSTGRES_WORKSPACE":
+            value = parser.get("postgres", "workspace", fallback="").strip()
+            if value:
+                override = WorkspaceOverrideSource(
+                    storage_family=family,
+                    implementation=implementation,
+                    source="config.ini[postgres].workspace",
+                    value=value,
+                )
+
+        if override is not None:
+            overrides.append(override)
+            effective.append((family, override.value))
+        else:
+            effective.append((family, server_workspace))
+
+    if mode == "multi" and overrides:
+        sources = ", ".join(sorted({item.source for item in overrides}))
+        raise StorageWorkspaceConsistencyError(
+            "Multi-workspace mode forbids logical workspace overrides for "
+            f"active storage backends: {sources}"
+        )
+
+    distinct = {value for _family, value in effective}
+    if len(distinct) > 1:
+        details = ", ".join(
+            f"{family}={next((item.source for item in overrides if item.storage_family == family), 'server workspace')}"
+            for family, _value in effective
+        )
+        raise StorageWorkspaceConsistencyError(
+            "Active storage families resolve to different legacy workspaces: " + details
+        )
+
+    resolved_workspace = next(iter(distinct), server_workspace)
+    return WorkspaceOverrideAudit(
+        mode=mode,
+        resolved_workspace=resolved_workspace,
+        overrides=tuple(overrides),
+        effective_workspaces=tuple(effective),
+    )
 
 
 def required_profile_sections(
@@ -158,6 +329,7 @@ def validate_storage_profile(
 
     if profile.get("dedicated") is not True:
         raise ValueError(f"Storage profile {profile_id!r} must declare dedicated=true")
+    physical_profile_lifecycle(profile_id, profile)
     for section in required_sections:
         value = profile.get(section)
         if section in {"working_dir", "input_dir"}:
@@ -169,6 +341,11 @@ def validate_storage_profile(
         if not isinstance(value, Mapping):
             raise ValueError(
                 f"Storage profile {profile_id!r} section {section!r} must be an object"
+            )
+        if value.get("workspace") not in (None, ""):
+            raise ValueError(
+                f"Storage profile {profile_id!r} section {section!r} cannot "
+                "override logical workspace identity"
             )
         missing = [
             field
@@ -264,6 +441,18 @@ def profile_resource_fingerprints(
         serialized = json.dumps(identity, sort_keys=True, default=str).encode("utf-8")
         fingerprints[section] = hashlib.sha256(serialized).hexdigest()
     return fingerprints
+
+
+def profile_binding_fingerprint(
+    profile: Mapping[str, Any], required_sections: Sequence[str]
+) -> str:
+    """Return one stable digest for the complete non-secret resource binding."""
+
+    fingerprints = profile_resource_fingerprints(profile, required_sections)
+    serialized = json.dumps(fingerprints, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(serialized).hexdigest()
 
 
 def build_default_resource_profile(

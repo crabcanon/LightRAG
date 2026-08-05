@@ -8,6 +8,7 @@ __all__ = [
     "RoleLLMConfig",
     "RoleSpec",
     "ROLES",
+    "WorkspaceBinding",
     "__version__",
 ]
 
@@ -19,12 +20,25 @@ if TYPE_CHECKING:
         RoleLLMConfig as RoleLLMConfig,
         RoleSpec as RoleSpec,
     )
+    from .workspace import WorkspaceBinding as WorkspaceBinding
 
 
-_LAZY_EXPORTS = {"LightRAG", "QueryParam", "RoleLLMConfig", "RoleSpec", "ROLES"}
+_LAZY_EXPORTS = {
+    "LightRAG",
+    "QueryParam",
+    "RoleLLMConfig",
+    "RoleSpec",
+    "ROLES",
+    "WorkspaceBinding",
+}
 
 
 def __getattr__(name: str) -> Any:
+    if name == "WorkspaceBinding":
+        from .workspace import WorkspaceBinding
+
+        globals()[name] = WorkspaceBinding
+        return WorkspaceBinding
     if name in _LAZY_EXPORTS:
         from .lightrag import LightRAG, QueryParam, RoleLLMConfig, RoleSpec, ROLES
 

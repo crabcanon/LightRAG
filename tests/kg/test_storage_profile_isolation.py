@@ -11,10 +11,13 @@ from lightrag.kg.storage_profiles import (
     STORAGE_ISOLATION_CAPABILITIES,
     build_default_resource_profile,
     forced_workspace_variables,
+    physical_profile_lifecycle,
+    profile_binding_fingerprint,
     profile_resource_fingerprints,
     required_profile_sections,
     validate_storage_profile,
 )
+from lightrag.utils import check_storage_env_vars
 
 
 pytestmark = pytest.mark.offline
@@ -31,7 +34,7 @@ def _selectable_implementations() -> set[str]:
 def test_every_selectable_backend_has_an_isolation_capability() -> None:
     selectable = _selectable_implementations()
 
-    assert len(selectable) == 23
+    assert len(selectable) == 24
     assert set(STORAGE_ISOLATION_CAPABILITIES) == selectable
 
 
@@ -48,6 +51,7 @@ def test_every_selectable_backend_has_an_isolation_capability() -> None:
         ("PGKVStorage", "postgres", "POSTGRES_WORKSPACE"),
         ("PGVectorStorage", "postgres", "POSTGRES_WORKSPACE"),
         ("PGGraphStorage", "postgres", "POSTGRES_WORKSPACE"),
+        ("PGTableGraphStorage", "postgres", "POSTGRES_WORKSPACE"),
         ("PGDocStatusStorage", "postgres", "POSTGRES_WORKSPACE"),
         ("Neo4JStorage", "neo4j", "NEO4J_WORKSPACE"),
         ("MongoKVStorage", "mongo", "MONGODB_WORKSPACE"),
@@ -165,6 +169,80 @@ def test_each_external_backend_accepts_a_complete_physical_section(
     )
 
 
+@pytest.mark.parametrize(
+    ("implementation", "section", "config"),
+    [
+        (
+            "PGKVStorage",
+            "postgres",
+            {
+                "host": "pg-a",
+                "port": 5432,
+                "user": "rag",
+                "password": "secret",
+                "database": "rag",
+            },
+        ),
+        (
+            "Neo4JStorage",
+            "neo4j",
+            {
+                "uri": "bolt://neo4j-a:7687",
+                "username": "neo4j",
+                "password": "secret",
+                "database": "neo4j",
+            },
+        ),
+        ("RedisKVStorage", "redis", {"uri": "redis://redis-a:6379/0"}),
+        (
+            "MongoKVStorage",
+            "mongo",
+            {"uri": "mongodb://mongo-a:27017", "database": "rag"},
+        ),
+        (
+            "MilvusVectorDBStorage",
+            "milvus",
+            {"uri": "http://milvus-a:19530", "db_name": "default"},
+        ),
+        (
+            "QdrantVectorDBStorage",
+            "qdrant",
+            {"url": "http://qdrant-a:6333", "collection_prefix": "rag_a"},
+        ),
+        (
+            "MemgraphStorage",
+            "memgraph",
+            {"uri": "bolt://memgraph-a:7687", "database": "memgraph"},
+        ),
+        (
+            "OpenSearchKVStorage",
+            "opensearch",
+            {"hosts": "search-a:9200", "index_prefix": "rag_a"},
+        ),
+    ],
+)
+def test_complete_physical_section_replaces_process_environment_requirements(
+    monkeypatch: pytest.MonkeyPatch,
+    implementation: str,
+    section: str,
+    config: dict,
+) -> None:
+    from lightrag.kg import STORAGE_ENV_REQUIREMENTS
+
+    for variable in STORAGE_ENV_REQUIREMENTS.get(implementation, ()):
+        monkeypatch.delenv(variable, raising=False)
+
+    check_storage_env_vars(implementation, {section: config})
+
+
+def test_incomplete_physical_section_fails_before_environment_fallback() -> None:
+    with pytest.raises(ValueError, match="collection_prefix"):
+        check_storage_env_vars(
+            "QdrantVectorDBStorage",
+            {"qdrant": {"url": "http://qdrant-a:6333"}},
+        )
+
+
 def test_resource_fingerprint_ignores_credentials_but_detects_resource_changes(
     tmp_path: Path,
 ) -> None:
@@ -198,6 +276,35 @@ def test_resource_fingerprint_ignores_credentials_but_detects_resource_changes(
         profile_resource_fingerprints(changed_database, required)["mongo"]
         != first["mongo"]
     )
+    assert profile_binding_fingerprint(base, required) == profile_binding_fingerprint(
+        changed_credentials, required
+    )
+    assert profile_binding_fingerprint(base, required) != profile_binding_fingerprint(
+        changed_database, required
+    )
+
+
+def test_physical_lifecycle_is_explicit_and_rejects_destructive_escalation() -> None:
+    expected = {
+        "resource_ownership": "operator",
+        "provisioning": "preprovisioned",
+        "deletion": "drop_workspace_namespaces",
+        "backup": "operator_managed",
+    }
+
+    assert physical_profile_lifecycle("profile-a", {}).public_dict() == expected
+    assert (
+        physical_profile_lifecycle("profile-a", {"lifecycle": expected}).public_dict()
+        == expected
+    )
+    with pytest.raises(ValueError, match="deletion"):
+        physical_profile_lifecycle(
+            "profile-a", {"lifecycle": {"deletion": "drop_database"}}
+        )
+    with pytest.raises(ValueError, match="unknown fields"):
+        physical_profile_lifecycle(
+            "profile-a", {"lifecycle": {"delete_endpoint": True}}
+        )
 
 
 def test_malformed_uri_has_a_stable_resource_fingerprint(tmp_path: Path) -> None:

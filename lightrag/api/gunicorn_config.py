@@ -1,6 +1,8 @@
 # gunicorn_config.py
 import os
 import logging
+import sys
+import traceback
 from lightrag.kg.shared_storage import finalize_share_data
 from lightrag.utils import setup_logger, get_env_value
 from lightrag.constants import (
@@ -143,21 +145,31 @@ def post_fork(server, worker):
     Executed after a worker has been forked.
     This is a good place to set up worker-specific configurations.
     """
-    # Set up main loggers
-    log_level = loglevel.upper() if loglevel else "INFO"
-    setup_logger("uvicorn", log_level, add_filter=False, log_file_path=log_file_path)
-    setup_logger(
-        "uvicorn.access", log_level, add_filter=True, log_file_path=log_file_path
-    )
-    setup_logger("lightrag", log_level, add_filter=True, log_file_path=log_file_path)
+    try:
+        # Set up main loggers
+        log_level = loglevel.upper() if loglevel else "INFO"
+        setup_logger(
+            "uvicorn", log_level, add_filter=False, log_file_path=log_file_path
+        )
+        setup_logger(
+            "uvicorn.error", log_level, add_filter=False, log_file_path=log_file_path
+        )
+        setup_logger(
+            "uvicorn.access", log_level, add_filter=True, log_file_path=log_file_path
+        )
+        setup_logger(
+            "lightrag", log_level, add_filter=True, log_file_path=log_file_path
+        )
 
-    # Set up lightrag submodule loggers
-    for name in logging.root.manager.loggerDict:
-        if name.startswith("lightrag."):
-            setup_logger(name, log_level, add_filter=True, log_file_path=log_file_path)
-
-    # Disable uvicorn.error logger
-    uvicorn_error_logger = logging.getLogger("uvicorn.error")
-    uvicorn_error_logger.handlers = []
-    uvicorn_error_logger.setLevel(logging.CRITICAL)
-    uvicorn_error_logger.propagate = False
+        # Snapshot the registry because resolving a PlaceHolder while setting up
+        # a logger may mutate loggerDict during iteration.
+        for name in list(logging.root.manager.loggerDict):
+            if name.startswith("lightrag."):
+                setup_logger(
+                    name, log_level, add_filter=True, log_file_path=log_file_path
+                )
+    except Exception:
+        print("LightRAG Gunicorn post_fork initialization failed", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+        raise

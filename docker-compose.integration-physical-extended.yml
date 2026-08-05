@@ -1,0 +1,253 @@
+# Ephemeral backend pairs for strict physical-profile integration gates.
+# Start one backend at a time, for example:
+#   docker compose -f docker-compose.integration-physical-extended.yml \
+#     --profile qdrant up -d --wait
+#   LIGHTRAG_EXTENDED_PHYSICAL_IT=qdrant ./scripts/test.sh \
+#     tests/workspace/test_physical_services_multitenant_integration.py \
+#     --run-integration -k extended
+#   docker compose -f docker-compose.integration-physical-extended.yml \
+#     --profile qdrant down -v
+name: lightrag-multikb-extended-it
+
+x-port-health: &port-health
+  interval: 5s
+  timeout: 3s
+  retries: 40
+  start_period: 10s
+
+services:
+  qdrant-a:
+    profiles: [qdrant]
+    image: qdrant/qdrant:v1.15.5
+    ports: ["127.0.0.1:56333:6333"]
+    volumes: [qdrant_a_data:/qdrant/storage]
+    healthcheck:
+      <<: *port-health
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/6333'"]
+
+  qdrant-b:
+    profiles: [qdrant]
+    image: qdrant/qdrant:v1.15.5
+    ports: ["127.0.0.1:56334:6333"]
+    volumes: [qdrant_b_data:/qdrant/storage]
+    healthcheck:
+      <<: *port-health
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/6333'"]
+
+  memgraph-a:
+    profiles: [memgraph]
+    image: memgraph/memgraph:latest
+    ports: ["127.0.0.1:57689:7687"]
+    volumes: [memgraph_a_data:/var/lib/memgraph]
+    healthcheck:
+      <<: *port-health
+      test:
+        - CMD-SHELL
+        - >-
+          PORT_HEX="$$(printf '%04X' 7687)";
+          grep -q ":$${PORT_HEX} " /proc/net/tcp /proc/net/tcp6
+
+  memgraph-b:
+    profiles: [memgraph]
+    image: memgraph/memgraph:latest
+    ports: ["127.0.0.1:57690:7687"]
+    volumes: [memgraph_b_data:/var/lib/memgraph]
+    healthcheck:
+      <<: *port-health
+      test:
+        - CMD-SHELL
+        - >-
+          PORT_HEX="$$(printf '%04X' 7687)";
+          grep -q ":$${PORT_HEX} " /proc/net/tcp /proc/net/tcp6
+
+  mongo-a:
+    profiles: [mongo]
+    image: mongodb/mongodb-atlas-local:8.0
+    ports: ["127.0.0.1:57017:27017"]
+    volumes:
+      - mongo_a_data:/data/db
+      - mongo_a_config:/data/configdb
+      - mongo_a_mongot:/data/mongot
+    healthcheck:
+      <<: *port-health
+      start_period: 60s
+      test:
+        - CMD-SHELL
+        - 'mongosh --quiet --eval "quit(db.adminCommand({ping:1}).ok ? 0 : 1)"'
+
+  mongo-b:
+    profiles: [mongo]
+    image: mongodb/mongodb-atlas-local:8.0
+    ports: ["127.0.0.1:57018:27017"]
+    volumes:
+      - mongo_b_data:/data/db
+      - mongo_b_config:/data/configdb
+      - mongo_b_mongot:/data/mongot
+    healthcheck:
+      <<: *port-health
+      start_period: 60s
+      test:
+        - CMD-SHELL
+        - 'mongosh --quiet --eval "quit(db.adminCommand({ping:1}).ok ? 0 : 1)"'
+
+  opensearch-a:
+    profiles: [opensearch]
+    image: opensearchproject/opensearch:3.3.2
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+    ports: ["127.0.0.1:59200:9200"]
+    volumes: [opensearch_a_data:/usr/share/opensearch/data]
+    ulimits:
+      memlock: {soft: -1, hard: -1}
+      nofile: {soft: 65536, hard: 65536}
+    healthcheck:
+      <<: *port-health
+      start_period: 45s
+      timeout: 5s
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9200/_cluster/health >/dev/null"]
+
+  opensearch-b:
+    profiles: [opensearch]
+    image: opensearchproject/opensearch:3.3.2
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+    ports: ["127.0.0.1:59201:9200"]
+    volumes: [opensearch_b_data:/usr/share/opensearch/data]
+    ulimits:
+      memlock: {soft: -1, hard: -1}
+      nofile: {soft: 65536, hard: 65536}
+    healthcheck:
+      <<: *port-health
+      start_period: 45s
+      timeout: 5s
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9200/_cluster/health >/dev/null"]
+
+  milvus-a:
+    profiles: [milvus]
+    image: milvusdb/milvus:v2.6.11
+    command: [milvus, run, standalone]
+    security_opt: [seccomp:unconfined]
+    environment:
+      ETCD_ENDPOINTS: milvus-etcd-a:2379
+      MINIO_ADDRESS: milvus-minio-a:9000
+      MINIO_ACCESS_KEY_ID: minioadmin
+      MINIO_SECRET_ACCESS_KEY: minioadmin
+    ports:
+      - "127.0.0.1:59530:19530"
+      - "127.0.0.1:59091:9091"
+    volumes: [milvus_a_data:/var/lib/milvus]
+    depends_on:
+      milvus-etcd-a: {condition: service_healthy}
+      milvus-minio-a: {condition: service_healthy}
+    healthcheck:
+      <<: *port-health
+      start_period: 30s
+      test:
+        - CMD-SHELL
+        - >-
+          PORT_HEX="$$(printf '%04X' 19530)";
+          grep -q ":$${PORT_HEX} " /proc/net/tcp /proc/net/tcp6
+
+  milvus-b:
+    profiles: [milvus]
+    image: milvusdb/milvus:v2.6.11
+    command: [milvus, run, standalone]
+    security_opt: [seccomp:unconfined]
+    environment:
+      ETCD_ENDPOINTS: milvus-etcd-b:2379
+      MINIO_ADDRESS: milvus-minio-b:9000
+      MINIO_ACCESS_KEY_ID: minioadmin
+      MINIO_SECRET_ACCESS_KEY: minioadmin
+    ports:
+      - "127.0.0.1:59531:19530"
+      - "127.0.0.1:59092:9091"
+    volumes: [milvus_b_data:/var/lib/milvus]
+    depends_on:
+      milvus-etcd-b: {condition: service_healthy}
+      milvus-minio-b: {condition: service_healthy}
+    healthcheck:
+      <<: *port-health
+      start_period: 30s
+      test:
+        - CMD-SHELL
+        - >-
+          PORT_HEX="$$(printf '%04X' 19530)";
+          grep -q ":$${PORT_HEX} " /proc/net/tcp /proc/net/tcp6
+
+  milvus-etcd-a:
+    profiles: [milvus]
+    image: quay.io/coreos/etcd:v3.5.25
+    command: >-
+      etcd -advertise-client-urls=http://0.0.0.0:2379
+      -listen-client-urls=http://0.0.0.0:2379 -data-dir /etcd
+    volumes: [milvus_etcd_a_data:/etcd]
+    healthcheck:
+      test: [CMD, etcdctl, endpoint, health]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  milvus-etcd-b:
+    profiles: [milvus]
+    image: quay.io/coreos/etcd:v3.5.25
+    command: >-
+      etcd -advertise-client-urls=http://0.0.0.0:2379
+      -listen-client-urls=http://0.0.0.0:2379 -data-dir /etcd
+    volumes: [milvus_etcd_b_data:/etcd]
+    healthcheck:
+      test: [CMD, etcdctl, endpoint, health]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  milvus-minio-a:
+    profiles: [milvus]
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: minio server /data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes: [milvus_minio_a_data:/data]
+    healthcheck:
+      test: [CMD, curl, -f, http://127.0.0.1:9000/minio/health/live]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  milvus-minio-b:
+    profiles: [milvus]
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: minio server /data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes: [milvus_minio_b_data:/data]
+    healthcheck:
+      test: [CMD, curl, -f, http://127.0.0.1:9000/minio/health/live]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  qdrant_a_data:
+  qdrant_b_data:
+  memgraph_a_data:
+  memgraph_b_data:
+  mongo_a_data:
+  mongo_a_config:
+  mongo_a_mongot:
+  mongo_b_data:
+  mongo_b_config:
+  mongo_b_mongot:
+  opensearch_a_data:
+  opensearch_b_data:
+  milvus_a_data:
+  milvus_b_data:
+  milvus_etcd_a_data:
+  milvus_etcd_b_data:
+  milvus_minio_a_data:
+  milvus_minio_b_data:
