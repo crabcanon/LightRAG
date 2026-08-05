@@ -17,6 +17,7 @@ from lightrag.kg.storage_profiles import (
     required_profile_sections,
     validate_storage_profile,
 )
+from lightrag.utils import check_storage_env_vars
 
 
 pytestmark = pytest.mark.offline
@@ -165,6 +166,80 @@ def test_each_external_backend_accepts_a_complete_physical_section(
         profile,
         required_profile_sections((implementation,)),
     )
+
+
+@pytest.mark.parametrize(
+    ("implementation", "section", "config"),
+    [
+        (
+            "PGKVStorage",
+            "postgres",
+            {
+                "host": "pg-a",
+                "port": 5432,
+                "user": "rag",
+                "password": "secret",
+                "database": "rag",
+            },
+        ),
+        (
+            "Neo4JStorage",
+            "neo4j",
+            {
+                "uri": "bolt://neo4j-a:7687",
+                "username": "neo4j",
+                "password": "secret",
+                "database": "neo4j",
+            },
+        ),
+        ("RedisKVStorage", "redis", {"uri": "redis://redis-a:6379/0"}),
+        (
+            "MongoKVStorage",
+            "mongo",
+            {"uri": "mongodb://mongo-a:27017", "database": "rag"},
+        ),
+        (
+            "MilvusVectorDBStorage",
+            "milvus",
+            {"uri": "http://milvus-a:19530", "db_name": "default"},
+        ),
+        (
+            "QdrantVectorDBStorage",
+            "qdrant",
+            {"url": "http://qdrant-a:6333", "collection_prefix": "rag_a"},
+        ),
+        (
+            "MemgraphStorage",
+            "memgraph",
+            {"uri": "bolt://memgraph-a:7687", "database": "memgraph"},
+        ),
+        (
+            "OpenSearchKVStorage",
+            "opensearch",
+            {"hosts": "search-a:9200", "index_prefix": "rag_a"},
+        ),
+    ],
+)
+def test_complete_physical_section_replaces_process_environment_requirements(
+    monkeypatch: pytest.MonkeyPatch,
+    implementation: str,
+    section: str,
+    config: dict,
+) -> None:
+    from lightrag.kg import STORAGE_ENV_REQUIREMENTS
+
+    for variable in STORAGE_ENV_REQUIREMENTS.get(implementation, ()):
+        monkeypatch.delenv(variable, raising=False)
+
+    check_storage_env_vars(implementation, {section: config})
+
+
+def test_incomplete_physical_section_fails_before_environment_fallback() -> None:
+    with pytest.raises(ValueError, match="collection_prefix"):
+        check_storage_env_vars(
+            "QdrantVectorDBStorage",
+            {"qdrant": {"url": "http://qdrant-a:6333"}},
+        )
 
 
 def test_resource_fingerprint_ignores_credentials_but_detects_resource_changes(
