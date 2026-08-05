@@ -17,7 +17,8 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, cast
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import unquote, urlsplit
+from urllib.request import url2pathname
 
 from lightrag.base import (
     DocProcessingStatus,
@@ -1196,8 +1197,8 @@ def sidecar_uri_for(parsed_artifact_dir: Path | str) -> str:
     from a file at the URI level. Non-ASCII characters are percent-encoded.
     """
     p = Path(parsed_artifact_dir).resolve()
-    encoded = quote(str(p), safe="/")
-    return f"file://{encoded}/"
+    uri = p.as_uri()
+    return uri if uri.endswith("/") else f"{uri}/"
 
 
 def resolve_sidecar_uri(uri: str | None) -> Path | None:
@@ -1212,9 +1213,15 @@ def resolve_sidecar_uri(uri: str | None) -> Path | None:
     if parts.scheme != "file":
         return None
     path_str = unquote(parts.path)
-    if path_str.endswith("/") and len(path_str) > 1:
-        path_str = path_str[:-1]
-    return Path(path_str)
+    if parts.netloc:
+        decoded_netloc = unquote(parts.netloc)
+        if re.match(r"^[A-Za-z]:[\\/]", decoded_netloc):
+            # Backward compatibility for Windows URIs emitted before
+            # ``sidecar_uri_for`` switched to pathlib's RFC-compliant as_uri().
+            path_str = f"{decoded_netloc}{path_str}"
+        else:
+            path_str = f"//{decoded_netloc}{path_str}"
+    return Path(url2pathname(path_str))
 
 
 def sidecar_blocks_path(uri: str | None) -> str | None:

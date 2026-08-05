@@ -34,7 +34,7 @@ def _selectable_implementations() -> set[str]:
 def test_every_selectable_backend_has_an_isolation_capability() -> None:
     selectable = _selectable_implementations()
 
-    assert len(selectable) == 23
+    assert len(selectable) == 24
     assert set(STORAGE_ISOLATION_CAPABILITIES) == selectable
 
 
@@ -51,6 +51,7 @@ def test_every_selectable_backend_has_an_isolation_capability() -> None:
         ("PGKVStorage", "postgres", "POSTGRES_WORKSPACE"),
         ("PGVectorStorage", "postgres", "POSTGRES_WORKSPACE"),
         ("PGGraphStorage", "postgres", "POSTGRES_WORKSPACE"),
+        ("PGTableGraphStorage", "postgres", "POSTGRES_WORKSPACE"),
         ("PGDocStatusStorage", "postgres", "POSTGRES_WORKSPACE"),
         ("Neo4JStorage", "neo4j", "NEO4J_WORKSPACE"),
         ("MongoKVStorage", "mongo", "MONGODB_WORKSPACE"),

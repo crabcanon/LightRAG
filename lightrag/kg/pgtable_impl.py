@@ -526,7 +526,8 @@ class PGTableGraphStorage(BaseGraphStorage):
                 # demands pgvector and this backend stays installable on stock
                 # PostgreSQL without passing a sentinel backend name.
                 self.db = await ClientManager.get_client(
-                    vector_storage=self.global_config.get("vector_storage")
+                    vector_storage=self.global_config.get("vector_storage"),
+                    storage_profile=self.global_config.get("storage_profile"),
                 )
                 # Workspace priority: POSTGRES_WORKSPACE env > self.workspace > "default"
                 if self.db.workspace:

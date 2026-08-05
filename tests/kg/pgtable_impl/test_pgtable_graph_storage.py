@@ -52,7 +52,7 @@ def test_constructor_validates_workspace_like_other_backends():
 
 
 @pytest.mark.parametrize(
-    ("global_config", "expected_vector_storage"),
+    ("global_config", "expected_vector_storage", "expected_storage_profile"),
     [
         # Forwarded verbatim in every case, exactly like the sibling PG storages,
         # so the process-wide pool signature can never diverge. An unspecified
@@ -61,15 +61,29 @@ def test_constructor_validates_workspace_like_other_backends():
         # sentinel name to stay installable on stock PostgreSQL. Bare configs are
         # real — tests/kg/test_graph_storage.py, the cross-backend contract suite,
         # is one, and CI runs it against a plain postgres image.
-        ({}, None),
-        ({"vector_storage": None}, None),
-        ({"vector_storage": "NanoVectorDBStorage"}, "NanoVectorDBStorage"),
-        ({"vector_storage": "PGVectorStorage"}, "PGVectorStorage"),
+        ({}, None, None),
+        ({"vector_storage": None}, None, None),
+        ({"vector_storage": "NanoVectorDBStorage"}, "NanoVectorDBStorage", None),
+        ({"vector_storage": "PGVectorStorage"}, "PGVectorStorage", None),
+        (
+            {
+                "vector_storage": "NanoVectorDBStorage",
+                "storage_profile": {
+                    "id": "kb-profile",
+                    "postgres": {"database": "kb_database"},
+                },
+            },
+            "NanoVectorDBStorage",
+            {
+                "id": "kb-profile",
+                "postgres": {"database": "kb_database"},
+            },
+        ),
     ],
 )
 @pytest.mark.asyncio
 async def test_initialize_forwards_configured_vector_storage_verbatim(
-    global_config, expected_vector_storage
+    global_config, expected_vector_storage, expected_storage_profile
 ):
     storage = make_uninitialized_storage(global_config=global_config)
     db = MagicMock()
@@ -89,7 +103,10 @@ async def test_initialize_forwards_configured_vector_storage_verbatim(
     ):
         await storage.initialize()
 
-    get_client.assert_awaited_once_with(vector_storage=expected_vector_storage)
+    get_client.assert_awaited_once_with(
+        vector_storage=expected_vector_storage,
+        storage_profile=expected_storage_profile,
+    )
 
 
 # ---------------------------------------------------------------------------

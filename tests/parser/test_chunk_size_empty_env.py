@@ -110,6 +110,9 @@ def test_empty_chunk_size_env_does_not_crash_lightrag_init(
     monkeypatch.setattr(
         "lightrag.lightrag.get_storage_class", lambda *a, **k: DummyStorage
     )
+    monkeypatch.setattr(
+        "lightrag.lightrag.LightRAG.validate_storage_bindings", lambda *a, **k: ()
+    )
 
     async def emb(texts: list[str]) -> np.ndarray:
         return np.zeros((len(texts), 8))

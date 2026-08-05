@@ -71,6 +71,7 @@ STORAGE_ISOLATION_CAPABILITIES: dict[str, StorageIsolationCapability] = {
     "PGKVStorage": StorageIsolationCapability("postgres", "POSTGRES_WORKSPACE"),
     "PGVectorStorage": StorageIsolationCapability("postgres", "POSTGRES_WORKSPACE"),
     "PGGraphStorage": StorageIsolationCapability("postgres", "POSTGRES_WORKSPACE"),
+    "PGTableGraphStorage": StorageIsolationCapability("postgres", "POSTGRES_WORKSPACE"),
     "PGDocStatusStorage": StorageIsolationCapability("postgres", "POSTGRES_WORKSPACE"),
     "Neo4JStorage": StorageIsolationCapability("neo4j", "NEO4J_WORKSPACE"),
     "MongoKVStorage": StorageIsolationCapability("mongo", "MONGODB_WORKSPACE"),

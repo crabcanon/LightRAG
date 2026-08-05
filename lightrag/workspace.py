@@ -285,6 +285,7 @@ LEGACY_EMPTY_WORKSPACE_ALIASES: dict[str, frozenset[str]] = {
     "PGKVStorage": frozenset({"", "default"}),
     "PGVectorStorage": frozenset({"", "default"}),
     "PGGraphStorage": frozenset({"", "default"}),
+    "PGTableGraphStorage": frozenset({"", "default"}),
     "PGDocStatusStorage": frozenset({"", "default"}),
     "MongoKVStorage": frozenset({""}),
     "MongoDocStatusStorage": frozenset({""}),
