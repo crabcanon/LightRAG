@@ -1648,3 +1648,9 @@ Prompt 依据：OpenAI 官方 [GPT-5.6 model guidance](https://developers.openai
 - 后端与 API 回归：核心 `kg/pipeline/extraction/chunker/llm/parser` 在离线 tiktoken 缓存下为 `4405 passed, 235 skipped, 5 deselected`；5 个 deselect 仅因 Windows 主机缺少 Cairo 原生 DLL，最终 Linux 镜像内实际 SVG→PNG 转换返回 `svg-rasterization-ok`。API 绿色门禁为 `800 passed, 15 skipped, 3 deselected`；3 个 deselect 是 Windows 无法执行的 Gunicorn/POSIX 路径与权限语义节点。
 - 前端与容器：WebUI 全量 `103 passed, 0 failed`，ESLint 通过，Vite production build 成功。最终源码镜像 `lightrag-sync-final` 增量构建成功（71 秒），容器 UID 为 `1000`，PGTable profile 注册与 SVG 实际转换均通过。Docker Hub `EOF` 与 Debian mirror `502` 的早期重试属于外部网络事件，最终构建无失败。
 - 平台边界与安全：`tests/setup` 依赖 Bash、Unix executable bit 和 macOS/Homebrew 路径，不能在原生 Windows 作为有效门禁；其失败不作为业务断言通过。未运行需要新数据迁移的操作，未修改或暂存 `.codex/`，所有测试目录与离线缓存仅作为本轮临时产物，提交前清理。
+
+### 2026-08-05T19:11:50+08:00 — 推送前二次 upstream 漂移检查
+
+- 推送前重新 fetch 时发现 `upstream/main` 从 `29c089ff` 推进到 `0a48ece6`，新增 rerank 结果边界校验；因此暂停推送，将最新上游再次合并为 `main@18163e19`，再合并为 `dev@1bf68fc0`，两次均无冲突。
+- 最新差异仅涉及 `lightrag/rerank.py`、`lightrag/utils.py` 与新增 rerank 测试；完整 LLM/rerank 加本轮 PGTable、sidecar、workspace binding 聚焦回归为 `485 passed`，相关 ruff format/check 全部通过。
+- 最终推送前仍需再次确认 `upstream/main`、`origin/main` 与 `origin/dev` 未推进；若再次漂移，继续按 main → dev → main 顺序集成，不使用 force push。
