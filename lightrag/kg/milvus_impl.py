@@ -181,6 +181,17 @@ def _get_env_int(key: str, default: int) -> int:
     return default
 
 
+def _escape_milvus_str(val: str) -> str:
+    """Escape a value embedded in a double-quoted Milvus filter literal."""
+    return (
+        val.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
+
+
 @dataclass
 class MilvusIndexConfig:
     """
@@ -2657,7 +2668,8 @@ class MilvusVectorDBStorage(BaseVectorStorage):
 
             self._ensure_collection_loaded()
 
-            expr = f'src_id == "{entity_name}" or tgt_id == "{entity_name}"'
+            safe_name = _escape_milvus_str(entity_name)
+            expr = f'src_id == "{safe_name}" or tgt_id == "{safe_name}"'
             results = self._client.query(
                 collection_name=self.final_namespace,
                 filter=expr,
@@ -2717,7 +2729,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
 
             result = self._client.query(
                 collection_name=self.final_namespace,
-                filter=f'id == "{id}"',
+                filter=f'id == "{_escape_milvus_str(id)}"',
                 output_fields=output_fields,
             )
 
@@ -2760,7 +2772,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 # Include all meta_fields (created_at is now always included) plus id
                 output_fields = list(self.meta_fields) + ["id"]
 
-                id_list = '", "'.join(remaining)
+                id_list = '", "'.join(_escape_milvus_str(i) for i in remaining)
                 filter_expr = f'id in ["{id_list}"]'
 
                 result = self._client.query(
@@ -2853,7 +2865,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         try:
             self._ensure_collection_loaded()
 
-            id_list = '", "'.join(remaining)
+            id_list = '", "'.join(_escape_milvus_str(i) for i in remaining)
             filter_expr = f'id in ["{id_list}"]'
 
             rows = self._client.query(
