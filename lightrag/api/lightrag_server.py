@@ -58,6 +58,7 @@ from lightrag.api.routers.document_routes import (
     DocumentManager,
     create_document_routes,
 )
+from lightrag.parser.docx.smart_heading.nlp import SmartHeadingNLPError
 from lightrag.parser.plugins import load_third_party_parsers
 from lightrag.parser.routing import (
     parser_rules_from_env,
@@ -1308,7 +1309,27 @@ def create_app(args):
     # smart_heading but the pinned spaCy models are missing — surfacing the
     # install step at startup instead of failing mid-pipeline. Runs in
     # create_app so both the uvicorn and gunicorn (preload) paths hit it.
-    validate_smart_heading_dependencies()
+    # Caught here (instead of letting it propagate as a raw traceback) so the
+    # missing-dependency message reads like the other boxed startup notices.
+    try:
+        validate_smart_heading_dependencies()
+    except SmartHeadingNLPError as exc:
+        # markup=False: ASCIIColors interprets "[...]" as rich markup tags and
+        # silently drops anything it doesn't recognize (e.g. "[api]").
+        ASCIIColors.red("\n" + "=" * 80, markup=False)
+        ASCIIColors.red("ERROR: smart_heading dependencies missing", markup=False)
+        ASCIIColors.red("=" * 80, markup=False)
+        ASCIIColors.red(exc.problem, markup=False)
+        ASCIIColors.red("\nInstall with:", markup=False)
+        ASCIIColors.cyan(
+            "    pip install lightrag-hku[api] && lightrag-download-cache --spacy --spacy-install",
+            markup=False,
+        )
+        ASCIIColors.red(
+            "(offline: see requirements-offline-smart-heading.txt)", markup=False
+        )
+        ASCIIColors.red("=" * 80 + "\n", markup=False)
+        sys.exit(1)
 
     # Create configuration cache (this will output configuration logs)
     config_cache = LLMConfigCache(args)
@@ -2304,6 +2325,9 @@ def create_app(args):
                 summary_context_size=args.summary_context_size,
                 chunk_token_size=int(args.chunk_size),
                 chunk_overlap_token_size=int(args.chunk_overlap_size),
+                embedding_chunk_overlap_token_size=int(
+                    args.embedding_chunk_overlap_token_size
+                ),
                 llm_model_kwargs=create_llm_model_kwargs(
                     args.llm_binding, args, llm_timeout
                 ),

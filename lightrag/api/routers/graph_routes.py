@@ -63,7 +63,7 @@ class EntityMergeRequest(BaseModel):
     )
     entity_to_change_into: str = Field(
         ...,
-        description="Target entity name that will receive all relationships from the source entities. This entity will be preserved.",
+        description="Target entity name that will receive all relationships from the source entities. An existing entity is preserved and merged; a missing target is created.",
         min_length=1,
         examples=["Elon Musk"],
     )
@@ -566,10 +566,11 @@ def create_graph_routes(rag, api_key: Optional[str] = None, context_dependency=N
                 entity_name=request.entity_name,
                 entity_data=request.entity_data,
             )
+            created_entity_name = result.get("entity_name", request.entity_name)
 
             return {
                 "status": "success",
-                "message": f"Entity '{request.entity_name}' created successfully",
+                "message": f"Entity '{created_entity_name}' created successfully",
                 "data": result,
             }
         except HTTPException:
@@ -716,7 +717,8 @@ def create_graph_routes(rag, api_key: Optional[str] = None, context_dependency=N
 
         HTTP Status Codes:
             200: Entities merged successfully
-            400: Invalid request (e.g., empty entity list, target entity doesn't exist)
+            400: Invalid request (e.g., empty entity list, source entity doesn't exist,
+                 or a name is empty after normalization)
             500: Internal server error
 
         Example Request:
@@ -727,7 +729,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None, context_dependency=N
             }
 
         Note:
-            - The target entity (entity_to_change_into) must exist in the knowledge graph
+            - The target entity may already exist or may be a new canonical name
             - Source entities will be permanently deleted after the merge
             - This operation cannot be undone, so verify entity names before merging
         """
@@ -737,9 +739,12 @@ def create_graph_routes(rag, api_key: Optional[str] = None, context_dependency=N
                 source_entities=request.entities_to_change,
                 target_entity=request.entity_to_change_into,
             )
+            merged_entity_name = result.get(
+                "entity_name", request.entity_to_change_into
+            )
             return {
                 "status": "success",
-                "message": f"Successfully merged {len(request.entities_to_change)} entities into '{request.entity_to_change_into}'",
+                "message": f"Successfully merged {len(request.entities_to_change)} entities into '{merged_entity_name}'",
                 "data": result,
             }
         except HTTPException:

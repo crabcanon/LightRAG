@@ -79,9 +79,10 @@ WORKDIR /app
 
 # Install the stable runtime package set and create the service account before
 # copying application layers. Source-only changes can then reuse this apt
-# layer; ownership is fixed after the copies below.
+# layer; ownership is fixed during the copies below. libcairo2 is required by
+# cairosvg for native Markdown SVG-to-PNG rasterization.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends gosu \
+    && apt-get install -y --no-install-recommends gosu libcairo2 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -g 1000 lightrag \
     && useradd -u 1000 -g lightrag -m -d /home/lightrag -s /usr/sbin/nologin lightrag
