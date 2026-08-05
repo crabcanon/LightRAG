@@ -1,9 +1,9 @@
 # LightRAG 多知识库 RFC 实现差距与新一轮优化方案
 
-- 状态：架构决策已确认；Phase 0～7+ 的 core/WebUI/physical 离线 Gate 已完成；physical 真实服务与同机 Gunicorn 外部集成 Gate 待验证
+- 状态：架构决策已确认；RFC-I01～I19 的 core/WebUI、同机 Gunicorn 与 physical 真实服务 Gate 已完成；RFC-I20 多节点协调仍未开始
 - RFC 基线：`docs/lightrag-rfc-en.md`（2026-07-29）
 - 代码基线：`dev@64713519`，已包含 `upstream/main@301e715c`
-- 审计日期：2026-08-03（Asia/Shanghai）
+- 审计日期：2026-08-03；外部门禁复验日期：2026-08-05（Asia/Shanghai）
 - 目标：把当前集成实现收敛为可分阶段提交、可证明安全、可回滚的社区方案
 
 > 实施进度（2026-08-03）：`3d79281c` 已完成 immutable tagged
@@ -30,8 +30,11 @@
 > selector、name+ID 显示、创建项置顶、临时 Admin Key 以及 control/data-plane
 > header 分流。`c18ed959` 已完成 RFC-I19 的 strict physical lifecycle 共享安全
 > 契约、catalog resource binding 与 fail-closed retarget 防护；全后端离线契约已
-> 通过，真实外部服务 integration 尚未执行，因此 RFC-I19 保持“代码完成，外部
-> Gate 待验证”。
+> 通过。2026-08-05 已在 Docker Linux 环境完成 PostgreSQL catalog + 2-worker
+> Gunicorn、worker SIGKILL/replacement、PostgreSQL/Redis/Neo4j 四存储族组合、
+> Qdrant/Memgraph/MongoDB/OpenSearch/Milvus 双物理端点，以及 catalog + 四存储族
+> 一致恢复点的原生备份/恢复门禁。RFC-I16 与 RFC-I19 因此完成；该结论只覆盖
+> same-host Manager coordinator，不包含 RFC-I20 的 external coordinator/multi-node。
 
 ## 1. 结论
 
@@ -542,7 +545,14 @@ sequenceDiagram
 
 实施结论：`b0982bb6` 建立单个 API app 共享的 `ResourceAdmissionController`，原始 LLM 各角色、embedding、rerank 与 pipeline 均先进入同一 deployment-total 预算。控制器使用 workspace DRR、同 workspace priority aging、全局/单 workspace pending 上限和总等待超时；过载稳定返回带 `Retry-After` 的 429/503。Gunicorn adapter 复用 master-owned global slot，startup recovery 通过独占 lease、heartbeat 和 fencing token 在 worker 间只执行一次，死亡 owner 可接管且旧 owner 不能发布终态。
 
-单进程与 Manager-backed 离线 Gate 已通过；真实 PostgreSQL catalog + Linux Gunicorn 多 worker、进程 SIGKILL、无 sticky session 的端到端验证因本机 Docker Engine、PostgreSQL 与 POSIX `SIGKILL` 不可用而尚未执行。因此单 worker multi-workspace write 默认开放，同机 multi-worker write 仍需显式 feature opt-in，且本文不把该部署标为已完成生产验证。
+单进程与 Manager-backed 离线 Gate 已通过。2026-08-05 又使用
+`docker-compose.integration-gunicorn.yml` 在干净 PostgreSQL catalog 和 Linux
+Gunicorn 2-worker 环境完成真实端到端门禁：显式创建 named knowledge base、重复
+无 sticky-session 数据面路由、catalog rename/revision 持久化、fenced delete 与
+cleanup journal 均成功；两个 worker 均可懒加载同一 record。强制 `SIGKILL` 一个
+worker 后，master 拉起 replacement worker，期间 health/catalog 保持可用。因此
+RFC-I16 的 same-host Manager 支持门禁完成；同机 multi-worker write 仍要求显式
+feature opt-in，且该结论不外推到 external coordinator 或多节点。
 
 ### Phase 6：Ollama selector
 
@@ -582,14 +592,38 @@ operation fencing 原子绑定该 snapshot；create/migrate/delete operation jou
 另外记录 `INITIALIZING_NAMESPACES`、`MIGRATING_NAMESPACES`、
 `DELETING_NAMESPACES`、`NAMESPACES_DELETED` 与 `READY`。
 
-验证方面，profile/catalog/lifecycle 聚焦回归为 `113 passed`；12 个存储后端目录与
-统一 profile/override 契约为 `1189 passed, 1 skipped, 12 deselected`；API 绿门禁为
-`773 passed, 17 deselected`；WebUI 为 `99 passed`，ESLint 与 production build
-成功，全仓 pre-commit 通过。跳过/排除项为既有 integration/POSIX 环境边界。本机
-Docker Desktop Linux Engine 不可用，因此尚未对 PostgreSQL、Redis、Neo4j、
-MongoDB、Milvus、Qdrant、Memgraph、OpenSearch 执行真实 endpoint 的 create/
-migrate/drop/backup-restore；这些结果不得从 mock/offline test 推断，生产支持声明
-保持不变。
+离线验证方面，profile/catalog/lifecycle 聚焦回归为 `113 passed`；此前 12 个存储
+后端目录与统一 profile/override 契约为 `1189 passed, 1 skipped, 12 deselected`；
+API 绿门禁为 `773 passed, 17 deselected`；WebUI 为 `99 passed`，ESLint、production
+build 与 pre-commit 均成功。2026-08-05 的最终代码复验扩大为 `tests/kg`：
+`1507 passed, 151 skipped`，`tests/workspace`：`75 passed, 7 skipped`，API 绿色
+门禁：`775 passed, 14 skipped, 3 deselected`。三个 deselect 是 Windows 无 POSIX
+`fcntl` 的 Gunicorn import 以及两个既有 401/403 认证断言差异；未过滤运行明确得到
+`775 passed, 14 skipped, 3 failed`，本轮新增失败为 0。
+
+真实服务方面，`docker-compose.integration-physical.yml` 使用两套 PostgreSQL、
+Neo4j、Redis endpoint 验证四个 storage family 可写、同逻辑 ID 隔离、drop A 不影响
+B；并在同一恢复点使用 `pg_dump/pg_restore`、Redis RDB、`neo4j-admin database
+dump/load` 恢复 catalog、KV、vector、graph 与 doc-status。随后
+`docker-compose.integration-physical-extended.yml` 分别以双 endpoint 验证 Qdrant、
+Memgraph、MongoDB Atlas Local、OpenSearch 和 Milvus；每个 profile 均执行
+initialize/migration、同 ID 写读和单边 namespace drop，结果各为 `1 passed`。
+这组真实门禁发现并关闭了实例级 physical profile 在 `LightRAG` construction 前被
+进程全局 backend 环境变量检查误拒绝的问题：完整 profile section 现在替代对应
+全局连接变量，缺字段仍 fail closed；覆盖八个外部 profile section 的单元回归为
+`49 passed`。RFC-I19 的外部 Gate 因此完成，但 resource service/cluster 的创建、
+备份和退役仍属于 operator，不能把 namespace drop 表述为销毁整个物理服务。
+
+容器交付同时完成真实构建门禁：Dockerfile 将前端依赖、Python lock 依赖、tiktoken/
+spaCy cache 与应用源码拆分为可复用层，最终 stage 直接复用 builder venv，并用
+`COPY --chown` 避免约 5 GB 树的递归 ownership rewrite；Windows checkout 的
+entrypoint 在镜像内去除 CRLF，`.dockerignore` 排除本地 `node_modules`。移除递归
+chown 后构建为 `50.6s`，当时的完全无变更缓存构建为 `8.8s` 且全部项目层
+`CACHED`；补充 `/app` 日志目录权限后的最终镜像构建为 `53.2s`。随后两次无变更
+复验分别在执行任何项目层之前被 Docker Hub `EOF` 与 GHCR token TLS timeout
+阻断；这不覆盖之前的全缓存证据，也不伪报为最终 cache run 成功。最终镜像的
+干净卷 create/6 次 route/delete 均成功，selector header 全部正确，cleanup
+complete，worker `69` 被 SIGKILL 后由 `768` 替换。
 
 ### Later：external coordinator 与多节点
 
